@@ -1,11 +1,17 @@
-# Glacier - Pure Zig OLAP Query Engine
+![Logo](img/GlacierLogo.png)
+
+# <div align="center">Glacier - Pure Zig OLAP Query Engine</div>
+
+<div align="center">
 
 [![Zig Version](https://img.shields.io/badge/zig-0.15.2-orange.svg)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)]()
 [![Version](https://img.shields.io/badge/version-0.8.1--alpha-blue.svg)]()
 
-> **A production-ready, JVM-free OLAP query engine for Apache Iceberg, Parquet, and Avro with full SQL support**
+</div>
+
+> **A production-ready, JVM-free OLAP query engine for Apache Iceberg, Parquet, and Avro with full SQL support** 
 
 Glacier is a high-performance **OLAP (Online Analytical Processing)** query engine written in **100% pure Zig**, designed to query **Apache Iceberg tables**, **Parquet files**, and **Avro files** from local filesystems and object storage, with complete **SQL support** including GROUP BY, aggregations, and predicate pushdown.
 
