@@ -7,9 +7,7 @@ const glacier = @import("glacier");
 
 // Display mode for query results
 const DisplayMode = union(enum) {
-    default: void, // Show 10 rows
-    head: usize, // Show first N rows
-    tail: usize, // Show last N rows
+    default: void, // Show 10 rows (deprecated - use LIMIT instead)
     full: void, // Show all rows
 };
 
@@ -337,9 +335,13 @@ fn loadParquetMetadata(allocator: std.mem.Allocator, file_path: []const u8) !Con
     const metadata = reader.metadata.?;
 
     // Extract data BEFORE arena cleanup
-    var total_rows: i64 = 0;
-    for (metadata.row_groups) |rg| {
-        total_rows += rg.num_rows;
+    // Use FileMetaData.num_rows first, fall back to summing row groups if needed
+    var total_rows: i64 = metadata.num_rows;
+    if (total_rows == 0) {
+        // Fallback: sum row groups (some files don't have global num_rows)
+        for (metadata.row_groups) |rg| {
+            total_rows += rg.num_rows;
+        }
     }
 
     const column_count = if (metadata.row_groups.len > 0)
@@ -955,9 +957,9 @@ fn executeIcebergQuery(allocator: std.mem.Allocator, table_path: []const u8, que
 
         for (metadata.row_groups) |rg| {
             if (is_select_star) {
-                try readAllColumnsWithMode(allocator, &reader, metadata, rg, mode, query.where_clause, query.order_by, query.limit);
+                _ = try readAllColumnsWithMode(allocator, &reader, metadata, rg, mode, query.where_clause, query.order_by, query.limit);
             } else {
-                try readSpecificColumnsWithMode(allocator, &reader, metadata, rg, query.select_columns, mode, query.where_clause);
+                _ = try readSpecificColumnsWithMode(allocator, &reader, metadata, rg, query.select_columns, mode, query.where_clause);
             }
         }
     }
@@ -1355,32 +1357,14 @@ pub fn main() !void {
         var display_mode: DisplayMode = .{ .default = {} };
         var actual_sql = trimmed;
 
-        if (std.ascii.startsWithIgnoreCase(trimmed, "head ")) {
-            // Extract N and SQL: "head 5 SELECT ..."
-            const rest = trimmed[5..]; // Skip "head "
-            var iter = std.mem.tokenizeAny(u8, rest, " \t");
-            if (iter.next()) |n_str| {
-                const n = std.fmt.parseInt(usize, n_str, 10) catch {
-                    std.debug.print("Error: Invalid number for head command\n\n", .{});
-                    continue;
-                };
-                const sql_start = rest.len - iter.rest().len;
-                actual_sql = std.mem.trim(u8, rest[sql_start..], " \t");
-                display_mode = .{ .head = n };
-            }
-        } else if (std.ascii.startsWithIgnoreCase(trimmed, "tail ")) {
-            // Extract N and SQL: "tail 20 SELECT ..."
-            const rest = trimmed[5..]; // Skip "tail "
-            var iter = std.mem.tokenizeAny(u8, rest, " \t");
-            if (iter.next()) |n_str| {
-                const n = std.fmt.parseInt(usize, n_str, 10) catch {
-                    std.debug.print("Error: Invalid number for tail command\n\n", .{});
-                    continue;
-                };
-                const sql_start = rest.len - iter.rest().len;
-                actual_sql = std.mem.trim(u8, rest[sql_start..], " \t");
-                display_mode = .{ .tail = n };
-            }
+        // DEPRECATED: head/tail commands removed in v0.8.2
+        // Use SQL standard: SELECT * ORDER BY col LIMIT N (head) or ORDER BY col DESC LIMIT N (tail)
+        if (std.ascii.startsWithIgnoreCase(trimmed, "head ") or std.ascii.startsWithIgnoreCase(trimmed, "tail ")) {
+            std.debug.print("Error: head/tail commands are deprecated in v0.8.2-alpha\n", .{});
+            std.debug.print("Use SQL standard instead:\n", .{});
+            std.debug.print("  - For first N rows:  SELECT * LIMIT N\n", .{});
+            std.debug.print("  - For last N rows:   SELECT * ORDER BY col DESC LIMIT N\n\n", .{});
+            continue;
         } else if (std.ascii.startsWithIgnoreCase(trimmed, "full ")) {
             // Extract SQL: "full SELECT ..."
             actual_sql = std.mem.trim(u8, trimmed[5..], " \t");
@@ -1416,7 +1400,7 @@ fn printBanner() void {
     std.debug.print("|                                                          |\n", .{});
     std.debug.print("|             Interactive OLAP Query Engine                |\n", .{});
     std.debug.print("|                                                          |\n", .{});
-    std.debug.print("|                 Version: 0.8.1-alpha                     |\n", .{});
+    std.debug.print("|                 Version: 0.8.2-alpha                     |\n", .{});
     std.debug.print("|          Type 'help' for commands, '\\q' to quit         |\n", .{});
     std.debug.print("|                                                          |\n", .{});
     std.debug.print("+----------------------------------------------------------+\n", .{});
@@ -1426,10 +1410,10 @@ fn printBanner() void {
 fn printHelp() void {
     std.debug.print("\n", .{});
     std.debug.print("Available commands:\n", .{});
-    std.debug.print("  SELECT ... FROM ... WHERE ...  Execute SQL query (shows 10 rows)\n", .{});
-    std.debug.print("  head N <query>                 Show first N rows\n", .{});
-    std.debug.print("  tail N <query>                 Show last N rows\n", .{});
-    std.debug.print("  full <query>                   Show all rows\n", .{});
+    std.debug.print("  SELECT ... FROM ... WHERE ...  Execute SQL query\n", .{});
+    std.debug.print("  SELECT ... LIMIT N             Return first N rows\n", .{});
+    std.debug.print("  SELECT ... ORDER BY col DESC   Order results\n", .{});
+    std.debug.print("  full <query>                   Show all rows (no 10-row limit)\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("Connection commands:\n", .{});
     std.debug.print("  \\d, \\tables                    Show current connection info\n", .{});
@@ -1441,10 +1425,10 @@ fn printHelp() void {
     std.debug.print("  \\q, exit                       Quit REPL\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("Example queries:\n", .{});
-    std.debug.print("  SELECT * FROM test_simple.parquet\n", .{});
-    std.debug.print("  head 5 SELECT * FROM test_table\n", .{});
-    std.debug.print("  tail 20 SELECT id FROM test_large_1gb.parquet\n", .{});
-    std.debug.print("  full SELECT age FROM test_simple.parquet\n", .{});
+    std.debug.print("  SELECT * LIMIT 10\n", .{});
+    std.debug.print("  SELECT * WHERE age > 30\n", .{});
+    std.debug.print("  SELECT * ORDER BY id DESC LIMIT 5\n", .{});
+    std.debug.print("  SELECT category, COUNT(*) GROUP BY category\n", .{});
     std.debug.print("\n", .{});
 }
 
@@ -1709,14 +1693,14 @@ fn processRowGroupForAggregates(
     var col_iter = columns_needed.keyIterator();
     while (col_iter.next()) |col_name| {
         const col_idx = schema_mapper.getColumnIndex(col_name.*) orelse return error.UnknownColumn;
-        const col_values = try readColumnDynamic(allocator, string_arena.allocator(), reader, metadata, rg, col_idx);
+        const col_values = try readColumnDynamic(allocator, string_arena.allocator(), reader, metadata, rg, col_idx, null);
         try columns.append(allocator, .{ .name = col_name.*, .values = col_values });
     }
 
     // If no columns were read (COUNT(*) with no WHERE), read first column to determine row count
     // This handles cases where rg.num_rows is 0 or incorrect
     if (columns.items.len == 0 and schema_mapper.column_names.len > 0) {
-        const col_values = try readColumnDynamic(allocator, string_arena.allocator(), reader, metadata, rg, 0);
+        const col_values = try readColumnDynamic(allocator, string_arena.allocator(), reader, metadata, rg, 0, null);
         try columns.append(allocator, .{ .name = schema_mapper.column_names[0], .values = col_values });
     }
 
@@ -1839,11 +1823,8 @@ fn executeParquetQueryWithMode(allocator: std.mem.Allocator, query: *const glaci
         return;
     }
 
-    // Calculate total rows across all row groups
-    var total_rows: i64 = 0;
-    for (metadata.row_groups) |row_group| {
-        total_rows += row_group.num_rows;
-    }
+    // Use FileMetaData.num_rows (more reliable than summing row groups)
+    const total_rows: i64 = metadata.num_rows;
 
     // Print info about multi-row-group files
     if (metadata.row_groups.len > 1) {
@@ -1855,105 +1836,37 @@ fn executeParquetQueryWithMode(allocator: std.mem.Allocator, query: *const glaci
     const rows_to_show: usize = if (query.limit) |limit|
         limit // ✅ USE LIMIT from SQL query!
     else switch (mode) {
-        .default => 10,
-        .head => |n| n,
-        .tail => |n| n,
-        .full => @intCast(total_rows),
+        .default => 10,  // Default: show 10 rows
+        .full => @intCast(total_rows),  // Full: show all rows
     };
 
     // Determine which columns to read
     const is_select_star = query.select_columns.len == 1 and std.mem.eql(u8, query.select_columns[0], "*");
 
-    // Multi-row-group reading strategy
+    // Multi-row-group reading strategy (simplified in v0.8.2)
     switch (mode) {
-        .default, .head => {
-            // Read row groups from the start until we have enough rows
+        .default => {
+            // Read row groups from the start until we have enough rows (LIMIT support)
+            // Use ACTUAL rows displayed (not metadata) for accurate early termination
             var rows_accumulated: usize = 0;
             for (metadata.row_groups, 0..) |rg, rg_idx| {
-                const rg_rows: usize = @intCast(rg.num_rows);
-
+                // Early termination: stop if we've shown enough rows
                 if (rows_accumulated >= rows_to_show) break;
 
-                // Calculate how many rows we need from this row group
+                // Calculate how many more rows we need
                 const rows_needed = rows_to_show - rows_accumulated;
-                const rows_from_this_rg = @min(rows_needed, rg_rows);
 
-                const rg_mode: DisplayMode = if (rows_from_this_rg < rg_rows)
-                    .{ .head = rows_from_this_rg }
+                // Read and display this row group
+                const rows_displayed = if (is_select_star)
+                    try readAllColumnsWithMode(allocator, &reader, metadata, rg, .{ .default = {} }, query.where_clause, query.order_by, rows_needed)
                 else
-                    .{ .full = {} };
+                    try readSpecificColumnsWithMode(allocator, &reader, metadata, rg, query.select_columns, .{ .default = {} }, query.where_clause);
 
-                if (is_select_star) {
-                    try readAllColumnsWithMode(allocator, &reader, metadata, rg, rg_mode, query.where_clause, query.order_by, query.limit);
-                } else {
-                    try readSpecificColumnsWithMode(allocator, &reader, metadata, rg, query.select_columns, rg_mode, query.where_clause);
-                }
+                rows_accumulated += rows_displayed;
 
-                rows_accumulated += rows_from_this_rg;
-
-                // Show continuation indicator if there are more row groups
+                // Show continuation indicator if there are more row groups AND we need more rows
                 if (rg_idx < metadata.row_groups.len - 1 and rows_accumulated < rows_to_show) {
                     std.debug.print("... continuing from row group {d} ...\n", .{rg_idx + 2});
-                }
-            }
-        },
-        .tail => |n| {
-            // For tail, we need to find which row groups contain the last N rows
-            const total_rows_usize: usize = @intCast(total_rows);
-
-            if (n >= total_rows_usize) {
-                // Need all rows, just read all row groups in order
-                for (metadata.row_groups, 0..) |rg, rg_idx| {
-                    if (is_select_star) {
-                        try readAllColumnsWithMode(allocator, &reader, metadata, rg, .{ .full = {} }, query.where_clause, query.order_by, query.limit);
-                    } else {
-                        try readSpecificColumnsWithMode(allocator, &reader, metadata, rg, query.select_columns, .{ .full = {} }, query.where_clause);
-                    }
-                    if (rg_idx < metadata.row_groups.len - 1) {
-                        std.debug.print("... continuing from row group {d} ...\n", .{rg_idx + 2});
-                    }
-                }
-            } else {
-                // Find which row groups to read
-                var rows_counted: usize = 0;
-                var first_rg_to_read: usize = metadata.row_groups.len;
-                var skip_rows_in_first_rg: usize = 0;
-
-                // Count backwards from the end
-                var rg_idx: usize = metadata.row_groups.len;
-                while (rg_idx > 0) {
-                    rg_idx -= 1;
-                    const rg = metadata.row_groups[rg_idx];
-                    const rg_rows: usize = @intCast(rg.num_rows);
-
-                    if (rows_counted + rg_rows >= n) {
-                        // This row group contains the start of our tail
-                        first_rg_to_read = rg_idx;
-                        skip_rows_in_first_rg = rg_rows - (n - rows_counted);
-                        break;
-                    }
-                    rows_counted += rg_rows;
-                }
-
-                // Read the selected row groups
-                for (first_rg_to_read..metadata.row_groups.len) |idx| {
-                    const rg = metadata.row_groups[idx];
-                    const rg_rows: usize = @intCast(rg.num_rows);
-
-                    const rg_mode: DisplayMode = if (idx == first_rg_to_read and skip_rows_in_first_rg > 0)
-                        .{ .tail = rg_rows - skip_rows_in_first_rg }
-                    else
-                        .{ .full = {} };
-
-                    if (is_select_star) {
-                        try readAllColumnsWithMode(allocator, &reader, metadata, rg, rg_mode, query.where_clause, query.order_by, query.limit);
-                    } else {
-                        try readSpecificColumnsWithMode(allocator, &reader, metadata, rg, query.select_columns, rg_mode, query.where_clause);
-                    }
-
-                    if (idx < metadata.row_groups.len - 1) {
-                        std.debug.print("... continuing from row group {d} ...\n", .{idx + 2});
-                    }
                 }
             }
         },
@@ -1961,9 +1874,9 @@ fn executeParquetQueryWithMode(allocator: std.mem.Allocator, query: *const glaci
             // Read all row groups
             for (metadata.row_groups, 0..) |rg, rg_idx| {
                 if (is_select_star) {
-                    try readAllColumnsWithMode(allocator, &reader, metadata, rg, .{ .full = {} }, query.where_clause, query.order_by, query.limit);
+                    _ = try readAllColumnsWithMode(allocator, &reader, metadata, rg, .{ .full = {} }, query.where_clause, query.order_by, query.limit);
                 } else {
-                    try readSpecificColumnsWithMode(allocator, &reader, metadata, rg, query.select_columns, .{ .full = {} }, query.where_clause);
+                    _ = try readSpecificColumnsWithMode(allocator, &reader, metadata, rg, query.select_columns, .{ .full = {} }, query.where_clause);
                 }
                 if (rg_idx < metadata.row_groups.len - 1) {
                     std.debug.print("... continuing from row group {d} ...\n", .{rg_idx + 2});
@@ -1989,6 +1902,9 @@ fn displayDynamicTable(columns: []const ColumnData, matched_rows: []const usize,
     const widths = try allocator.alloc(usize, columns.len);
     defer allocator.free(widths);
 
+    // Maximum column width for better UX (similar to DuckDB)
+    const MAX_COLUMN_WIDTH: usize = 50;
+
     for (columns, 0..) |col, col_idx| {
         var max_width: usize = getDisplayWidth(col.name); // Start with column name
 
@@ -1999,6 +1915,8 @@ fn displayDynamicTable(columns: []const ColumnData, matched_rows: []const usize,
             max_width = @max(max_width, getDisplayWidth(val_str));
         }
 
+        // Limit to MAX_COLUMN_WIDTH for better readability
+        max_width = @min(max_width, MAX_COLUMN_WIDTH);
         widths[col_idx] = max_width + 2; // +2 for padding
     }
 
@@ -2021,7 +1939,11 @@ fn displayDynamicTable(columns: []const ColumnData, matched_rows: []const usize,
             const val_str = try col.values[row_idx].toString(allocator);
             defer allocator.free(val_str);
 
-            printCentered(val_str, width);
+            // Truncate text if it exceeds column width
+            const display_str = try truncateText(allocator, val_str, width - 2); // -2 for padding
+            defer allocator.free(display_str);
+
+            printCentered(display_str, width);
             std.debug.print("|", .{});
         }
         std.debug.print("\n", .{});
@@ -2085,9 +2007,8 @@ fn sortRowsByOrder(
     }
 }
 
-fn readAllColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.parquet.Reader, metadata: glacier.parquet.FileMetaData, rg: glacier.parquet.RowGroup, mode: DisplayMode, where_clause: ?*const glacier.sql.Expr, order_by: ?[]const glacier.sql.OrderByClause, limit: ?usize) !void {
+fn readAllColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.parquet.Reader, metadata: glacier.parquet.FileMetaData, rg: glacier.parquet.RowGroup, mode: DisplayMode, where_clause: ?*const glacier.sql.Expr, order_by: ?[]const glacier.sql.OrderByClause, limit: ?usize) !usize {
     // DYNAMIC VERSION: Read ALL columns from schema (no hard-coding)
-    _ = mode; // TODO: Implement mode (head/tail/full)
 
     // Create arena for all string allocations in this query
     var string_arena = std.heap.ArenaAllocator.init(allocator);
@@ -2107,16 +2028,25 @@ fn readAllColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.parquet
         all_columns.deinit(allocator);
     }
 
-    // Read ALL columns dynamically from schema
+    // Determine max rows to read based on mode and limit
+    // OPTIMIZATION: Pass limit to stop reading pages early (for LIMIT 5, only read 5 rows)
+    // IMPORTANT: If ORDER BY is present, we MUST read all rows before sorting!
+    const max_rows_to_read = if (order_by != null)
+        null  // ORDER BY: must read all rows to sort
+    else switch (mode) {
+        .default => if (limit) |lim| lim else 10,  // Default/LIMIT: use limit or 10
+        .full => null,   // Full: read everything
+    };
+
     for (0..num_columns) |col_idx| {
         const col_name = schema_mapper.getColumnName(col_idx) orelse continue;
-        const col_values = try readColumnDynamic(allocator, string_arena.allocator(), reader, metadata, rg, col_idx);
+        const col_values = try readColumnDynamic(allocator, string_arena.allocator(), reader, metadata, rg, col_idx, max_rows_to_read);
         try all_columns.append(allocator, .{ .name = col_name, .values = col_values });
     }
 
     if (all_columns.items.len == 0) {
         std.debug.print("[ERROR] No columns found in table\n", .{});
-        return;
+        return 0; // No rows displayed
     }
 
     // Determine actual row count from first column (all columns should have same length)
@@ -2149,11 +2079,16 @@ fn readAllColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.parquet
         matched_rows.items;
 
     // Display results using dynamic table formatter
-    try displayDynamicTable(all_columns.items, rows_to_display, total_rows);
+    // Show total from file metadata, not just this row group
+    const file_total_rows: usize = @intCast(metadata.num_rows);
+    try displayDynamicTable(all_columns.items, rows_to_display, file_total_rows);
+
+    // Return number of rows actually displayed
+    return rows_to_display.len;
 }
 
 fn readAllColumns(allocator: std.mem.Allocator, reader: *glacier.parquet.Reader, metadata: glacier.parquet.FileMetaData, rg: glacier.parquet.RowGroup) !void {
-    return readAllColumnsWithMode(allocator, reader, metadata, rg, .{ .default = {} }, null, null, null);
+    _ = try readAllColumnsWithMode(allocator, reader, metadata, rg, .{ .default = {} }, null, null, null);
 }
 
 /// Read ALL columns, filter by WHERE, then display only selected columns
@@ -2165,7 +2100,7 @@ fn readAllColumnsAndFilterDisplay(
     selected_columns: [][]const u8,
     mode: DisplayMode,
     where_clause: *const glacier.sql.Expr,
-) !void {
+) !usize {
     // Use dynamic system instead of hard-coded columns
     var string_arena = std.heap.ArenaAllocator.init(allocator);
     defer string_arena.deinit();
@@ -2202,7 +2137,7 @@ fn readAllColumnsAndFilterDisplay(
             return error.UnknownColumn;
         };
 
-        const col_values = try readColumnDynamic(allocator, string_arena.allocator(), reader, metadata, rg, col_idx);
+        const col_values = try readColumnDynamic(allocator, string_arena.allocator(), reader, metadata, rg, col_idx, null);
         try all_columns.append(allocator, .{ .name = col_name.*, .values = col_values });
     }
 
@@ -2224,20 +2159,17 @@ fn readAllColumnsAndFilterDisplay(
     const num_matched = matched_rows.items.len;
     const display_count: usize = switch (mode) {
         .default => @min(num_matched, 10),
-        .head => |n| @min(num_matched, n),
-        .tail => |n| @min(num_matched, n),
         .full => num_matched,
     };
 
-    const start_idx: usize = switch (mode) {
-        .tail => |_| if (num_matched > display_count) num_matched - display_count else 0,
-        else => 0,
-    };
+    const start_idx: usize = 0;  // Always start from beginning (removed tail support)
     const end_idx = @min(start_idx + display_count, num_matched);
 
     // Calculate individual width for EACH column
     const widths = try allocator.alloc(usize, selected_columns.len);
     defer allocator.free(widths);
+
+    const MAX_COLUMN_WIDTH: usize = 50;
 
     for (selected_columns, 0..) |col_name, col_idx| {
         var max_width: usize = getDisplayWidth(col_name);
@@ -2257,6 +2189,7 @@ fn readAllColumnsAndFilterDisplay(
             }
         }
 
+        max_width = @min(max_width, MAX_COLUMN_WIDTH);
         widths[col_idx] = max_width + 2; // +2 for padding
     }
 
@@ -2276,7 +2209,10 @@ fn readAllColumnsAndFilterDisplay(
                     const val_str = try col.values[row_idx].toString(allocator);
                     defer allocator.free(val_str);
 
-                    printCentered(val_str, width);
+                    const display_str = try truncateText(allocator, val_str, width - 2);
+                    defer allocator.free(display_str);
+
+                    printCentered(display_str, width);
                     std.debug.print("|", .{});
                     found = true;
                     break;
@@ -2290,9 +2226,14 @@ fn readAllColumnsAndFilterDisplay(
         std.debug.print("\n", .{});
     }
 
-    printTableFooter(widths, total_rows, num_matched);
+    // Show total from file metadata, not just this row group
+    const file_total_rows: usize = @intCast(metadata.num_rows);
+    printTableFooter(widths, file_total_rows, num_matched);
+
+    // Return number of rows actually displayed
+    return num_matched;
 }
-fn readSpecificColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.parquet.Reader, metadata: glacier.parquet.FileMetaData, rg: glacier.parquet.RowGroup, column_names: [][]const u8, mode: DisplayMode, where_clause: ?*const glacier.sql.Expr) !void {
+fn readSpecificColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.parquet.Reader, metadata: glacier.parquet.FileMetaData, rg: glacier.parquet.RowGroup, column_names: [][]const u8, mode: DisplayMode, where_clause: ?*const glacier.sql.Expr) !usize {
     // OPTIMIZATION: If WHERE clause is present, we need to read ALL columns to evaluate it
     // Then we filter and only display the requested columns
     // This is simpler than tracking which columns are needed for WHERE vs SELECT
@@ -2311,13 +2252,22 @@ fn readSpecificColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.pa
     var schema_mapper = try SchemaMapper.init(allocator, metadata);
     defer schema_mapper.deinit();
 
+    // Get actual row count from first column metadata (rg.num_rows may be 0!)
+    const actual_total_rows: usize = if (rg.columns.len > 0)
+        @intCast(rg.columns[0].meta_data.num_values)
+    else
+        0;
+
     // Calculate number of rows to display based on mode
-    const total_rows: usize = @intCast(rg.num_rows);
     const num_rows: usize = switch (mode) {
-        .default => @min(total_rows, 10),
-        .head => |n| @min(total_rows, n),
-        .tail => |n| @min(total_rows, n),
-        .full => total_rows,
+        .default => @min(actual_total_rows, 10),
+        .full => actual_total_rows,
+    };
+
+    // OPTIMIZATION: Only read first N rows for default mode
+    const max_rows_to_read: ?usize = switch (mode) {
+        .default => 10,  // Default: read 10 rows
+        .full => null,   // Full: read everything
     };
 
     // Read all requested columns dynamically
@@ -2335,7 +2285,7 @@ fn readSpecificColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.pa
             return error.UnknownColumn;
         };
 
-        const col_values = try readColumnDynamic(allocator, string_arena.allocator(), reader, metadata, rg, col_idx);
+        const col_values = try readColumnDynamic(allocator, string_arena.allocator(), reader, metadata, rg, col_idx, max_rows_to_read);
         try all_values.append(allocator, .{ .name = col_name, .values = col_values });
     }
 
@@ -2345,16 +2295,15 @@ fn readSpecificColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.pa
         actual_rows = @max(actual_rows, col_data.values.len);
     }
 
-    // Calculate display range
-    const start_idx: usize = switch (mode) {
-        .tail => |n| if (actual_rows > n) actual_rows - n else 0,
-        else => 0,
-    };
+    // Calculate display range (always start from beginning - removed tail support)
+    const start_idx: usize = 0;
     const end_idx = @min(start_idx + num_rows, actual_rows);
 
     // Calculate individual width for EACH column
     const widths = try allocator.alloc(usize, column_names.len);
     defer allocator.free(widths);
+
+    const MAX_COLUMN_WIDTH: usize = 50;
 
     for (column_names, 0..) |col_name, col_idx| {
         var max_width: usize = getDisplayWidth(col_name);
@@ -2373,6 +2322,7 @@ fn readSpecificColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.pa
             }
         }
 
+        max_width = @min(max_width, MAX_COLUMN_WIDTH);
         widths[col_idx] = max_width + 2; // +2 for padding
     }
 
@@ -2387,7 +2337,10 @@ fn readSpecificColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.pa
                 const val_str = try col_data.values[row_idx].toString(allocator);
                 defer allocator.free(val_str);
 
-                printCentered(val_str, width);
+                const display_str = try truncateText(allocator, val_str, width - 2);
+                defer allocator.free(display_str);
+
+                printCentered(display_str, width);
                 std.debug.print("|", .{});
             } else {
                 printCentered("NULL", width);
@@ -2397,11 +2350,16 @@ fn readSpecificColumnsWithMode(allocator: std.mem.Allocator, reader: *glacier.pa
         std.debug.print("\n", .{});
     }
 
-    printTableFooter(widths, actual_rows, end_idx - start_idx);
+    // Show total from file metadata, not just this row group
+    const file_total_rows: usize = @intCast(metadata.num_rows);
+    printTableFooter(widths, file_total_rows, end_idx - start_idx);
+
+    // Return number of rows actually displayed
+    return end_idx - start_idx;
 }
 
 fn readSpecificColumns(allocator: std.mem.Allocator, reader: *glacier.parquet.Reader, metadata: glacier.parquet.FileMetaData, rg: glacier.parquet.RowGroup, column_names: [][]const u8) !void {
-    return readSpecificColumnsWithMode(allocator, reader, metadata, rg, column_names, .{ .default = {} }, null);
+    _ = try readSpecificColumnsWithMode(allocator, reader, metadata, rg, column_names, .{ .default = {} }, null);
 }
 
 /// Column data structure used for dynamic column reading
@@ -2475,6 +2433,38 @@ fn getDisplayWidth(text: []const u8) usize {
 }
 
 /// Helper to print centered text within a given width
+/// Truncate text if needed and add ellipsis
+fn truncateText(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]const u8 {
+    const text_width = getDisplayWidth(text);
+    if (text_width <= max_width) {
+        return try allocator.dupe(u8, text);
+    }
+
+    // Text is too long, truncate and add "..."
+    const ellipsis = "...";
+    const available = if (max_width > 3) max_width - 3 else 0;
+
+    if (available == 0) {
+        return try allocator.dupe(u8, ellipsis);
+    }
+
+    // Find the byte position where we should cut
+    var byte_count: usize = 0;
+    var char_count: usize = 0;
+
+    while (byte_count < text.len and char_count < available) {
+        const char_len = std.unicode.utf8ByteSequenceLength(text[byte_count]) catch 1;
+        if (byte_count + char_len > text.len) break;
+        byte_count += char_len;
+        char_count += 1;
+    }
+
+    const result = try allocator.alloc(u8, byte_count + ellipsis.len);
+    @memcpy(result[0..byte_count], text[0..byte_count]);
+    @memcpy(result[byte_count..], ellipsis);
+    return result;
+}
+
 fn printCentered(text: []const u8, width: usize) void {
     const text_display_width = getDisplayWidth(text);
     const text_len = @min(text_display_width, width);
@@ -2768,6 +2758,7 @@ fn processRowGroupForGroupBy(
             metadata,
             rg,
             col_idx,
+            null,
         );
         try columns.append(allocator, .{ .name = col_name.*, .values = col_values });
     }
@@ -3266,6 +3257,7 @@ fn decodeBooleanGeneric(
 }
 
 /// Read a single column dynamically based on its type
+/// If max_rows is provided, stops reading after reaching that many values (for LIMIT optimization)
 fn readColumnDynamic(
     allocator: std.mem.Allocator,
     string_arena: std.mem.Allocator,
@@ -3273,6 +3265,7 @@ fn readColumnDynamic(
     metadata: glacier.parquet.FileMetaData,
     rg: glacier.parquet.RowGroup,
     column_index: usize,
+    max_rows: ?usize,
 ) ![]DynamicColumnValue {
     if (column_index >= rg.columns.len) return error.ColumnIndexOutOfBounds;
 
@@ -3316,109 +3309,139 @@ fn readColumnDynamic(
     defer if (dict_double) |*d| d.deinit();
     defer if (dict_bool) |*d| d.deinit();
 
-    // Read data page
-    const page = try reader.readDataPage(col.meta_data.data_page_offset, allocator);
-    defer allocator.free(page.compressed_data);
+    // Multi-page reading implementation with early termination support
+    // Parquet files can have MULTIPLE pages per column in a row group.
+    // We need to read ALL pages until we have col.meta_data.num_values total values.
+    // OPTIMIZATION: If max_rows is specified (e.g., for LIMIT 5), stop reading after max_rows values.
 
-    const uncompressed_size: usize = @intCast(page.page_header.uncompressed_page_size);
-    const page_data = try glacier.compression.decompress(
-        allocator,
-        col.meta_data.codec,
-        page.compressed_data,
-        uncompressed_size,
-    );
-    defer allocator.free(page_data);
+    const total_values: usize = @intCast(col.meta_data.num_values);
+
+    // Determine how many values we actually need to read
+    const values_to_read: usize = if (max_rows) |limit| @min(total_values, limit) else total_values;
+
+    const result = try allocator.alloc(DynamicColumnValue, values_to_read);
+    errdefer allocator.free(result);
 
     const is_required = if (schema_element.repetition_type) |rt| rt == .REQUIRED else false;
-    const encoding = page.page_header.data_page_header.?.encoding;
-    const num_page_values: usize = @intCast(page.page_header.data_page_header.?.num_values);
-
-    // Decode based on type and encoding
-    // Use num_page_values (actual values in page) instead of rg.num_rows (metadata total)
-    const result = try allocator.alloc(DynamicColumnValue, num_page_values);
-
     const col_type = schema_element.type orelse return error.MissingType;
-    switch (col_type) {
-        .INT64 => {
-            const dict_vals = if (dict_int) |d| d.values else null;
-            const values = try decodeNumericGeneric(i64, allocator, page_data, num_page_values, encoding, is_required, dict_vals);
-            defer allocator.free(values);
-            for (values, 0..) |v, i| {
-                result[i] = .{ .int64 = v };
-            }
-        },
-        .INT32 => {
-            // For PLAIN encoding, decode directly as i32
-            // For DICTIONARY encoding, decode as i64 then convert (dictionaries are always i64)
-            if (encoding == .PLAIN) {
-                const values = try decodeNumericGeneric(i32, allocator, page_data, num_page_values, encoding, is_required, null);
-                defer allocator.free(values);
-                for (values, 0..) |v, i| {
-                    result[i] = .{ .int32 = v };
-                }
-            } else {
-                // Dictionary encoding uses i64 internally
-                const dict_vals = if (dict_int) |d| d.values else null;
-                const i64_values = try decodeNumericGeneric(i64, allocator, page_data, num_page_values, encoding, is_required, dict_vals);
-                defer allocator.free(i64_values);
-                for (i64_values, 0..) |v, i| {
-                    result[i] = .{ .int32 = @intCast(v) };
-                }
-            }
-        },
-        .BYTE_ARRAY => {
-            const values = switch (encoding) {
-                .PLAIN => try glacier.parquet.Reader.decodePlainByteArray(
-                    string_arena,
-                    page_data,
-                    num_page_values,
-                    is_required,
-                ),
-                .RLE_DICTIONARY, .PLAIN_DICTIONARY => blk: {
-                    if (dict_str) |dict| {
-                        break :blk try glacier.parquet.Reader.decodeRLEDictionaryByteArray(
-                            string_arena,
-                            page_data,
-                            num_page_values,
-                            is_required,
-                            dict.values,
-                        );
-                    } else {
-                        return error.MissingDictionary;
-                    }
-                },
-                else => return error.UnsupportedEncoding,
-            };
 
-            for (values, 0..) |v, i| {
-                result[i] = .{ .byte_array = v };
-            }
-        },
-        .FLOAT => {
-            const dict_vals = if (dict_float) |d| d.values else null;
-            const values = try decodeNumericGeneric(f32, allocator, page_data, num_page_values, encoding, is_required, dict_vals);
-            defer allocator.free(values);
-            for (values, 0..) |v, i| {
-                result[i] = .{ .float = v };
-            }
-        },
-        .DOUBLE => {
-            const dict_vals = if (dict_double) |d| d.values else null;
-            const values = try decodeNumericGeneric(f64, allocator, page_data, num_page_values, encoding, is_required, dict_vals);
-            defer allocator.free(values);
-            for (values, 0..) |v, i| {
-                result[i] = .{ .double = v };
-            }
-        },
-        .BOOLEAN => {
-            const dict_vals = if (dict_bool) |d| d.values else null;
-            const values = try decodeBooleanGeneric(allocator, page_data, num_page_values, encoding, is_required, dict_vals);
-            defer allocator.free(values);
-            for (values, 0..) |v, i| {
-                result[i] = .{ .boolean = v };
-            }
-        },
-        else => return error.UnsupportedParquetType,
+    var values_read: usize = 0;
+    var current_offset: i64 = col.meta_data.data_page_offset;
+
+    // Read pages until we have enough values (early termination for LIMIT)
+    while (values_read < values_to_read) {
+        const page = try reader.readDataPage(current_offset, allocator);
+        defer allocator.free(page.compressed_data);
+
+        const uncompressed_size: usize = @intCast(page.page_header.uncompressed_page_size);
+        const page_data = try glacier.compression.decompress(
+            allocator,
+            col.meta_data.codec,
+            page.compressed_data,
+            uncompressed_size,
+        );
+        defer allocator.free(page_data);
+
+        const encoding = page.page_header.data_page_header.?.encoding;
+        const num_page_values: usize = @intCast(page.page_header.data_page_header.?.num_values);
+
+        // Calculate how many values to copy from this page (handle partial page reads for LIMIT)
+        const values_remaining = values_to_read - values_read;
+        const values_to_copy = @min(num_page_values, values_remaining);
+
+        // Decode this page's values based on type
+        switch (col_type) {
+            .INT64 => {
+                const dict_vals = if (dict_int) |d| d.values else null;
+                const values = try decodeNumericGeneric(i64, allocator, page_data, num_page_values, encoding, is_required, dict_vals);
+                defer allocator.free(values);
+                for (0..values_to_copy) |idx| {
+                    result[values_read + idx] = .{ .int64 = values[idx] };
+                }
+            },
+            .INT32 => {
+                if (encoding == .PLAIN) {
+                    const values = try decodeNumericGeneric(i32, allocator, page_data, num_page_values, encoding, is_required, null);
+                    defer allocator.free(values);
+                    for (0..values_to_copy) |idx| {
+                        result[values_read + idx] = .{ .int32 = values[idx] };
+                    }
+                } else {
+                    const dict_vals = if (dict_int) |d| d.values else null;
+                    const i64_values = try decodeNumericGeneric(i64, allocator, page_data, num_page_values, encoding, is_required, dict_vals);
+                    defer allocator.free(i64_values);
+                    for (0..values_to_copy) |idx| {
+                        result[values_read + idx] = .{ .int32 = @intCast(i64_values[idx]) };
+                    }
+                }
+            },
+            .BYTE_ARRAY => {
+                const values = switch (encoding) {
+                    .PLAIN => try glacier.parquet.Reader.decodePlainByteArray(
+                        string_arena,
+                        page_data,
+                        num_page_values,
+                        is_required,
+                    ),
+                    .RLE_DICTIONARY, .PLAIN_DICTIONARY => blk: {
+                        if (dict_str) |dict| {
+                            break :blk try glacier.parquet.Reader.decodeRLEDictionaryByteArray(
+                                string_arena,
+                                page_data,
+                                num_page_values,
+                                is_required,
+                                dict.values,
+                            );
+                        } else {
+                            return error.MissingDictionary;
+                        }
+                    },
+                    else => return error.UnsupportedEncoding,
+                };
+                for (0..values_to_copy) |idx| {
+                    result[values_read + idx] = .{ .byte_array = values[idx] };
+                }
+            },
+            .FLOAT => {
+                const dict_vals = if (dict_float) |d| d.values else null;
+                const values = try decodeNumericGeneric(f32, allocator, page_data, num_page_values, encoding, is_required, dict_vals);
+                defer allocator.free(values);
+                for (0..values_to_copy) |idx| {
+                    result[values_read + idx] = .{ .float = values[idx] };
+                }
+            },
+            .DOUBLE => {
+                const dict_vals = if (dict_double) |d| d.values else null;
+                const values = try decodeNumericGeneric(f64, allocator, page_data, num_page_values, encoding, is_required, dict_vals);
+                defer allocator.free(values);
+                for (0..values_to_copy) |idx| {
+                    result[values_read + idx] = .{ .double = values[idx] };
+                }
+            },
+            .BOOLEAN => {
+                const dict_vals = if (dict_bool) |d| d.values else null;
+                const values = try decodeBooleanGeneric(allocator, page_data, num_page_values, encoding, is_required, dict_vals);
+                defer allocator.free(values);
+                for (0..values_to_copy) |idx| {
+                    result[values_read + idx] = .{ .boolean = values[idx] };
+                }
+            },
+            else => return error.UnsupportedParquetType,
+        }
+
+        // Update counter with values actually copied (not total in page)
+        values_read += values_to_copy;
+
+        // Early termination: if we have enough values, stop reading pages
+        if (values_read >= values_to_read) {
+            break;
+        }
+
+        // Calculate next page offset
+        // Next page starts after: current_offset + header_size + compressed_page_size
+        const compressed_size: i64 = page.page_header.compressed_page_size;
+        const header_size_i64: i64 = @intCast(page.header_size);
+        current_offset += header_size_i64 + compressed_size;
     }
 
     return result;
