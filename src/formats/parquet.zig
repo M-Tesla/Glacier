@@ -215,10 +215,10 @@ fn parseFileMetaData(allocator: std.mem.Allocator, data: []const u8) !FileMetaDa
                     try schema.append(allocator, elem);
                 }
             },
-            3, 5, 12 => { // num_rows (field varies by writer: PyArrow=5, Zig Parquet=12)
+            3, 5, 7, 12 => { // num_rows (field varies by writer: PyArrow=5, some tools=7, Zig Parquet=12)
                 num_rows = try reader.readVarint64();
             },
-            4, 6, 13 => { // row_groups (field varies by writer: PyArrow=6, Zig Parquet=13)
+            4, 6, 8, 13 => { // row_groups (field varies by writer: PyArrow=6, some tools=8, Zig Parquet=13)
                 const list_info = try reader.readListBegin();
                 var i: usize = 0;
                 while (i < list_info.size) : (i += 1) {
@@ -318,7 +318,7 @@ fn parseRowGroup(allocator: std.mem.Allocator, reader: *thrift.CompactReader) !R
             2, 17 => { // total_byte_size (field 2 in spec, but PyArrow may use field 17)
                 total_byte_size = try reader.readVarint64();
             },
-            3, 5, 18, 24 => { // num_rows (field 3 in spec, PyArrow 19.0.0 uses field 24)
+            3, 5, 18 => { // num_rows (field 3 in spec, some writers use 5 or 18)
                 num_rows = try reader.readVarint64();
             },
             else => {
@@ -556,6 +556,7 @@ pub const Reader = struct {
     pub fn readDataPage(self: *Self, offset: i64, allocator: std.mem.Allocator) !struct {
         page_header: PageHeader,
         compressed_data: []u8,
+        header_size: usize,
     } {
         // OPTIMIZATION: Read header + data in ONE seek + read operation
         // Old approach: 3 seeks per page (45ms overhead on HDD)
@@ -634,6 +635,7 @@ pub const Reader = struct {
         return .{
             .page_header = page_header,
             .compressed_data = compressed_data,
+            .header_size = header_size,
         };
     }
 
