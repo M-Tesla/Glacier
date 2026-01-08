@@ -29,6 +29,67 @@ const std = @import("std");
 const encoding = @import("encoding.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Decode a batch of PLAIN encoded INT64 values
+pub fn decodePlainInt64(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    num_values: usize,
+    _: bool // required (ignored for PLAIN which doesn't interleave nulls)
+) ![]i64 {
+    var values = try allocator.alloc(i64, num_values);
+    errdefer allocator.free(values);
+
+    var decoder = PlainInt64Decoder.init(data);
+    for (0..num_values) |i| {
+        if (decoder.isAtEnd()) return error.UnexpectedEndOfData; // Should satisfy count
+        values[i] = try decoder.readValue();
+    }
+    return values;
+}
+
+/// Decode a batch of PLAIN encoded INT32 values
+pub fn decodePlainInt32(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    num_values: usize,
+    _: bool
+) ![]i32 {
+    var values = try allocator.alloc(i32, num_values);
+    errdefer allocator.free(values);
+
+    var decoder = PlainInt32Decoder.init(data);
+    for (0..num_values) |i| {
+        if (decoder.isAtEnd()) return error.UnexpectedEndOfData;
+        values[i] = try decoder.readValue();
+    }
+    return values;
+}
+
+/// Decode a batch of PLAIN encoded BYTE_ARRAY (String) values
+/// Allocates deep copies of strings because Parquet data buffer is temporary
+pub fn decodePlainByteArray(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    num_values: usize,
+    _: bool
+) ![][]u8 {
+    var values = try allocator.alloc([]u8, num_values);
+    errdefer allocator.free(values);
+
+    var decoder = PlainByteArrayDecoder.init(data);
+    for (0..num_values) |i| {
+        if (decoder.isAtEnd()) return error.UnexpectedEndOfData;
+        const slice = try decoder.readValue();
+        // Deep copy
+        values[i] = try allocator.dupe(u8, slice);
+    }
+    return values;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // PLAIN ENCODING DECODERS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -199,6 +260,10 @@ pub const PlainDoubleDecoder = struct {
     }
 };
 
+
+
+
+
 /// PLAIN decoder for BYTE_ARRAY (length-prefixed byte arrays)
 pub const PlainByteArrayDecoder = struct {
     data: []const u8,
@@ -240,6 +305,24 @@ pub const PlainByteArrayDecoder = struct {
         return self.pos >= self.data.len;
     }
 };
+
+
+/// Decode dictionary indices from a Data Page using RLE/Bit-Packing
+/// Reads the bit-width byte, then decodes the values.
+pub fn decodeDictionaryIndices(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    num_values: usize,
+) ![]i64 {
+    if (data.len < 1) return error.UnexpectedEndOfData;
+
+    // First byte is bit width
+    const bit_width = data[0];
+    const rle_data = data[1..];
+
+    var decoder = encoding.RLEDecoder.init(rle_data, @intCast(bit_width));
+    return decoder.decodeAll(allocator, num_values);
+}
 
 /// PLAIN decoder for FIXED_LEN_BYTE_ARRAY
 pub const PlainFixedLenByteArrayDecoder = struct {
@@ -448,4 +531,19 @@ test "DictionaryDecoder - i32" {
     try std.testing.expectEqual(@as(i32, 20), try decoder.readValue()); // index 1
     try std.testing.expectEqual(@as(i32, 30), try decoder.readValue()); // index 2
     try std.testing.expectEqual(@as(i32, 40), try decoder.readValue()); // index 3
+}
+
+test "decodePlainInt64" {
+    const allocator = std.testing.allocator;
+    const data = [_]u8{
+        0xCB, 0x04, 0xFB, 0x71, 0x1F, 0x01, 0x00, 0x00, // 1234567890123
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 1
+    };
+    
+    const values = try decodePlainInt64(allocator, &data, 2, false);
+    defer allocator.free(values);
+    
+    try std.testing.expectEqual(@as(usize, 2), values.len);
+    try std.testing.expectEqual(@as(i64, 1234567890123), values[0]);
+    try std.testing.expectEqual(@as(i64, 1), values[1]);
 }
