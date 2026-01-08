@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// GLACIER - High-Performance SQL Parser (Phase 5)
+// GLACIER - High-Performance SQL Parser
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Complete SQL parser for Apache Iceberg with extreme performance focus
@@ -11,13 +11,13 @@
 // 4. Minimal memory footprint
 //
 // Supported SQL:
-//   ✅ SELECT ... FROM ... WHERE ... ORDER BY ... LIMIT ...
-//   ✅ JOIN (INNER, LEFT, RIGHT, FULL, CROSS)
-//   ✅ GROUP BY ... HAVING ...
-//   ✅ Subqueries & CTEs
-//   ✅ Aggregations (COUNT, SUM, AVG, MIN, MAX)
-//   ✅ Window functions
-//   ✅ CASE WHEN, IN, BETWEEN, LIKE
+//    SELECT ... FROM ... WHERE ... ORDER BY ... LIMIT ...
+//    JOIN (INNER, LEFT, RIGHT, FULL, CROSS)
+//    GROUP BY ... HAVING ...
+//    Subqueries & CTEs
+//    Aggregations (COUNT, SUM, AVG, MIN, MAX)
+//    Window functions
+//    CASE WHEN, IN, BETWEEN, LIKE
 //
 // Performance targets:
 //   - Parse 1M simple queries/sec on single core
@@ -432,7 +432,7 @@ pub const OrderDirection = enum {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// TOKENIZER (Zero-Allocation, High-Performance)
+// TOKENIZER (Zero-Allocation)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Zero-allocation SQL tokenizer
@@ -1268,6 +1268,15 @@ pub fn parseQuery(allocator: std.mem.Allocator, sql: []const u8) !Query {
         table_name = try allocator.dupe(u8, "");
         errdefer allocator.free(table_name);
         // Continue to parse WHERE/ORDER/GROUP/LIMIT below (fall through)
+    } else if (table_token.kind == .STRING) {
+        // Support file paths in quotes (e.g., 'path/to/file.parquet')
+        if (table_token.lexeme.len >= 2) {
+             // Strip quotes
+             table_name = try allocator.dupe(u8, table_token.lexeme[1..table_token.lexeme.len-1]);
+             errdefer allocator.free(table_name);
+        } else {
+             return error.InvalidSyntax;
+        }
     } else if (table_token.kind == .IDENTIFIER) {
         // Check if there's a file extension (.parquet)
         const peek_pos = tokenizer.pos; // Save position BEFORE peek
