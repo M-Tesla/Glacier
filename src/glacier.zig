@@ -92,6 +92,9 @@ pub const projection = @import("execution/projection.zig");
 /// Query execution planner
 pub const planner = @import("execution/planner.zig");
 
+/// Physical execution engine
+pub const physical = @import("execution/physical.zig");
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SQL PARSER
 // ═══════════════════════════════════════════════════════════════════════════
