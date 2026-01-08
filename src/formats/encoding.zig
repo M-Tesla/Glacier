@@ -144,6 +144,7 @@ pub const RLEDecoder = struct {
         // If current run is exhausted, read next run header
         if (self.run_remaining == 0) {
             try self.readRunHeader();
+            if (self.run_remaining == 0) return error.UnexpectedZeroRunLength;
         }
 
         const value = if (self.is_bit_packed) blk: {
@@ -167,6 +168,21 @@ pub const RLEDecoder = struct {
         for (output) |*val| {
             val.* = try self.readValue();
         }
+    }
+
+    /// Read all remaining values up to `count`
+    /// Result is allocated with `allocator`
+    pub fn decodeAll(self: *Self, allocator: std.mem.Allocator, count: usize) ![]i64 {
+        const result = try allocator.alloc(i64, count);
+        errdefer allocator.free(result);
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+             // RLEDecoder returns u32, cast to i64 for indices
+             result[i] = @as(i64, @intCast(try self.readValue()));
+        }
+
+        return result;
     }
 
     /// Read run header and prepare for reading values
