@@ -119,6 +119,13 @@ pub const PageHeader = struct {
     uncompressed_page_size: i32,
     compressed_page_size: i32,
     data_page_header: ?DataPageHeader,
+    dictionary_page_header: ?DictionaryPageHeader,
+};
+
+pub const DictionaryPageHeader = struct {
+    num_values: i32,
+    encoding: Encoding,
+    is_sorted: ?bool,
 };
 
 /// Schema element (simplified - will expand as needed)
@@ -452,6 +459,7 @@ fn parsePageHeader(allocator: std.mem.Allocator, data: []const u8) !PageHeader {
     var uncompressed_page_size: i32 = 0;
     var compressed_page_size: i32 = 0;
     var data_page_header: ?DataPageHeader = null;
+    var dictionary_page_header: ?DictionaryPageHeader = null;
 
     while (try reader.readFieldBegin()) |field| {
         switch (field.field_id) {
@@ -468,6 +476,9 @@ fn parsePageHeader(allocator: std.mem.Allocator, data: []const u8) !PageHeader {
             5 => { // data_page_header
                 data_page_header = try parseDataPageHeader(allocator, &reader);
             },
+            7 => { // dictionary_page_header
+                dictionary_page_header = try parseDictionaryPageHeader(allocator, &reader);
+            },
             else => {
                 try reader.skip(field.field_type);
             },
@@ -479,6 +490,28 @@ fn parsePageHeader(allocator: std.mem.Allocator, data: []const u8) !PageHeader {
         .uncompressed_page_size = uncompressed_page_size,
         .compressed_page_size = compressed_page_size,
         .data_page_header = data_page_header,
+        .dictionary_page_header = dictionary_page_header,
+    };
+}
+
+fn parseDictionaryPageHeader(_: std.mem.Allocator, reader: *thrift.CompactReader) !DictionaryPageHeader {
+    reader.last_field_id = 0;
+    var num_values: i32 = 0;
+    var encoding: Encoding = .PLAIN;
+    var is_sorted: ?bool = null;
+
+    while (try reader.readFieldBegin()) |field| {
+        switch (field.field_id) {
+            1 => { num_values = try reader.readVarint32(); },
+            2 => { encoding = @enumFromInt(try reader.readVarint32()); },
+            3 => { is_sorted = (try reader.readVarint32()) != 0; },
+            else => try reader.skip(field.field_type),
+        }
+    }
+    return DictionaryPageHeader{
+        .num_values = num_values,
+        .encoding = encoding,
+        .is_sorted = is_sorted,
     };
 }
 
