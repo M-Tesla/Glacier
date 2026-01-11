@@ -1454,7 +1454,117 @@ fn executeQueryWithMode(allocator: std.mem.Allocator, sql: []const u8, mode: Dis
     }
 
     // Execute the parsed query with display mode
-    try executeParquetQueryWithMode(allocator, &query, mode);
+    // Execute using new Planner Pipeline
+    try executeViaPlanner(allocator, &query, mode);
+}
+
+/// Execute query using the new Planner/Physical Engine
+fn executeViaPlanner(allocator: std.mem.Allocator, query: *const glacier.sql.Query, mode: DisplayMode) !void {
+    _ = mode; // TODO: Implement display mode handling in printer
+    
+    // 1. Logical Plan
+    var planner_inst = glacier.planner.Planner.init(allocator);
+    const logical_plan = glacier.planner.Planner.createLogicalPlan(&planner_inst, query) catch |err| {
+        std.debug.print("[PLANNER ERROR] {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer logical_plan.deinit(allocator);
+
+    // 2. Physical Plan
+    // Recursive builder logic integrated here or helper
+    var physical_plan = try buildPhysicalPlan(allocator, logical_plan);
+    defer physical_plan.deinit();
+
+    // 3. Execute
+    var iterator = try physical_plan.execute(allocator);
+    defer iterator.deinit();
+
+    // 4. Print Results
+    var batch_count: usize = 0;
+    var row_count: usize = 0;
+    
+    while (try iterator.next()) |batch| {
+        var mut_batch = batch;
+        defer mut_batch.deinit();
+        
+        batch_count += 1;
+        row_count += mut_batch.row_count;
+        
+        // Print first batch as preview (and schema)
+        if (batch_count == 1) {
+             printBatch(&mut_batch);
+        }
+    }
+    
+    std.debug.print("\nScanned {d} batches, {d} rows.\nFrom {s}\n", .{batch_count, row_count, query.from_table});
+}
+
+fn buildPhysicalPlan(allocator: std.mem.Allocator, logic: glacier.planner.LogicalPlan) !glacier.physical.ExecutionPlan {
+    switch (logic) {
+        .scan => |node| {
+            return glacier.physical.ScanExec.create(allocator, node);
+        },
+        .filter => |node| {
+            const input_plan = try buildPhysicalPlan(allocator, node.input);
+            return glacier.physical.FilterExec.create(allocator, input_plan, node.condition);
+        },
+        .projection => |node| {
+            // For POC: Pass-through (assume SELECT *)
+            // Ideally: Implement ProjectionExec
+            // If we want to support column selection, we need ProjectionExec.
+            // For now, just execute input.
+            // WARNING: This returns input plan directly.
+            return buildPhysicalPlan(allocator, node.input);
+        },
+        .limit => |node| {
+             // Ignore limit for now, just scan all
+             return buildPhysicalPlan(allocator, node.input);
+        },
+        else => {
+            std.debug.print("[ERROR] Unsupported logical node: {s}\n", .{@tagName(logic)});
+            return error.UnsupportedPlan;
+        }
+    }
+}
+
+fn printBatch(batch: *glacier.batch.Batch) void {
+    std.debug.print("\n+------------------------------------------------+\n", .{});
+    // Print Header
+    for (batch.schema.columns, 0..) |col, i| {
+        std.debug.print("{s: <15}", .{col.name});
+        if (i < batch.schema.columns.len - 1) std.debug.print("| ", .{});
+    }
+    std.debug.print("\n+------------------------------------------------+\n", .{});
+    
+    // Print Rows (up to 10)
+    const limit = @min(batch.row_count, 10);
+    for (0..limit) |row_idx| {
+        for (batch.schema.columns, 0..) |col, col_idx| {
+             const col_vec = batch.column(col_idx);
+             if (col_vec.isNull(row_idx)) {
+                 std.debug.print("NULL           ", .{});
+             } else {
+                 switch (col.data_type) {
+                     .int64 => std.debug.print("{d: <15}", .{col_vec.getValue(i64, row_idx).?}),
+                     .int32 => std.debug.print("{d: <15}", .{col_vec.getValue(i32, row_idx).?}),
+                     .float32 => std.debug.print("{d: <15.2}", .{col_vec.getValue(f32, row_idx).?}),
+                     .float64 => std.debug.print("{d: <15.2}", .{col_vec.getValue(f64, row_idx).?}),
+                     .string => {
+                         const slice = col_vec.getValue([]u8, row_idx).?;
+                         // Truncate for display if needed
+                         if (slice.len > 15) {
+                             std.debug.print("{s}...", .{slice[0..12]});
+                         } else {
+                            std.debug.print("{s: <15}", .{slice});
+                         }
+                     },
+                     else => std.debug.print("?              ", .{}),
+                 }
+             }
+             if (col_idx < batch.schema.columns.len - 1) std.debug.print("| ", .{});
+        }
+        std.debug.print("\n", .{});
+    }
 }
 
 /// Execute aggregate query on Iceberg table (processes multiple data files)
