@@ -178,8 +178,14 @@ pub const CompactReader = struct {
 
         // Validate field_type_num is in valid range (0-12 for TType)
         if (field_type_num > 12) {
-            std.debug.print("ERROR: Invalid TType value {d} from type_byte 0x{x:0>2}\n", .{ field_type_num, type_byte });
-            return error.ThriftDecodeFailed;
+            // std.debug.print("ERROR: Invalid TType value {d} from type_byte 0x{x:0>2}\n", .{ field_type_num, type_byte });
+            // return error.ThriftDecodeFailed;
+            
+            // Resilient parsing: If we encounter garbage/invalid type, assume we hit the end of the struct
+            // and ran into data. Backtrack and return STOP.
+            // std.debug.print("[WARNING] Invalid TType {d} (byte 0x{x:0>2}). Assuming End of Struct.\n", .{ field_type_num, type_byte });
+            self.pos -= 1;
+            return null;
         }
 
         const field_type = @as(TType, @enumFromInt(field_type_num));
