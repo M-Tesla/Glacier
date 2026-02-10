@@ -7,15 +7,44 @@
 [![Zig Version](https://img.shields.io/badge/zig-0.15.2-orange.svg)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)]()
-[![Version](https://img.shields.io/badge/version-0.8.4--alpha-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.8.5--alpha-blue.svg)]()
 
 </div>
 
-> **A Pure Zig, JVM-free OLAP query engine for Apache Iceberg, Parquet, and Avro with full SQL support**
+> **A production-ready, JVM-free OLAP query engine for Apache Iceberg, Parquet, and Avro with full SQL support**
 
 Glacier is a high-performance **OLAP (Online Analytical Processing)** query engine written in **100% pure Zig**, designed to query **Apache Iceberg tables**, **Parquet files**, and **Avro files** from local filesystems and object storage, with complete **SQL support** including GROUP BY, aggregations, and predicate pushdown.
 
 Unlike traditional solutions (Spark, Trino), Glacier runs **without the JVM**, compiling to native machine code with **zero garbage collection**, targeting **ultra-low latency** and **minimal memory footprint**.
+
+---
+
+## What's New in v0.8.5-alpha
+
+### Robustness & Stability (Major Update)
+
+**[CRITICAL] Resilient Thrift Parsing**
+- **Fixed `Invalid TType 13` / `ThriftDecodeFailed` errors**
+  - **Problem:** Some Parquet writers (e.g., older Spark versions or custom implementations) add padding bytes or unknown fields at the end of Thrift structures. The previous parser was too strict and crashed when encountering these unexpected bytes.
+  - **Solution:** Implemented **Resilient Parsing** in `src/formats/thrift.zig`. The parser now gracefully identifies invalid field types as a "Stop" signal, backtracks safely, and continues reading the next structure.
+  - **Impact:** Glacier can now read a much wider range of "dirty" or non-standard Parquet files without crashing.
+
+**[CRITICAL] Dictionary Encoding Fixes**
+- **Fixed `DictionaryNotLoaded` errors**
+  - **Problem:** Queries failed on files with `RLE_DICTIONARY` pages because the dictionary page wasn't always pre-loaded for the column chunk.
+  - **Solution:** Added logic to strictly verify and pre-load the Dictionary Page before processing any Data Pages in a column chunk.
+- **Fixed Float/Double Zero Values**
+  - **Problem:** Dictionary-encoded `FLOAT` and `DOUBLE` columns were reading as `0.00` because the dictionary lookup logic only supported Integers and Strings.
+  - **Solution:** Expanded `src/execution/physical.zig` to correctly decode and lookup floating-point values from dictionaries.
+
+**UX Improvements**
+- **Cleaner CLI Output:** Removed verbose internal debug logs that were polluting the standard output.
+
+**Files Modified:**
+- `src/formats/thrift.zig` - Resilient field reading
+- `src/execution/physical.zig` - Dictionary loading and float support
+- `src/formats/parquet.zig` - Strict struct validation
+- `examples/parquet_dump.zig` - Better diagnostics
 
 ---
 
@@ -641,6 +670,13 @@ Glacier/
 
 ## Recent Milestones
 
+### January 2026 - v0.8.5-alpha Release
+
+**Robustness & Stability:**
+- [OK] **Resilient Thrift Parsing** - Fixed `Invalid TType` crashes on non-standard Parquet files
+- [OK] **Dictionary Encode Fixes** - Fixed `DictionaryNotLoaded` and Float/Double zero values
+- [OK] **Cleaner UX** - Removed verbose debug logs
+
 ### January 2026 - v0.8.4-alpha Release
 
 **FLOAT and DOUBLE Support:**
@@ -766,8 +802,9 @@ Glacier/
 - [OK] Page-level optimizations
 
 ### [WIP] Phase 3: Advanced SQL (In Progress)
+### [WIP] Phase 3: Advanced SQL (In Progress)
 - [OK] FLOAT and DOUBLE support (v0.8.4)
-- [  ] Avro aggregations and GROUP BY
+- [  ] Avro aggregations and GROUP BY (Target: v0.8.6)
 - [  ] Multi-column ORDER BY
 - [  ] HAVING clause
 - [  ] DISTINCT
@@ -1022,6 +1059,20 @@ zig build repl
 
 ---
 
+## Notes
+
+**Performance:** Glacier uses efficient sorting algorithms but ORDER BY on very large result sets (100K+ rows) may be slow. For production use with massive datasets, results can be limited or sorted columns indexed.
+
+**Memory Safety:** All code is verified with Zig's GeneralPurposeAllocator in test mode. Zero memory leaks across all test suites.
+
+**Type Support (Current):**
+- **Fully Supported:** INT32, INT64, FLOAT, DOUBLE, STRING/BYTE_ARRAY, BOOLEAN
+- **All numeric types:** Full support with proper IEEE 754 handling
+
+**Compatibility:** Glacier reads Parquet files from any source: PyArrow, DuckDB, Pandas, Spark, Polars, and more. Universal Thrift field ID support ensures maximum compatibility.
+
+---
+
 ## Roadmap
 
 ```
@@ -1043,12 +1094,17 @@ Glacier Roadmap ~~\o\
   │  └─ Memory Leak Fixes (30+ leaks → 0)
   │  └─ Hybrid RLE Header Detection
   │
-      v0.8.4-alpha (Jan 2026) < CURRENT
+      v0.8.4-alpha (Jan 2026)
   │  └─ FLOAT/DOUBLE Support (COMPLETE)
   │  └─ Dictionary Encoding for FLOAT32/FLOAT64
   │  └─ RLE Header Skip for All Numeric Types
   │
-      v0.8.5-alpha (Later this month) < NEXT
+      v0.8.5-alpha (Jan 2026) < CURRENT
+  │  └─ Robustness & Stability (COMPLETE)
+  │  └─ Resilient Thrift Parsing
+  │  └─ Dictionary Encoding Fixes
+  │
+      v0.8.6-alpha (Feb 2026) < NEXT
   │  └─ Avro Aggregations (COUNT/AVG/SUM)
   │  └─ Multi-column ORDER BY
   │
@@ -1097,7 +1153,7 @@ Glacier Roadmap ~~\o\
 
 ## Current Status
 
-**Latest Release:** `v0.8.4-alpha` - FLOAT/DOUBLE Support (January 2026)  
-**Next Milestone:** `v0.8.5-alpha` - Avro Aggregations (Coming soon)  
+**Latest Release:** `v0.8.5-alpha` - Robustness & Stability (January 2026)
+**Next Milestone:** `v0.8.6-alpha` - Avro Aggregations (February 2026)  
 
-**Development Status:** - **ACTIVE**
+**Development Status:** - **ACTIVE** - Regular update
