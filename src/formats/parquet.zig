@@ -462,6 +462,7 @@ fn parsePageHeader(allocator: std.mem.Allocator, data: []const u8) !PageHeader {
     var dictionary_page_header: ?DictionaryPageHeader = null;
 
     while (try reader.readFieldBegin()) |field| {
+        // std.debug.print("[Parquet] parsePageHeader Field id={d} type={}\n", .{field.field_id, field.field_type});
         switch (field.field_id) {
             1 => { // type
                 const type_val = try reader.readVarint32();
@@ -474,12 +475,21 @@ fn parsePageHeader(allocator: std.mem.Allocator, data: []const u8) !PageHeader {
                 compressed_page_size = try reader.readVarint32();
             },
             5 => { // data_page_header
-                data_page_header = try parseDataPageHeader(allocator, &reader);
+                if (field.field_type == .STRUCT) {
+                    data_page_header = try parseDataPageHeader(allocator, &reader);
+                } else {
+                    try reader.skip(field.field_type);
+                }
             },
             7 => { // dictionary_page_header
-                dictionary_page_header = try parseDictionaryPageHeader(allocator, &reader);
+                if (field.field_type == .STRUCT) {
+                    dictionary_page_header = try parseDictionaryPageHeader(allocator, &reader);
+                } else {
+                    try reader.skip(field.field_type);
+                }
             },
             else => {
+                // std.debug.print("[Parquet] parsePageHeader Skipping unknown field {d}\n", .{field.field_id});
                 try reader.skip(field.field_type);
             },
         }
@@ -616,6 +626,7 @@ pub const Reader = struct {
 
         // Parse page header from buffer
         // If buffer is too small, parsePageHeader will return error
+        // std.debug.print("[Parquet] readDataPage offset={d} initial_bytes={d} first_bytes={any}\n", .{offset, initial_bytes_read, initial_buffer[0..@min(initial_bytes_read, 32)]});
         const page_header = try parsePageHeader(allocator, initial_buffer[0..initial_bytes_read]);
 
         // SANITY CHECK: Validate page sizes
