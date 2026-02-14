@@ -1017,7 +1017,7 @@ For questions and support, open an [Issue](../../issues) on GitHub.
 
 <div align="center">
 
-**Glacier v0.8.3-alpha** - Built with Pure Zig
+**Glacier v0.8.5-alpha** - Built with Pure Zig
 
 **Status:** [ALPHA] Active Development
 
