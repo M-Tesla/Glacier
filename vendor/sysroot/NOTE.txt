@@ -1,0 +1,2 @@
+Unversioned libzstd.so for the Zig linker (host has only libzstd.so.1; no libzstd-dev).
+Do not copy the .so into the tree. Recreate: ln -sfn "$(find /usr/lib -name libzstd.so.1 | head -1)" vendor/sysroot/lib/libzstd.so

@@ -1,0 +1,5 @@
+Apache Avro C (libavro) 1.11.3, lang/c only.
+https://github.com/apache/avro/releases/tag/release-1.11.3
+Apache-2.0. Compiled from source in build.zig (no CMake).
+Deflate via zlib (`-DDEFLATE_CODEC`). Snappy/LZMA codecs off — Iceberg manifests and
+our fixtures use the null codec. Schema JSON parsing uses vendored Jansson.

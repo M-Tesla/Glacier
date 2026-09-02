@@ -1,0 +1,4 @@
+Carquet 0.7.1 (C11, MIT), vendored from https://github.com/Vitruves/carquet
+Nearest public tag in build.zig.zon is v0.7.0 (0.7.1 was untagged when vendored).
+Compiled from vendor/ in build.zig. Native: system zlib + libzstd, vendored lz4, snappy.c with -mssse3.
+WASM: vendored zlib, zstd stub, serial worker pool. Tree is include/ + src/ only.

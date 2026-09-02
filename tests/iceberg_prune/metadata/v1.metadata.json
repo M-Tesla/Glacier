@@ -1,0 +1,25 @@
+{
+  "format-version": 2,
+  "table-uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "location": "iceberg_prune",
+  "last-updated-ms": 1700000000000,
+  "last-column-id": 3,
+  "current-snapshot-id": 1,
+  "current-schema-id": 0,
+  "default-spec-id": 0,
+  "partition-specs": [{ "spec-id": 0, "fields": [] }],
+  "schemas": [{
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "id", "required": true, "type": "long"},
+      {"id": 2, "name": "price", "required": true, "type": "long"},
+      {"id": 3, "name": "category", "required": true, "type": "string"}
+    ]
+  }],
+  "snapshots": [{
+    "snapshot-id": 1,
+    "timestamp-ms": 1700000000000,
+    "sequence-number": 1,
+    "manifest-list": "metadata/snap-1.avro"
+  }]
+}

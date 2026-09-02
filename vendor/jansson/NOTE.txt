@@ -1,0 +1,3 @@
+Jansson 2.14, required by Apache Avro C for schema JSON.
+https://github.com/akheron/jansson/releases/tag/v2.14
+MIT. Config headers in src/ are hand-filled for Linux/glibc (no autotools).

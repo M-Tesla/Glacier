@@ -1,0 +1,11 @@
+{
+  "name": "glacier",
+  "version": "0.1.0",
+  "description": "Glacier OLAP engine — N-API on glacier.h",
+  "main": "index.js",
+  "gypfile": true,
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "test": "node test.mjs"
+  }
+}

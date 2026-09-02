@@ -1,0 +1,2 @@
+Apache nanoarrow 0.9.0, bundled with `ci/scripts/bundle.py --symbol-namespace=Glacier`.
+Do not include nanoarrow.h from public glacier.h — consumers only see Arrow C Data structs.

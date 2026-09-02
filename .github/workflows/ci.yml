@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-linux
+            os: ubuntu-latest
+          - name: x86_64-macos
+            os: macos-13
+          - name: aarch64-macos
+            os: macos-14
+          - name: x86_64-windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libzstd-dev zlib1g-dev python3
+
+      - name: macOS deps
+        if: runner.os == 'macOS'
+        run: |
+          brew install zstd
+          echo "LIBRARY_PATH=$(brew --prefix zstd)/lib:${LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "CPATH=$(brew --prefix zstd)/include:${CPATH}" >> "$GITHUB_ENV"
+
+      - name: Windows deps
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-zstd mingw-w64-x86_64-zlib
+          update: false
+
+      - name: Windows library path
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "LIBRARY_PATH=C:/msys64/mingw64/lib" >> "$GITHUB_ENV"
+          echo "CPATH=C:/msys64/mingw64/include" >> "$GITHUB_ENV"
+
+      - name: Test
+        if: runner.os != 'Windows'
+        run: zig build test
+
+      - name: Build
+        if: runner.os == 'Windows'
+        run: zig build
+
+      - name: fmt
+        if: runner.os == 'Linux'
+        run: zig fmt --check build.zig glacier_repl.zig src tools
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+      - run: zig build wasm
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Linux deps
+        run: sudo apt-get update && sudo apt-get install -y libzstd-dev zlib1g-dev
+      - name: Build lib
+        run: zig build -Doptimize=ReleaseFast
+      - name: pytest
+        run: |
+          python3 -m pip install pytest
+          python3 -m pip install bindings/python
+          python3 -m pytest bindings/python/tests

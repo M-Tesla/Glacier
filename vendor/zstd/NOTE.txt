@@ -1,0 +1,4 @@
+zstd 1.5.7 headers (`zstd.h`, `zstd_errors.h`) from facebook/zstd.
+Linked against system libzstd (see vendor/sysroot/lib/libzstd.so).
+Needed so carquet `src/compression/zstd.c` compiles without libzstd-dev.
+BSD / GPLv2 dual license (zstd).

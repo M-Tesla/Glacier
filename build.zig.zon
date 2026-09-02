@@ -1,0 +1,37 @@
+.{
+    .name = .glacier,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xc00d1b7971b42ef4,
+    // Compile source is vendor/ (jansson config headers are hand-filled; nanoarrow
+    // is bundled with --symbol-namespace=Glacier). build.zig does not call
+    // b.dependency() for these. url+hash are the upstream tarballs for audit.
+    .dependencies = .{
+        .carquet = .{
+            .url = "https://github.com/Vitruves/carquet/archive/refs/tags/v0.7.0.tar.gz",
+            .hash = "N-V-__8AAOirTwABP-kIYR9SegojmCg3kSzW8PLJVpJxjCdH",
+        },
+        .nanoarrow = .{
+            .url = "https://github.com/apache/arrow-nanoarrow/archive/refs/tags/apache-arrow-nanoarrow-0.9.0.tar.gz",
+            .hash = "N-V-__8AAGM6XQCUXNkVhBS9UZxjHLJDtX1gkhvDBI2e0wTY",
+        },
+        .avro = .{
+            .url = "https://github.com/apache/avro/archive/refs/tags/release-1.11.3.tar.gz",
+            .hash = "N-V-__8AAPU44AAPDgKqUX1HyO0Z5WpFuHhlCzRKSf8rXRJk",
+        },
+        .jansson = .{
+            .url = "https://github.com/akheron/jansson/archive/refs/tags/v2.14.tar.gz",
+            .hash = "N-V-__8AAD4lCgD2BmnfMPAgzXJOskWE-Zwzgq058IoNsR8_",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tools",
+        "include",
+        "LICENSE",
+        "README.md",
+        "WORKPLAN.md",
+    },
+}

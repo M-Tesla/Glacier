@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glacier"
+version = "0.1.0"
+description = "Glacier OLAP engine — Zig query engine, C ABI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+arrow = ["pyarrow>=14"]
+pandas = ["pyarrow>=14", "pandas"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["glacier*"]
+
+[tool.setuptools.package-data]
+glacier = ["*.so", "*.dylib", "*.dll"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

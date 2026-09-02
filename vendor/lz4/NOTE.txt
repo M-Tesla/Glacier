@@ -1,0 +1,3 @@
+LZ4 v1.10.0 (`lz4.c` / `lz4.h` from https://github.com/lz4/lz4).
+Compiled into Glacier so carquet's `src/compression/lz4.c` can include `<lz4.h>`
+without liblz4-dev. BSD-2-Clause.

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Glacier wasm</title>
+</head>
+<body>
+  <p>Load <code>glacier.wasm</code> (from <code>zig-out/bin/glacier.wasm</code>) and a parquet file. Queries run in memory — no <code>std.fs</code>.</p>
+  <input id="wasm" type="file" accept=".wasm" />
+  <input id="parquet" type="file" accept=".parquet" />
+  <pre id="out"></pre>
+  <script type="module">
+    import { Glacier } from "./glacier.js";
+    const out = document.getElementById("out");
+    let wasmBytes = null;
+    document.getElementById("wasm").addEventListener("change", async (e) => {
+      wasmBytes = new Uint8Array(await e.target.files[0].arrayBuffer());
+      out.textContent = "wasm loaded\n";
+    });
+    document.getElementById("parquet").addEventListener("change", async (e) => {
+      if (!wasmBytes) { out.textContent = "pick glacier.wasm first"; return; }
+      const g = await Glacier.instantiate(wasmBytes);
+      const parquet = new Uint8Array(await e.target.files[0].arrayBuffer());
+      const db = g.openBuffer(parquet);
+      const result = g.query(db, "SELECT COUNT(*)");
+      out.textContent = `glacier ${g.version()}\nquery ok (Arrow export is glacier_result_arrow; this page only checks COUNT runs)\n`;
+      g.destroyResult(result);
+      g.close(db);
+    });
+  </script>
+</body>
+</html>
