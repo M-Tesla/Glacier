@@ -12,7 +12,7 @@
 
 </div>
 
-Glacier is an OLAP engine. You open an Iceberg table, a Parquet file, or an Avro file — locally, over `https://`, or on `s3://` — and run SQL. Results come back as a columnar batch (Arrow C Data on the public ABI).
+Glacier is an OLAP engine. You open an Iceberg table, a Parquet file or an Avro file. You can run locally, over `https://`, or on `s3://` and run SQL. Results come back as a columnar batch (Arrow C Data on the public ABI).
 
 The query engine is Zig 0.16. Parquet, Avro, and in-memory Arrow are small C libraries (carquet, libavro, nanoarrow), not a from-scratch codec stack.
 
