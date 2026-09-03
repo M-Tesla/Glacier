@@ -314,7 +314,7 @@ fn httpExchange(
         }
         extra_all = signed_extra[0..n];
     } else {
-        ua_headers[0] = .{ .name = "user-agent", .value = "glacier/0.1" };
+        ua_headers[0] = .{ .name = "user-agent", .value = "glacier/0.2" };
         for (extra, 0..) |e, i| ua_headers[1 + i] = e;
         extra_all = ua_headers[0 .. 1 + extra.len];
     }

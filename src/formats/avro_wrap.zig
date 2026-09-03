@@ -57,6 +57,7 @@ const c = struct {
         upper: [*]const i64,
         n: c_int,
         bound_field_id: i32,
+        contents: ?[*]const i32,
     ) c_int;
     extern fn glacier_avro_write_sales_rows(
         path: [*:0]const u8,
@@ -271,9 +272,11 @@ pub fn writeDataManifest(
     lower: []const i64,
     upper: []const i64,
     bound_field_id: i32,
+    contents: []const i32,
 ) !void {
     if (file_paths.len == 0 or file_paths.len != counts.len or file_paths.len != lower.len or file_paths.len != upper.len)
         return error.AvroWriteFailed;
+    if (contents.len != 0 and contents.len != file_paths.len) return error.AvroWriteFailed;
     if (c.glacier_avro_write_iceberg_manifest(
         path.ptr,
         file_paths.ptr,
@@ -282,6 +285,7 @@ pub fn writeDataManifest(
         upper.ptr,
         @intCast(file_paths.len),
         bound_field_id,
+        if (contents.len == 0) null else contents.ptr,
     ) != 0) return error.AvroWriteFailed;
 }
 

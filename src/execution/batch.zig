@@ -84,12 +84,17 @@ pub const Batch = struct {
     }
 
     /// Exact name, or a unique `alias.col` suffix. Two matches → AmbiguousColumn.
+    /// `t.id` also matches a unique column named `id` (FROM subquery / CTE).
     pub fn lookup(self: Batch, name: []const u8) !usize {
         if (self.columnIndex(name)) |i| return i;
+        if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+            if (self.columnIndex(name[dot + 1 ..])) |i| return i;
+        }
         var found: ?usize = null;
+        const tail = if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
         for (self.columns, 0..) |col, i| {
-            const dot = std.mem.lastIndexOfScalar(u8, col.name, '.') orelse continue;
-            if (!std.ascii.eqlIgnoreCase(col.name[dot + 1 ..], name)) continue;
+            const cdot = std.mem.lastIndexOfScalar(u8, col.name, '.') orelse continue;
+            if (!std.ascii.eqlIgnoreCase(col.name[cdot + 1 ..], tail)) continue;
             if (found != null) return error.AmbiguousColumn;
             found = i;
         }

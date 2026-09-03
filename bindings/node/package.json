@@ -1,6 +1,6 @@
 {
   "name": "glacier",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Glacier OLAP engine — N-API on glacier.h",
   "main": "index.js",
   "gypfile": true,

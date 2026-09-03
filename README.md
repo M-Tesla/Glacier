@@ -7,8 +7,8 @@
 [![Zig Version](https://img.shields.io/badge/zig-0.16.0-orange.svg)](https://ziglang.org/)
 [![CI](https://github.com/M-Tesla/Glacier/actions/workflows/ci.yml/badge.svg)](https://github.com/M-Tesla/Glacier/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-0.1-blue.svg)]()
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)]()
+[![Status](https://img.shields.io/badge/status-0.2-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)]()
 
 </div>
 
@@ -16,17 +16,32 @@ Glacier is an OLAP engine. You open an Iceberg table, a Parquet file or an Avro 
 
 The query engine is Zig 0.16. Parquet, Avro, and in-memory Arrow are small C libraries (carquet, libavro, nanoarrow), not a from-scratch codec stack.
 
-**0.1.0** is the first version that matches this description. It was built and tested on **Linux**. The commands in this README are bash (`export`, `$ZIG`, `./zig-out/bin/glacier`, `libglacier.so`). They are not a Windows playbook; cmd/PowerShell, `.exe` / `.dll`, and paths will differ, and that path was not used here.
+**0.2.0** is the version that matches this description: analysis SQL on an Iceberg table, a Parquet file, or an Avro file. It was built and tested on **Linux**. The commands in this README are bash (`export`, `$ZIG`, `./zig-out/bin/glacier`, `libglacier.so`). They are not a Windows playbook; cmd/PowerShell, `.exe` / `.dll`, and paths will differ, and that path was not used here.
 
 CI in this repo: `zig build test` on Linux and macOS; on Windows only `zig build` (compile, no test suite). The Python and WASM jobs run on Ubuntu.
 
 ---
 
-## What 0.1 does
+## Update v0.2
 
-**SQL.** `SELECT` (including `SELECT 1` with no table), `DISTINCT`, `WHERE` (`AND` / `OR`, comparisons, `IS [NOT] NULL`), `GROUP BY` / `HAVING`, `ORDER BY` (several columns; nulls last on `ASC`), `LIMIT` / `OFFSET`. Aggregates: `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` (`COUNT(*)` counts every row; the others skip nulls). `INNER JOIN … ON` (equalities, including `AND` of equalities). Window: `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` / `ROW_NUMBER` / `RANK` / `DENSE_RANK` with `OVER ([PARTITION BY …] [ORDER BY …])` — no `ROWS` / `RANGE` frame. Scalars: `abs`, `round`, `cast`, `coalesce`. `COPY TO` writes a native `.glacier` file you can open again.
+What 0.2 adds on top of 0.1 (the SQL surface that 0.1 froze and refused):
 
-**Data.** Parquet (Snappy, GZIP, LZ4, ZSTD), Avro (null / deflate / snappy), Iceberg (`metadata.json` + Avro manifests, prune by column bounds). Optional Parquet columns are real SQL nulls. Nested lists/structs are rejected.
+- **JOIN.** `LEFT` / `RIGHT` / `FULL JOIN … ON` (equalities, including `AND` of equalities). Null keys do not match. LEFT keeps every left row.
+- **Predicates and scalars.** `LIKE`, `IN` (literals or uncorrelated `SELECT`), `BETWEEN`, `CASE WHEN … THEN … ELSE … END`, `SELECT NULL`.
+- **Set and subquery.** `UNION` / `UNION ALL` (same schema), `FROM (SELECT …)`, `WITH t AS (SELECT …)`, scalar subquery in `WHERE`.
+- **Window.** `ROWS` / `RANGE` frames (`UNBOUNDED PRECEDING` / `FOLLOWING`, `CURRENT ROW`, `N PRECEDING` / `FOLLOWING`), `LAG` / `LEAD`, window after `GROUP BY`.
+- **Iceberg.** Position and equality deletes on scan. Partition prune for `bucket[N]` / `year` / `month` / `day` / `hour` / `truncate[W]` / `void`, not only file bounds. Snapshot `schema-id` may differ from `current-schema-id` (promote int32→int64 / float32→float64; incompatible types error; new optional columns are null).
+- **Parquet nested.** A LIST of primitives is utf8 (`[1, 2, 3]`). Flat STRUCT leaves are columns. Maps and nested lists stay rejected.
+
+Linux is still the tested path. `glacier.api_version()` is still `1`.
+
+---
+
+## What 0.2 does
+
+**SQL.** `SELECT` (including `SELECT 1` / `SELECT NULL` with no table), `DISTINCT`, `WHERE` (`AND` / `OR`, comparisons, `IS [NOT] NULL`, `LIKE`, `IN (literals or uncorrelated SELECT)`, `BETWEEN`, scalar subquery), `GROUP BY` / `HAVING`, `ORDER BY` (several columns; nulls last on `ASC`), `LIMIT` / `OFFSET`, `UNION` / `UNION ALL` (same schema), `FROM (SELECT …)`, `WITH t AS (SELECT …)`. Aggregates: `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` (`COUNT(*)` counts every row; the others skip nulls). `INNER` / `LEFT` / `RIGHT` / `FULL JOIN … ON` (equalities, including `AND` of equalities; null keys do not match; LEFT keeps every left row). Window: `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` / `ROW_NUMBER` / `RANK` / `DENSE_RANK` / `LAG` / `LEAD` with `OVER ([PARTITION BY …] [ORDER BY …] [ROWS|RANGE …])`. Frames: `UNBOUNDED PRECEDING` / `FOLLOWING`, `CURRENT ROW`, `N PRECEDING` / `FOLLOWING`; `RANGE` offsets need a single numeric `ORDER BY`. Window after `GROUP BY` is allowed. Scalars: `abs`, `round`, `cast`, `coalesce`, `CASE WHEN … THEN … ELSE … END`. `COPY TO` writes a native `.glacier` file you can open again.
+
+**Data.** Parquet (Snappy, GZIP, LZ4, ZSTD), Avro (null / deflate / snappy), Iceberg (`metadata.json` + Avro manifests). Iceberg prune uses column bounds and partition values (`identity`, `bucket[N]`, `year` / `month` / `day` / `hour`, `truncate[W]`, `void`; unknown transform is still rejected). Position and equality deletes (`content` 1 / 2) are applied on scan. Schema evolution: a snapshot `schema-id` may differ from `current-schema-id`; int32 promotes to int64 and float32 to float64; incompatible types error; new optional columns are null. Optional Parquet columns are real SQL nulls. A LIST of primitives is utf8 (`[1, 2, 3]`, `["a"]`). Flat STRUCT leaves are ordinary columns. Maps and nested lists (`max_rep_level > 1`) are rejected.
 
 **Access.** Local path, `http(s)://` Range GET, `s3://` (SigV4; `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or `~/.aws/credentials`; `AWS_ENDPOINT_URL` for path-style). Large scans stream; `ORDER BY` / `GROUP BY` / `DISTINCT` can spill under `GLACIER_MEM` (default 256 MiB) into `$GLACIER_TEMP`.
 
@@ -34,9 +49,9 @@ CI in this repo: `zig build test` on Linux and macOS; on Windows only `zig build
 
 ---
 
-## What 0.1 does not do
+## What 0.2 does not do
 
-LEFT / RIGHT / FULL JOIN, `USING` / `NATURAL` / comma-join, subqueries, CTEs, window frames, `LAG` / `LEAD`, `SELECT NULL` as a bare literal. Azure Blob and GCS. ZSTD inside the WASM build (Snappy / GZIP / LZ4 work). A manylinux / PyPI wheel — `pip install bindings/python` after a local `$ZIG build` on Linux does. A tested Windows (or native cmd) flow.
+`USING` / `NATURAL` / comma-join, correlated subqueries, recursive `WITH`, `EXISTS`, subquery in the select list, named `WINDOW` clause, `GROUPS` frames. Azure Blob and GCS. ZSTD inside the WASM build (Snappy / GZIP / LZ4 work). A manylinux / PyPI wheel — `pip install bindings/python` after a local `$ZIG build` on Linux does. A tested Windows (or native cmd) flow.
 
 ---
 
@@ -99,9 +114,9 @@ cd bindings/rust && cargo test
 
 ## What to expect next
 
-0.1 stays on this SQL surface until the next minor. The line after that is LEFT JOIN (nulls are already in the batch), then window frames, then a manylinux wheel so `pip install glacier` does not need Zig on the machine. Running the test suite on Windows (today CI only compiles there) and documenting those commands comes with that. Azure / GCS and richer SQL (subquery, CTE) come after that. Parallel scan and extra formats are not on the 0.1 board.
+A manylinux wheel so `pip install glacier` does not need Zig, and the Windows test suite. Azure / GCS and parallel scan are not on that board.
 
-Issues and CI live in this repo. The engine version is `0.1.0`; `glacier.api_version()` is `1`.
+Issues and CI live in this repo. The engine version is `0.2.0`; `glacier.api_version()` is `1`.
 
 ---
 

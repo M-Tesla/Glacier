@@ -733,7 +733,8 @@ GLACIER_INTERNAL int glacier_avro_write_iceberg_manifest(
     const int64_t *lower,
     const int64_t *upper,
     int n,
-    int32_t bound_field_id
+    int32_t bound_field_id,
+    const int32_t *contents
 ) {
     static const char schema_json[] =
         "{\"type\":\"record\",\"name\":\"manifest_entry\",\"fields\":["
@@ -764,7 +765,7 @@ GLACIER_INTERNAL int glacier_avro_write_iceberg_manifest(
         avro_value_set_int(&f, 1);
         avro_value_get_by_name(&rec, "data_file", &df, NULL);
         avro_value_get_by_name(&df, "content", &f, NULL);
-        avro_value_set_int(&f, 0);
+        avro_value_set_int(&f, contents ? contents[i] : 0);
         avro_value_get_by_name(&df, "file_path", &f, NULL);
         avro_value_set_string(&f, file_paths[i]);
         avro_value_get_by_name(&df, "file_format", &f, NULL);

@@ -135,6 +135,29 @@ GLACIER_INTERNAL int glacier_carquet_rb_column(
     return st == CARQUET_OK ? 0 : -1;
 }
 
+GLACIER_INTERNAL int glacier_carquet_rb_column_list(
+    void *batch,
+    int32_t index,
+    const int32_t **offsets,
+    int64_t *num_lists,
+    const void **values,
+    const uint8_t **value_validity,
+    int64_t *num_values,
+    const uint8_t **list_validity)
+{
+    if (!offsets || !num_lists || !values || !num_values) return -1;
+    const carquet_status_t st = carquet_row_batch_column_list(
+        (const carquet_row_batch_t *)batch,
+        index,
+        offsets,
+        num_lists,
+        values,
+        value_validity,
+        num_values,
+        list_validity);
+    return st == CARQUET_OK ? 0 : -1;
+}
+
 GLACIER_INTERNAL void glacier_carquet_close(void *reader) {
     carquet_reader_close((carquet_reader_t *)reader);
 }
@@ -666,6 +689,139 @@ GLACIER_INTERNAL int glacier_carquet_write_logical_fixture(const char *path) {
         carquet_writer_write_batch(writer, 1, uuids, 3, NULL, NULL) != CARQUET_OK ||
         carquet_writer_write_batch(writer, 2, ts_us, 3, NULL, NULL) != CARQUET_OK ||
         carquet_writer_write_batch(writer, 3, tstz_us, 3, NULL, NULL) != CARQUET_OK) {
+        (void)carquet_writer_close(writer);
+        return -1;
+    }
+    return carquet_writer_close(writer) == CARQUET_OK ? 0 : -1;
+}
+
+GLACIER_INTERNAL int glacier_carquet_write_pos_deletes(
+    const char *path,
+    const char *const *file_paths,
+    const int64_t *positions,
+    int32_t n
+) {
+    if (n <= 0) return -1;
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t *schema = carquet_schema_create(&err);
+    if (!schema) return -1;
+
+    carquet_logical_type_t str_lt = {0};
+    str_lt.id = CARQUET_LOGICAL_STRING;
+
+    if (carquet_schema_add_column(schema, "file_path", CARQUET_PHYSICAL_BYTE_ARRAY, &str_lt,
+                                 CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "pos", CARQUET_PHYSICAL_INT64, NULL,
+                                 CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) {
+        carquet_schema_free(schema);
+        return -1;
+    }
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_UNCOMPRESSED;
+    opts.write_crc = false;
+    opts.write_page_index = false;
+    opts.write_bloom_filters = false;
+
+    carquet_writer_t *writer = carquet_writer_create(path, schema, &opts, &err);
+    carquet_schema_free(schema);
+    if (!writer) return -1;
+
+    carquet_byte_array_t *paths = malloc((size_t)n * sizeof(*paths));
+    if (!paths) {
+        (void)carquet_writer_close(writer);
+        return -1;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        paths[i].data = (uint8_t *)file_paths[i];
+        paths[i].length = (int32_t)strlen(file_paths[i]);
+    }
+    const int ok =
+        carquet_writer_write_batch(writer, 0, paths, n, NULL, NULL) == CARQUET_OK &&
+        carquet_writer_write_batch(writer, 1, positions, n, NULL, NULL) == CARQUET_OK;
+    free(paths);
+    if (!ok) {
+        (void)carquet_writer_close(writer);
+        return -1;
+    }
+    return carquet_writer_close(writer) == CARQUET_OK ? 0 : -1;
+}
+
+GLACIER_INTERNAL int glacier_carquet_write_eq_i64_deletes(
+    const char *path,
+    const char *col_name,
+    const int64_t *vals,
+    int32_t n
+) {
+    if (n <= 0 || !col_name) return -1;
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t *schema = carquet_schema_create(&err);
+    if (!schema) return -1;
+
+    if (carquet_schema_add_column(schema, col_name, CARQUET_PHYSICAL_INT64, NULL,
+                                 CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) {
+        carquet_schema_free(schema);
+        return -1;
+    }
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_UNCOMPRESSED;
+    opts.write_crc = false;
+    opts.write_page_index = false;
+    opts.write_bloom_filters = false;
+
+    carquet_writer_t *writer = carquet_writer_create(path, schema, &opts, &err);
+    carquet_schema_free(schema);
+    if (!writer) return -1;
+
+    if (carquet_writer_write_batch(writer, 0, vals, n, NULL, NULL) != CARQUET_OK) {
+        (void)carquet_writer_close(writer);
+        return -1;
+    }
+    return carquet_writer_close(writer) == CARQUET_OK ? 0 : -1;
+}
+
+GLACIER_INTERNAL int glacier_carquet_write_struct_fixture(const char *path) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t *schema = carquet_schema_create(&err);
+    if (!schema) return -1;
+
+    carquet_logical_type_t str_lt = {0};
+    str_lt.id = CARQUET_LOGICAL_STRING;
+
+    const int32_t addr = carquet_schema_add_group(schema, "addr", CARQUET_REPETITION_REQUIRED, 0);
+    if (addr < 0 ||
+        carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64, NULL,
+                                 CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(schema, "city", CARQUET_PHYSICAL_BYTE_ARRAY, &str_lt,
+                                 CARQUET_REPETITION_REQUIRED, 0, addr) != CARQUET_OK) {
+        carquet_schema_free(schema);
+        return -1;
+    }
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_UNCOMPRESSED;
+    opts.write_crc = false;
+    opts.write_page_index = false;
+    opts.write_bloom_filters = false;
+
+    carquet_writer_t *writer = carquet_writer_create(path, schema, &opts, &err);
+    carquet_schema_free(schema);
+    if (!writer) return -1;
+
+    const int64_t ids[] = {1, 2};
+    static const char *cities[] = {"oslo", "bergen"};
+    carquet_byte_array_t city_ba[2];
+    city_ba[0].data = (uint8_t *)cities[0];
+    city_ba[0].length = (int32_t)strlen(cities[0]);
+    city_ba[1].data = (uint8_t *)cities[1];
+    city_ba[1].length = (int32_t)strlen(cities[1]);
+
+    if (carquet_writer_write_batch(writer, 0, ids, 2, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(writer, 1, city_ba, 2, NULL, NULL) != CARQUET_OK) {
         (void)carquet_writer_close(writer);
         return -1;
     }

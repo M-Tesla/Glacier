@@ -38,6 +38,16 @@ const c = struct {
         nulls: *?*const u8,
         n: *i64,
     ) c_int;
+    extern fn glacier_carquet_rb_column_list(
+        batch: ?*anyopaque,
+        index: i32,
+        offsets: *?[*]const i32,
+        num_lists: *i64,
+        values: *?*const anyopaque,
+        value_validity: *?[*]const u8,
+        num_values: *i64,
+        list_validity: *?[*]const u8,
+    ) c_int;
     extern fn glacier_carquet_close(reader: ?*anyopaque) void;
     extern fn glacier_carquet_num_rows(reader: ?*anyopaque) i64;
     extern fn glacier_carquet_num_columns(reader: ?*anyopaque) i32;
@@ -63,6 +73,19 @@ const c = struct {
     extern fn glacier_carquet_write_row_groups_fixture(path: [*:0]const u8) c_int;
     extern fn glacier_carquet_write_nested_fixture(path: [*:0]const u8) c_int;
     extern fn glacier_carquet_write_logical_fixture(path: [*:0]const u8) c_int;
+    extern fn glacier_carquet_write_pos_deletes(
+        path: [*:0]const u8,
+        file_paths: [*]const [*:0]const u8,
+        positions: [*]const i64,
+        n: i32,
+    ) c_int;
+    extern fn glacier_carquet_write_eq_i64_deletes(
+        path: [*:0]const u8,
+        col_name: [*:0]const u8,
+        vals: [*]const i64,
+        n: i32,
+    ) c_int;
+    extern fn glacier_carquet_write_struct_fixture(path: [*:0]const u8) c_int;
 };
 
 pub const PhysicalType = enum(c_int) {
@@ -187,6 +210,45 @@ pub const RowBatch = struct {
         const p = data orelse return error.ParquetOpenFailed;
         return .{ .ptr = @ptrCast(p), .n = n, .nulls = if (nulls) |nb| @ptrCast(nb) else null };
     }
+
+    pub const ListCol = struct {
+        offsets: []const i32,
+        values: [*]const u8,
+        n_lists: i64,
+        n_values: i64,
+        value_validity: ?[*]const u8,
+        list_validity: ?[*]const u8,
+    };
+
+    pub fn columnList(self: RowBatch, index: i32) !ListCol {
+        var offsets: ?[*]const i32 = null;
+        var n_lists: i64 = 0;
+        var values: ?*const anyopaque = null;
+        var value_validity: ?[*]const u8 = null;
+        var n_values: i64 = 0;
+        var list_validity: ?[*]const u8 = null;
+        if (c.glacier_carquet_rb_column_list(
+            self.ptr,
+            index,
+            &offsets,
+            &n_lists,
+            &values,
+            &value_validity,
+            &n_values,
+            &list_validity,
+        ) != 0) return error.ParquetOpenFailed;
+        const off = offsets orelse return error.ParquetOpenFailed;
+        const val = values orelse return error.UnsupportedNested;
+        const off_len: usize = @intCast(if (n_lists < 0) 0 else n_lists + 1);
+        return .{
+            .offsets = off[0..off_len],
+            .values = @ptrCast(val),
+            .n_lists = n_lists,
+            .n_values = n_values,
+            .value_validity = value_validity,
+            .list_validity = list_validity,
+        };
+    }
 };
 
 pub const BatchReader = struct {
@@ -288,6 +350,29 @@ pub fn writeNestedFixture(path: [:0]const u8) !void {
 pub fn writeLogicalFixture(path: [:0]const u8) !void {
     try ensureInit();
     if (c.glacier_carquet_write_logical_fixture(path.ptr) != 0) return error.ParquetWriteFailed;
+}
+
+pub fn writePosDeletes(
+    path: [:0]const u8,
+    file_paths: []const [*:0]const u8,
+    positions: []const i64,
+) !void {
+    try ensureInit();
+    if (file_paths.len == 0 or file_paths.len != positions.len) return error.ParquetWriteFailed;
+    if (c.glacier_carquet_write_pos_deletes(path.ptr, file_paths.ptr, positions.ptr, @intCast(file_paths.len)) != 0)
+        return error.ParquetWriteFailed;
+}
+
+pub fn writeEqI64Deletes(path: [:0]const u8, col_name: [:0]const u8, vals: []const i64) !void {
+    try ensureInit();
+    if (vals.len == 0) return error.ParquetWriteFailed;
+    if (c.glacier_carquet_write_eq_i64_deletes(path.ptr, col_name.ptr, vals.ptr, @intCast(vals.len)) != 0)
+        return error.ParquetWriteFailed;
+}
+
+pub fn writeStructFixture(path: [:0]const u8) !void {
+    try ensureInit();
+    if (c.glacier_carquet_write_struct_fixture(path.ptr) != 0) return error.ParquetWriteFailed;
 }
 
 pub const ByteArray = extern struct {

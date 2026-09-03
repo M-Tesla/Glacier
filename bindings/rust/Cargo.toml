@@ -1,6 +1,6 @@
 [package]
 name = "glacier"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Thin Rust wrapper around Glacier C ABI (include/glacier.h)"
 license = "MIT"
