@@ -18,7 +18,7 @@ The query engine is Zig 0.16. Parquet, Avro, and in-memory Arrow are small C lib
 
 **0.2.0** is the version that matches this description: analysis SQL on an Iceberg table, a Parquet file, or an Avro file. It was built and tested on **Linux**. The commands in this README are bash (`export`, `$ZIG`, `./zig-out/bin/glacier`, `libglacier.so`). They are not a Windows playbook; cmd/PowerShell, `.exe` / `.dll`, and paths will differ, and that path was not used here.
 
-CI in this repo: `zig build test` on Linux and macOS; on Windows only `zig build` (compile, no test suite). The Python and WASM jobs run on Ubuntu.
+CI in this repo: `zig build test` on Linux and macOS; on Windows only `zig build` (compile, no test suite). Python tests and manylinux wheels (`manylinux_2_28` x86_64 and aarch64) run on Ubuntu. WASM on Ubuntu.
 
 ---
 
@@ -45,13 +45,13 @@ Linux is still the tested path. `glacier.api_version()` is still `1`.
 
 **Access.** Local path, `http(s)://` Range GET, `s3://` (SigV4; `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or `~/.aws/credentials`; `AWS_ENDPOINT_URL` for path-style). Large scans stream; `ORDER BY` / `GROUP BY` / `DISTINCT` can spill under `GLACIER_MEM` (default 256 MiB) into `$GLACIER_TEMP`.
 
-**How you call it.** CLI `glacier` (TUI on a Linux terminal, or `-c SQL`). Shared library `libglacier.so` on Linux + [`include/glacier.h`](include/glacier.h). Bindings on that header: Python (`bindings/python`), WASM (`$ZIG build wasm`), Node, Go, Rust.
+**How you call it.** CLI `glacier` (TUI on a Linux terminal, or `-c SQL`). Shared library `libglacier.so` on Linux + [`include/glacier.h`](include/glacier.h). Bindings on that header: Python (`pip install glacier-olap`, or `bindings/python` after a local `$ZIG build`), Kof JVM (`bindings/kof`), WASM (`$ZIG build wasm`), Node, Go, Rust.
 
 ---
 
 ## What 0.2 does not do
 
-`USING` / `NATURAL` / comma-join, correlated subqueries, recursive `WITH`, `EXISTS`, subquery in the select list, named `WINDOW` clause, `GROUPS` frames. Azure Blob and GCS. ZSTD inside the WASM build (Snappy / GZIP / LZ4 work). A manylinux / PyPI wheel — `pip install bindings/python` after a local `$ZIG build` on Linux does. A tested Windows (or native cmd) flow.
+`USING` / `NATURAL` / comma-join, correlated subqueries, recursive `WITH`, `EXISTS`, subquery in the select list, named `WINDOW` clause, `GROUPS` frames. Azure Blob and GCS. ZSTD inside the WASM build (Snappy / GZIP / LZ4 work). A tested Windows (or native cmd) flow.
 
 ---
 
@@ -81,6 +81,14 @@ Output on Linux: `zig-out/bin/glacier`, `zig-out/lib/libglacier.so`, `zig-out/bi
 ## Python (Linux)
 
 ```bash
+pip install glacier-olap
+```
+
+The PyPI name is `glacier-olap` because `glacier` is taken. `import glacier` is unchanged. The wheel includes `libglacier.so`; you do not need Zig to run queries. CI builds `manylinux_2_28` wheels; a GitHub Release publishes them to PyPI. Until that upload exists, install a CI artifact or the source checkout below.
+
+From a source checkout:
+
+```bash
 $ZIG build -Doptimize=ReleaseFast
 python3 -m pip install bindings/python
 ```
@@ -99,7 +107,7 @@ n.execute("SELECT id WHERE qty IS NULL").fetchall()
 
 ---
 
-## WASM, Node, Go, Rust (Linux)
+## WASM, Node, Go, Rust, Kof (Linux)
 
 Same `glacier.h`. Build the shared library first (`$ZIG build -Doptimize=ReleaseFast`). WASM takes parquet bytes in memory (`bindings/wasm/example.html`); there is no filesystem in that build. The commands below are Linux.
 
@@ -108,13 +116,14 @@ $ZIG build wasm && node bindings/wasm/smoke.mjs
 cd bindings/node && node-gyp rebuild && node test.mjs
 cd bindings/go && go test
 cd bindings/rust && cargo test
+KOF_HOME=/path/to/kof-*-linux-x86_64 bindings/kof/run_tests.sh
 ```
 
 ---
 
 ## What to expect next
 
-A manylinux wheel so `pip install glacier` does not need Zig, and the Windows test suite. Azure / GCS and parallel scan are not on that board.
+The Windows test suite. Azure / GCS and parallel scan are not on that board.
 
 Issues and CI live in this repo. The engine version is `0.2.0`; `glacier.api_version()` is `1`.
 

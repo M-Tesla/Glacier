@@ -1,0 +1,16 @@
+main() {
+    assert(Conn.version() == "0.2.0")
+    assert(Conn.apiVersion() == 1)
+
+    var empty = Conn.connectEmpty()
+    assert(empty.firstInt("SELECT 1") == 1)
+    assert(empty.rowCount("SELECT 1") == 1)
+    empty.close()
+
+    var sales = Conn.connectPath("__GLACIER_KOF_PARQUET__")
+    assert(sales.firstInt("SELECT COUNT(*)") == 10)
+    assert(sales.firstInt("SELECT id ORDER BY id LIMIT 1") == 1)
+    sales.close()
+
+    println("kof jvm ok")
+}

@@ -1,0 +1,38 @@
+import java.util.ArrayList
+
+class Conn {
+    static String version() {
+        return "stub"
+    }
+
+    static Int apiVersion() {
+        return 0
+    }
+
+    static Conn connectEmpty() {
+        return Conn()
+    }
+
+    static Conn connectPath(String path) {
+        return Conn()
+    }
+
+    ArrayList execute(String sql) {
+        return new ArrayList()
+    }
+
+    Int firstInt(String sql) {
+        return 0
+    }
+
+    String firstText(String sql) {
+        return ""
+    }
+
+    Int rowCount(String sql) {
+        return 0
+    }
+
+    close() {
+    }
+}
