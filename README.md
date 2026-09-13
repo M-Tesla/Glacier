@@ -32,6 +32,8 @@ What 0.2 adds on top of 0.1 (the SQL surface that 0.1 froze and refused):
 - **Window.** `ROWS` / `RANGE` frames (`UNBOUNDED PRECEDING` / `FOLLOWING`, `CURRENT ROW`, `N PRECEDING` / `FOLLOWING`), `LAG` / `LEAD`, window after `GROUP BY`.
 - **Iceberg.** Position and equality deletes on scan. Partition prune for `bucket[N]` / `year` / `month` / `day` / `hour` / `truncate[W]` / `void`, not only file bounds. Snapshot `schema-id` may differ from `current-schema-id` (promote int32→int64 / float32→float64; incompatible types error; new optional columns are null).
 - **Parquet nested.** A LIST of primitives is utf8 (`[1, 2, 3]`). Flat STRUCT leaves are columns. Maps and nested lists stay rejected.
+- **Python wheel.** `pip install glacier-olap` (`import glacier`). The wheel ships `libglacier.so` with zlib and zstd compiled in (no host `libz` / `libzstd`). CI builds `manylinux_2_28` for x86_64 and aarch64.
+- **Kof JVM.** [`bindings/kof`](bindings/kof): `.kf` API plus Java/JNI on `glacier.h`. `SELECT 1` and parquet `COUNT(*)` were tested on Linux.
 
 Linux is still the tested path. `glacier.api_version()` is still `1`.
 
@@ -107,7 +109,31 @@ n.execute("SELECT id WHERE qty IS NULL").fetchall()
 
 ---
 
-## WASM, Node, Go, Rust, Kof (Linux)
+## Kof (Linux)
+
+Kof 0.3 has no FFI, so this binding is JVM: `Conn.kf` is what the compiler sees, and at run time that class is Java JNI on `libglacier.so`. Full notes: [`bindings/kof`](bindings/kof).
+
+```kof
+var c = Conn.connectEmpty()
+assert(c.firstInt("SELECT 1") == 1)
+c.close()
+
+var sales = Conn.connectPath("tests/formats/sales.parquet")
+assert(sales.firstInt("SELECT COUNT(*)") == 10)
+sales.close()
+```
+
+```bash
+export ZIG="$HOME/opt/zig-0.16/zig"
+export KOF_HOME=/path/to/kof-*-linux-x86_64
+bindings/kof/run_tests.sh
+```
+
+`connectEmpty` / `connectPath` are separate names because Kof mis-resolves overloads. Do not use `kof run` / `kof test` on this tree: they recompile the stub and drop the JNI class.
+
+---
+
+## WASM, Node, Go, Rust (Linux)
 
 Same `glacier.h`. Build the shared library first (`$ZIG build -Doptimize=ReleaseFast`). WASM takes parquet bytes in memory (`bindings/wasm/example.html`); there is no filesystem in that build. The commands below are Linux.
 
@@ -116,7 +142,6 @@ $ZIG build wasm && node bindings/wasm/smoke.mjs
 cd bindings/node && node-gyp rebuild && node test.mjs
 cd bindings/go && go test
 cd bindings/rust && cargo test
-KOF_HOME=/path/to/kof-*-linux-x86_64 bindings/kof/run_tests.sh
 ```
 
 ---
