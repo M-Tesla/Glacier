@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  release:
+    types: [published]
 
 jobs:
   test:
@@ -25,17 +27,6 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: "0.16.0"
-
-      - name: Linux deps
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libzstd-dev zlib1g-dev python3
-
-      - name: macOS deps
-        if: runner.os == 'macOS'
-        run: |
-          brew install zstd
-          echo "LIBRARY_PATH=$(brew --prefix zstd)/lib:${LIBRARY_PATH}" >> "$GITHUB_ENV"
-          echo "CPATH=$(brew --prefix zstd)/include:${CPATH}" >> "$GITHUB_ENV"
 
       - name: Windows deps
         if: runner.os == 'Windows'
@@ -83,12 +74,59 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Linux deps
-        run: sudo apt-get update && sudo apt-get install -y libzstd-dev zlib1g-dev
       - name: Build lib
-        run: zig build -Doptimize=ReleaseFast
+        run: |
+          zig build -Doptimize=ReleaseFast -Dlib_only=true
+          zig build -Doptimize=ReleaseFast fixtures
       - name: pytest
         run: |
           python3 -m pip install pytest
           python3 -m pip install bindings/python
           python3 -m pytest bindings/python/tests
+
+  wheel:
+    name: manylinux-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build manylinux wheel
+        run: |
+          docker run --rm \
+            -v "$PWD":/src -w /src \
+            ${{ matrix.image }} \
+            bash bindings/python/ci_manylinux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-manylinux_2_28_${{ matrix.arch }}
+          path: dist/*.whl
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test wheel
+        run: |
+          python3 -m pip install pytest dist/*.whl
+          python3 -m pytest bindings/python/tests
+
+  publish:
+    needs: wheel
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

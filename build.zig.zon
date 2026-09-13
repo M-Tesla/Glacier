@@ -23,6 +23,10 @@
             .url = "https://github.com/akheron/jansson/archive/refs/tags/v2.14.tar.gz",
             .hash = "N-V-__8AAD4lCgD2BmnfMPAgzXJOskWE-Zwzgq058IoNsR8_",
         },
+        .zstd = .{
+            .url = "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz",
+            .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
+        },
     },
     .paths = .{
         "build.zig",

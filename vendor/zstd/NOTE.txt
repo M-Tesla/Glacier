@@ -1,4 +1,4 @@
-zstd 1.5.7 headers (`zstd.h`, `zstd_errors.h`) from facebook/zstd.
-Linked against system libzstd (see vendor/sysroot/lib/libzstd.so).
-Needed so carquet `src/compression/zstd.c` compiles without libzstd-dev.
-BSD / GPLv2 dual license (zstd).
+zstd 1.5.7 from facebook/zstd (BSD / GPLv2 dual; Glacier uses BSD).
+Headers plus `lib/common`, `lib/compress`, `lib/decompress` are compiled into
+libglacier so the wheel does not need system libzstd. Assembly is off
+(`ZSTD_DISABLE_ASM`). Pin: `build.zig.zon` `.zstd`.

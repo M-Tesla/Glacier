@@ -14,6 +14,8 @@ pub fn build(b: *std.Build) void {
     addNanoarrow(b, glacier_mod);
     addAvro(b, glacier_mod);
 
+    const lib_only = b.option(bool, "lib_only", "Install only libglacier (Python wheel)") orelse false;
+
     const lib = b.addLibrary(.{
         .name = "glacier",
         .linkage = .dynamic,
@@ -21,6 +23,7 @@ pub fn build(b: *std.Build) void {
     });
     lib.installHeader(b.path("include/glacier.h"), "glacier.h");
     lib.setVersionScript(b.path("include/glacier.map"));
+    if (optimize != .Debug) lib.root_module.strip = true;
     b.installArtifact(lib);
 
     const repl = b.addExecutable(.{
@@ -35,7 +38,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(repl);
+    if (!lib_only) b.installArtifact(repl);
 
     const info = b.addExecutable(.{
         .name = "parquet-info",
@@ -49,7 +52,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(info);
+    if (!lib_only) b.installArtifact(info);
 
     const gen = b.addExecutable(.{
         .name = "gen-fixtures",
@@ -122,7 +125,7 @@ pub fn build(b: *std.Build) void {
     });
     smoke.root_module.addIncludePath(b.path("include"));
     smoke.root_module.linkLibrary(lib);
-    b.installArtifact(smoke);
+    if (!lib_only) b.installArtifact(smoke);
 
     const run_smoke = b.addRunArtifact(smoke);
     run_smoke.setCwd(b.path("."));
@@ -145,7 +148,7 @@ pub fn build(b: *std.Build) void {
     });
     example.root_module.addIncludePath(b.path("include"));
     example.root_module.linkLibrary(lib);
-    b.installArtifact(example);
+    if (!lib_only) b.installArtifact(example);
 
     const wasm_step = b.step("wasm", "Build glacier.wasm (wasm32-wasi, ReleaseSmall)");
     const wasm_target = b.resolveTargetQuery(.{
@@ -222,11 +225,9 @@ fn addCarquet(b: *std.Build, mod: *std.Build.Module) void {
     } else {
         const os = moduleOsTag(mod);
         mod.addIncludePath(b.path("vendor/zstd"));
-        if (os == .linux) {
-            mod.addLibraryPath(b.path("vendor/sysroot/lib"));
-        }
-        mod.linkSystemLibrary("z", .{});
-        mod.linkSystemLibrary("zstd", .{});
+        mod.addIncludePath(b.path("vendor/zstd/lib"));
+        addZlib(b, mod);
+        addZstd(b, mod);
         if (os != .windows) {
             mod.linkSystemLibrary("m", .{});
             mod.linkSystemLibrary("pthread", .{});
@@ -320,6 +321,7 @@ fn addZlib(b: *std.Build, mod: *std.Build.Module) void {
         "-DHAVE_UNISTD_H",
         "-DHAVE_STDARG_H",
     };
+    mod.addIncludePath(b.path("vendor/zlib"));
     mod.addCSourceFiles(.{
         .root = b.path("vendor/zlib"),
         .files = &.{
@@ -336,6 +338,52 @@ fn addZlib(b: *std.Build, mod: *std.Build.Module) void {
             "zutil.c",
         },
         .flags = &zflags,
+    });
+}
+
+fn addZstd(b: *std.Build, mod: *std.Build.Module) void {
+    const flags = [_][]const u8{
+        "-std=c11",
+        "-fno-sanitize=undefined",
+        "-fvisibility=hidden",
+        "-D_GNU_SOURCE",
+        "-DZSTD_DISABLE_ASM=1",
+        "-DZSTD_LEGACY_SUPPORT=0",
+        "-Wno-unused-parameter",
+        "-Wno-unused-function",
+        "-Wno-unused-variable",
+    };
+    mod.addCSourceFiles(.{
+        .root = b.path("vendor/zstd/lib"),
+        .files = &.{
+            "common/debug.c",
+            "common/entropy_common.c",
+            "common/error_private.c",
+            "common/fse_decompress.c",
+            "common/pool.c",
+            "common/threading.c",
+            "common/xxhash.c",
+            "common/zstd_common.c",
+            "compress/fse_compress.c",
+            "compress/hist.c",
+            "compress/huf_compress.c",
+            "compress/zstd_compress.c",
+            "compress/zstd_compress_literals.c",
+            "compress/zstd_compress_sequences.c",
+            "compress/zstd_compress_superblock.c",
+            "compress/zstd_double_fast.c",
+            "compress/zstd_fast.c",
+            "compress/zstd_lazy.c",
+            "compress/zstd_ldm.c",
+            "compress/zstdmt_compress.c",
+            "compress/zstd_opt.c",
+            "compress/zstd_preSplit.c",
+            "decompress/huf_decompress.c",
+            "decompress/zstd_ddict.c",
+            "decompress/zstd_decompress.c",
+            "decompress/zstd_decompress_block.c",
+        },
+        .flags = &flags,
     });
 }
 

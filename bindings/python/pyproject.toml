@@ -1,14 +1,26 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "glacier"
+name = "glacier-olap"
 version = "0.2.0"
-description = "Glacier OLAP engine — Zig query engine, C ABI"
+description = "Glacier OLAP engine — SQL on Iceberg, Parquet, and Avro"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+authors = [{ name = "Marcelo Tesla" }]
+keywords = ["olap", "sql", "iceberg", "parquet", "avro", "arrow"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: SQL",
+    "Topic :: Database",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Homepage = "https://github.com/M-Tesla/Glacier"
+Issues = "https://github.com/M-Tesla/Glacier/issues"
 
 [project.optional-dependencies]
 arrow = ["pyarrow>=14"]

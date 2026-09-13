@@ -83,7 +83,8 @@ def load():
         _LIB = lib
         return lib
     raise FileNotFoundError(
-        "libglacier not found. Build with `$ZIG build` or set GLACIER_LIB. "
+        "libglacier not found. pip install glacier-olap (Linux wheel) or "
+        "build with `$ZIG build` / set GLACIER_LIB. "
         f"Last error: {last}"
     )
 
