@@ -8,7 +8,7 @@
 [![CI](https://github.com/M-Tesla/Glacier/actions/workflows/ci.yml/badge.svg)](https://github.com/M-Tesla/Glacier/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-0.2-blue.svg)]()
-[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)]()
 
 </div>
 
@@ -16,7 +16,7 @@ Glacier is an OLAP engine. You open an Iceberg table, a Parquet file or an Avro 
 
 The query engine is Zig 0.16. Parquet, Avro, and in-memory Arrow are small C libraries (carquet, libavro, nanoarrow), not a from-scratch codec stack.
 
-**0.2.0** is the version that matches this description: analysis SQL on an Iceberg table, a Parquet file, or an Avro file. It was built and tested on **Linux**. The commands in this README are bash (`export`, `$ZIG`, `./zig-out/bin/glacier`, `libglacier.so`). They are not a Windows playbook; cmd/PowerShell, `.exe` / `.dll`, and paths will differ, and that path was not used here.
+**0.2.1** is the version that matches this description: analysis SQL on an Iceberg table, a Parquet file, or an Avro file (the 0.2 surface), plus the Linux Python wheel and the Kof JVM driver. It was built and tested on **Linux**. The commands in this README are bash (`export`, `$ZIG`, `./zig-out/bin/glacier`, `libglacier.so`). They are not a Windows playbook; cmd/PowerShell, `.exe` / `.dll`, and paths will differ, and that path was not used here.
 
 CI in this repo: `zig build test` on Linux and macOS; on Windows only `zig build` (compile, no test suite). Python tests and manylinux wheels (`manylinux_2_28` x86_64 and aarch64) run on Ubuntu. WASM on Ubuntu.
 
@@ -150,7 +150,7 @@ cd bindings/rust && cargo test
 
 The Windows test suite. Azure / GCS and parallel scan are not on that board.
 
-Issues and CI live in this repo. The engine version is `0.2.0`; `glacier.api_version()` is `1`.
+Issues and CI live in this repo. The engine version is `0.2.1`; `glacier.api_version()` is `1`.
 
 ---
 

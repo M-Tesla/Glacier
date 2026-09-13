@@ -1,5 +1,5 @@
 main() {
-    assert(Conn.version() == "0.2.0")
+    assert(Conn.version() == "0.2.1")
     assert(Conn.apiVersion() == 1)
 
     var empty = Conn.connectEmpty()
