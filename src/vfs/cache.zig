@@ -8,6 +8,7 @@ const Transport = @import("source.zig").Transport;
 const chunk_cap: usize = 4 * 1024 * 1024;
 
 pub fn tempRoot() []const u8 {
+    if (comptime @import("builtin").cpu.arch == .wasm32) return "/tmp/glacier";
     if (std.c.getenv("GLACIER_TEMP")) |p| {
         const s = std.mem.span(p);
         if (s.len > 0) return s;

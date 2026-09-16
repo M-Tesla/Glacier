@@ -7,17 +7,20 @@ const batch_mod = @import("execution/batch.zig");
 const parquet = @import("formats/parquet_wrap.zig");
 const avro = @import("formats/avro_wrap.zig");
 const iceberg = @import("table/iceberg.zig");
+const rest_catalog = @import("table/rest_catalog.zig");
 const errmod = @import("error.zig");
 const vfs = @import("vfs/source.zig");
 const cache = @import("vfs/cache.zig");
 const spill = @import("vfs/spill.zig");
 const native = @import("formats/native.zig");
+const aws = @import("kernel/aws.zig");
 
 pub const Batch = batch_mod.Batch;
 pub const Column = batch_mod.Column;
 pub const DataType = batch_mod.DataType;
 pub const ScanStats = physical.ScanStats;
 pub const GlacierError = errmod.GlacierError;
+pub const RestOptions = rest_catalog.Options;
 
 var last_open_buf: [512]u8 = undefined;
 var last_open_err: ?GlacierError = null;
@@ -89,6 +92,14 @@ pub const Session = struct {
     table_name: []const u8,
     files: []const iceberg.DataFile,
     schema_fields: []const iceberg.SchemaField,
+    rest: ?*rest_catalog.Client = null,
+    table_cache: std.StringHashMapUnmanaged([]const iceberg.DataFile) = .empty,
+    s3_creds: ?aws.Credentials = null,
+    s3_endpoint: ?[]const u8 = null,
+    s3_region: ?[]const u8 = null,
+    gcs_token: ?[]const u8 = null,
+    gcs_user_project: ?[]const u8 = null,
+    default_namespace: []const u8 = "default",
     error_buf: [512]u8 = undefined,
     last_error: ?GlacierError = null,
 
@@ -97,7 +108,16 @@ pub const Session = struct {
     }
 
     fn transport(self: *Session) vfs.Transport {
-        return .{ .allocator = self.gpa, .io = self.io, .http = &self.http };
+        return .{
+            .allocator = self.gpa,
+            .io = self.io,
+            .http = &self.http,
+            .s3_creds = self.s3_creds,
+            .s3_endpoint = self.s3_endpoint,
+            .s3_region = self.s3_region,
+            .gcs_token = self.gcs_token,
+            .gcs_user_project = self.gcs_user_project,
+        };
     }
 
     pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Session {
@@ -127,6 +147,63 @@ pub const Session = struct {
             .files = &.{},
             .schema_fields = &.{},
         };
+    }
+
+    pub fn openRest(gpa: std.mem.Allocator, io: std.Io, opts: rest_catalog.Options) !Session {
+        last_open_err = null;
+        var http: std.http.Client = .{ .allocator = gpa, .io = io };
+        errdefer http.deinit();
+        var catalog_arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer catalog_arena.deinit();
+        const a = catalog_arena.allocator();
+
+        const t = vfs.Transport{ .allocator = gpa, .io = io, .http = &http };
+        const resolved = rest_catalog.resolveOptions(opts);
+        const client_val = rest_catalog.Client.connect(a, t, resolved) catch |err| {
+            last_open_err = captureError(&last_open_buf, err);
+            return err;
+        };
+        const client = try a.create(rest_catalog.Client);
+        client.* = client_val;
+
+        var session = Session{
+            .gpa = gpa,
+            .io = io,
+            .http = http,
+            .catalog_arena = catalog_arena,
+            .path = try a.dupe(u8, client.endpoint),
+            .table_name = try a.dupe(u8, resolved.default_table orelse "rest"),
+            .files = &.{},
+            .schema_fields = &.{},
+            .rest = client,
+            .default_namespace = client.default_namespace,
+        };
+        try session.applyCatalogConfig(client.config);
+        if (resolved.default_table) |name| {
+            session.files = session.filesFor(a, name) catch |err| {
+                last_open_err = captureError(&last_open_buf, err);
+                return err;
+            };
+        }
+        return session;
+    }
+
+    fn applyCatalogConfig(self: *Session, cfg: rest_catalog.Config) !void {
+        const a = self.catalog_arena.allocator();
+        if (cfg.s3_access_key_id) |ak| {
+            if (cfg.s3_secret_access_key) |sk| {
+                self.s3_creds = .{
+                    .access_key = try a.dupe(u8, ak),
+                    .secret_key = try a.dupe(u8, sk),
+                    .session_token = if (cfg.s3_session_token) |tok| try a.dupe(u8, tok) else null,
+                    .region = try a.dupe(u8, cfg.s3_region orelse "us-east-1"),
+                };
+            }
+        }
+        if (cfg.s3_endpoint) |e| self.s3_endpoint = try a.dupe(u8, e);
+        if (cfg.s3_region) |r| self.s3_region = try a.dupe(u8, r);
+        if (cfg.gcs_token) |tok| self.gcs_token = try a.dupe(u8, tok);
+        if (cfg.gcs_project_id) |p| self.gcs_user_project = try a.dupe(u8, p);
     }
 
     /// `bytes` are copied. Parquet (or Avro if `format` is .avro).
@@ -250,6 +327,9 @@ pub const Session = struct {
         var c = q;
         c.union_all = false;
         c.union_right = null;
+        c.order_by = &.{};
+        c.limit = null;
+        c.offset = null;
         return c;
     }
 
@@ -294,7 +374,7 @@ pub const Session = struct {
             if (!cur.union_all) acc = try physical.distinctRows(a, acc);
             cur = right.*;
         }
-        return acc;
+        return physical.finishUnion(a, acc, query);
     }
 
     fn runLeafEnv(
@@ -305,7 +385,7 @@ pub const Session = struct {
         env: []const NamedBatch,
     ) !Batch {
         var q = try self.rewritePreds(a, query, stats, env);
-        if (q.isLiteralOnly()) {
+        if (q.isNoFrom()) {
             return physical.execute(a, self.transport(), &.{}, q, null, stats, null);
         }
         if (q.join) |j| {
@@ -381,23 +461,73 @@ pub const Session = struct {
     ) ![]const sql.SelectItem {
         var need = false;
         for (items) |item| {
-            if (item == .case) {
-                for (item.case.arms) |arm| {
-                    if (predHasSub(arm.when)) need = true;
-                }
+            switch (item) {
+                .expr => |ex| if (valueHasSub(ex.expr)) {
+                    need = true;
+                },
+                .case => |cs| {
+                    for (cs.arms) |arm| {
+                        if (predHasSub(arm.when)) need = true;
+                    }
+                },
+                else => {},
             }
         }
         if (!need) return items;
         const out = try a.dupe(sql.SelectItem, items);
         for (out) |*item| {
-            if (item.* != .case) continue;
-            const arms = try a.dupe(sql.CaseArm, item.case.arms);
-            for (arms) |*arm| {
-                arm.when = try self.rewriteBool(a, arm.when, outer, stats, env);
+            switch (item.*) {
+                .expr => |ex| {
+                    item.expr.expr = try self.rewriteValue(a, ex.expr, outer, stats, env);
+                },
+                .case => {
+                    const arms = try a.dupe(sql.CaseArm, item.case.arms);
+                    for (arms) |*arm| {
+                        arm.when = try self.rewriteBool(a, arm.when, outer, stats, env);
+                    }
+                    item.case.arms = arms;
+                },
+                else => {},
             }
-            item.case.arms = arms;
         }
         return out;
+    }
+
+    fn rewriteValue(
+        self: *Session,
+        a: std.mem.Allocator,
+        expr: *sql.Expr,
+        outer: *const sql.Query,
+        stats: *ScanStats,
+        env: []const NamedBatch,
+    ) !*sql.Expr {
+        switch (expr.*) {
+            .subquery => |q| {
+                if (sql.isCorrelated(q, outer)) return error.UnsupportedSql;
+                const batch = try self.runQueryEnv(a, q.*, stats, env);
+                if (batch.columns.len != 1) return error.TypeMismatch;
+                if (batch.len > 1) return error.SubqueryCardinality;
+                const lit: sql.Literal = if (batch.len == 0) .null else try cellToLiteral(a, batch.columns[0], 0);
+                expr.* = .{ .literal = lit };
+                return expr;
+            },
+            .binary => |b| {
+                expr.binary.left = try self.rewriteValue(a, b.left, outer, stats, env);
+                expr.binary.right = try self.rewriteValue(a, b.right, outer, stats, env);
+                return expr;
+            },
+            .unary_minus => |arg| {
+                expr.unary_minus = try self.rewriteValue(a, arg, outer, stats, env);
+                return expr;
+            },
+            .call => |c| {
+                for (c.args) |arg| {
+                    _ = try self.rewriteValue(a, arg, outer, stats, env);
+                }
+                return expr;
+            },
+            else => return expr,
+        }
     }
 
     fn rewriteBool(
@@ -419,6 +549,11 @@ pub const Session = struct {
                 expr.@"or".right = try self.rewriteBool(a, b.right, outer, stats, env);
                 return expr;
             },
+            .cmp => |c| {
+                expr.cmp.left = try self.rewriteValue(a, c.left, outer, stats, env);
+                expr.cmp.right = try self.rewriteValue(a, c.right, outer, stats, env);
+                return expr;
+            },
             .in_query => |p| {
                 if (sql.isCorrelated(p.query, outer)) return error.UnsupportedSql;
                 const batch = try self.runQueryEnv(a, p.query.*, stats, env);
@@ -433,8 +568,23 @@ pub const Session = struct {
                 if (batch.columns.len != 1) return error.TypeMismatch;
                 if (batch.len > 1) return error.SubqueryCardinality;
                 const lit: sql.Literal = if (batch.len == 0) .null else try cellToLiteral(a, batch.columns[0], 0);
+                const lit_e = try a.create(sql.Expr);
+                lit_e.* = .{ .literal = lit };
                 const node = try a.create(sql.BoolExpr);
-                node.* = .{ .cmp = .{ .op = p.op, .left = p.left, .literal = lit } };
+                node.* = .{ .cmp = .{ .op = p.op, .left = p.left, .right = lit_e } };
+                return node;
+            },
+            .exists => |p| {
+                if (sql.isCorrelated(p.query, outer)) return error.UnsupportedSql;
+                const batch = try self.runQueryEnv(a, p.query.*, stats, env);
+                const present = batch.len > 0;
+                const ok = if (p.negated) !present else present;
+                const left = try a.create(sql.Expr);
+                left.* = .{ .literal = .{ .int = 1 } };
+                const right = try a.create(sql.Expr);
+                right.* = .{ .literal = .{ .int = if (ok) 1 else 0 } };
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .cmp = .{ .op = .eq, .left = left, .right = right } };
                 return node;
             },
             else => return expr,
@@ -464,6 +614,25 @@ pub const Session = struct {
         }
         const stem = std.fs.path.stem(from);
         if (std.ascii.eqlIgnoreCase(stem, self.table_name)) return self.files;
+        if (self.rest) |client| {
+            if (self.table_cache.get(from)) |cached| return cached;
+            const ident = rest_catalog.splitIdent(from, client.default_namespace);
+            const loaded = try client.loadTable(self.catalog_arena.allocator(), self.transport(), ident.ns, ident.name);
+            try self.applyCatalogConfig(loaded.config);
+            const cat_a = self.catalog_arena.allocator();
+            const table = try iceberg.openFromMetadata(
+                cat_a,
+                self.transport(),
+                loaded.metadata,
+                rest_catalog.fileBase(loaded),
+            );
+            const key = try cat_a.dupe(u8, from);
+            try self.table_cache.put(cat_a, key, table.files);
+            if (self.schema_fields.len == 0) {
+                if (table.metadata.currentSchema()) |s| self.schema_fields = s.fields;
+            }
+            return table.files;
+        }
         return error.TableNotFound;
     }
 };
@@ -475,19 +644,39 @@ fn queryNeedsSession(q: sql.Query) bool {
     }
     if (predHasSub(q.where) or predHasSub(q.having)) return true;
     for (q.items) |item| {
-        if (item == .case) {
-            for (item.case.arms) |arm| {
-                if (predHasSub(arm.when)) return true;
-            }
+        switch (item) {
+            .expr => |ex| if (valueHasSub(ex.expr)) return true,
+            .case => |cs| {
+                for (cs.arms) |arm| {
+                    if (predHasSub(arm.when)) return true;
+                }
+            },
+            else => {},
         }
     }
     return false;
 }
 
+fn valueHasSub(e: *const sql.Expr) bool {
+    return switch (e.*) {
+        .subquery => true,
+        .binary => |b| valueHasSub(b.left) or valueHasSub(b.right),
+        .unary_minus => |a| valueHasSub(a),
+        .call => |c| blk: {
+            for (c.args) |arg| {
+                if (valueHasSub(arg)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
 fn predHasSub(expr: ?*sql.BoolExpr) bool {
     const e = expr orelse return false;
     return switch (e.*) {
-        .in_query, .cmp_query => true,
+        .in_query, .cmp_query, .exists => true,
+        .cmp => |c| valueHasSub(c.left) or valueHasSub(c.right),
         .@"and", .@"or" => |b| predHasSub(b.left) or predHasSub(b.right),
         else => false,
     };
@@ -1076,7 +1265,13 @@ test "GlacierError carries a message not the error name" {
     const missing = session.lastError() orelse return error.MissingGlacierError;
     try std.testing.expectEqualStrings("table not found", missing.message);
 
-    try std.testing.expectError(error.UnsupportedSql, session.execute("SELECT (SELECT 1) FROM sales"));
+    {
+        var sub = try session.execute("SELECT (SELECT 1) FROM sales");
+        defer sub.deinit();
+        const b = sub.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 10), b.len);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
     try std.testing.expectError(
         error.UnsupportedSql,
         session.execute("SELECT * FROM sales a WHERE a.id IN (SELECT b.id FROM sales b WHERE a.id > 0)"),
@@ -1405,6 +1600,107 @@ const remote_test = if (@import("builtin").is_test) struct {
         const auth = if (require_auth) "1" else "0";
         var child = std.process.spawn(io, .{
             .argv = &.{ "python3", "-c", py, root, prefix, auth },
+            .stdout = .pipe,
+            .stderr = .ignore,
+            .stdin = .ignore,
+        }) catch return error.SkipZigTest;
+        errdefer child.kill(io);
+
+        var line_buf: [64]u8 = undefined;
+        var stdout_reader = child.stdout.?.readerStreaming(io, &line_buf);
+        const line = stdout_reader.interface.takeDelimiterExclusive('\n') catch {
+            child.kill(io);
+            return error.SkipZigTest;
+        };
+        const port = std.fmt.parseInt(u16, std.mem.trim(u8, line, " \r\n"), 10) catch {
+            child.kill(io);
+            return error.SkipZigTest;
+        };
+        return .{ .child = child, .port = port };
+    }
+
+    fn spawnRestCatalog(io: std.Io, root: []const u8, token: []const u8, mode: []const u8, header: []const u8) !struct { child: std.process.Child, port: u16 } {
+        const py =
+            \\from http.server import BaseHTTPRequestHandler, HTTPServer
+            \\from pathlib import Path
+            \\import json, sys
+            \\ROOT = Path(sys.argv[1]).resolve()
+            \\TOKEN = sys.argv[2]
+            \\MODE = sys.argv[3]
+            \\HEADER = sys.argv[4]
+            \\PREFIX = "cat"
+            \\class H(BaseHTTPRequestHandler):
+            \\    def log_message(self, *args):
+            \\        pass
+            \\    def _deny(self, code):
+            \\        self.send_response(code)
+            \\        self.end_headers()
+            \\    def _check(self):
+            \\        if HEADER:
+            \\            name, _, val = HEADER.partition(":")
+            \\            got = self.headers.get(name.strip()) or ""
+            \\            if got != val.strip():
+            \\                self._deny(403)
+            \\                return False
+            \\        if MODE == "none":
+            \\            return True
+            \\        auth = self.headers.get("Authorization") or ""
+            \\        if MODE in ("bearer", "oauth"):
+            \\            if auth != "Bearer " + TOKEN:
+            \\                self._deny(401)
+            \\                return False
+            \\            return True
+            \\        if MODE == "sigv4":
+            \\            if not auth.startswith("AWS4-HMAC-SHA256 "):
+            \\                self._deny(403)
+            \\                return False
+            \\            return True
+            \\        return True
+            \\    def _send(self, obj):
+            \\        data = json.dumps(obj).encode()
+            \\        self.send_response(200)
+            \\        self.send_header("Content-Type", "application/json")
+            \\        self.send_header("Content-Length", str(len(data)))
+            \\        self.end_headers()
+            \\        self.wfile.write(data)
+            \\    def do_POST(self):
+            \\        p = self.path.split("?", 1)[0].rstrip("/")
+            \\        if p in ("/v1/oauth/tokens", "/oauth/tokens"):
+            \\            n = int(self.headers.get("Content-Length") or 0)
+            \\            body = self.rfile.read(n).decode()
+            \\            if MODE == "oauth" and "s3cret" not in body:
+            \\                self._deny(401)
+            \\                return
+            \\            self._send({"access_token": TOKEN or "test-token", "token_type": "bearer", "expires_in": 3600})
+            \\            return
+            \\        self._deny(404)
+            \\    def do_GET(self):
+            \\        if not self._check():
+            \\            return
+            \\        p = self.path.split("?", 1)[0]
+            \\        if p == "/v1/config":
+            \\            self._send({"defaults": {"prefix": PREFIX}, "overrides": {}})
+            \\            return
+            \\        want = "/v1/%s/namespaces/default/tables/prune" % PREFIX
+            \\        if p == want:
+            \\            meta = str(ROOT / "metadata" / "v1.metadata.json")
+            \\            self._send({
+            \\                "metadata-location": meta,
+            \\                "config": {
+            \\                    "s3.access-key-id": "AKIATEST",
+            \\                    "s3.secret-access-key": "secret",
+            \\                    "gcs.oauth2.token": "ya29.test",
+            \\                    "gcs.project-id": "proj",
+            \\                },
+            \\            })
+            \\            return
+            \\        self._deny(404)
+            \\httpd = HTTPServer(("127.0.0.1", 0), H)
+            \\print(httpd.server_address[1], flush=True)
+            \\httpd.serve_forever()
+        ;
+        var child = std.process.spawn(io, .{
+            .argv = &.{ "python3", "-c", py, root, token, mode, header },
             .stdout = .pipe,
             .stderr = .ignore,
             .stdin = .ignore,
@@ -2204,8 +2500,37 @@ test "CASE LIKE IN BETWEEN NULL UNION" {
         const mb = mix.nextBatch() orelse return error.EmptyResult;
         try std.testing.expectEqual(@as(usize, 3), mb.len);
 
+        {
+            var uo = try empty.execute("SELECT 2 AS x UNION SELECT 1 UNION ALL SELECT 3 ORDER BY x");
+            defer uo.deinit();
+            const ob = uo.nextBatch() orelse return error.EmptyResult;
+            try std.testing.expectEqual(@as(usize, 3), ob.len);
+            try std.testing.expectEqual(@as(i64, 1), ob.columns[0].i64s[0]);
+            try std.testing.expectEqual(@as(i64, 2), ob.columns[0].i64s[1]);
+            try std.testing.expectEqual(@as(i64, 3), ob.columns[0].i64s[2]);
+        }
+        {
+            var ul = try empty.execute("SELECT 3 AS x UNION SELECT 1 UNION ALL SELECT 2 ORDER BY x LIMIT 2 OFFSET 1");
+            defer ul.deinit();
+            const lb = ul.nextBatch() orelse return error.EmptyResult;
+            try std.testing.expectEqual(@as(usize, 2), lb.len);
+            try std.testing.expectEqual(@as(i64, 2), lb.columns[0].i64s[0]);
+            try std.testing.expectEqual(@as(i64, 3), lb.columns[0].i64s[1]);
+        }
+
         try std.testing.expectError(error.SchemaMismatch, empty.execute("SELECT 1 UNION SELECT 'x'"));
-        try std.testing.expectError(error.UnsupportedSql, empty.execute("SELECT (SELECT 1)"));
+        {
+            var scal = try empty.execute("SELECT (SELECT 1)");
+            defer scal.deinit();
+            const sb1 = scal.nextBatch() orelse return error.EmptyResult;
+            try std.testing.expectEqual(@as(usize, 1), sb1.len);
+            try std.testing.expectEqual(@as(i64, 1), sb1.columns[0].i64s[0]);
+        }
+
+        var arith = try empty.execute("SELECT 1 + 2");
+        defer arith.deinit();
+        const ab = arith.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), ab.columns[0].i64s[0]);
 
         var sub = try empty.execute("SELECT * FROM (SELECT 1 AS x)");
         defer sub.deinit();
@@ -2293,6 +2618,38 @@ test "CASE LIKE IN BETWEEN NULL UNION" {
         const b = result.nextBatch() orelse return error.EmptyResult;
         try std.testing.expectEqual(@as(usize, 4), b.len);
     }
+    {
+        var result = try session.execute(
+            "SELECT price * 2 FROM glacier_expr_sales WHERE id = 1",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 100), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT price * 1.1 FROM glacier_expr_sales WHERE id = 1",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectApproxEqAbs(@as(f64, 55.0), b.columns[0].f64s[0], 1e-9);
+    }
+    {
+        var result = try session.execute(
+            "SELECT COUNT(*) FROM glacier_expr_sales WHERE price > id",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 10), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT abs(price * -1) FROM glacier_expr_sales WHERE id = 1",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 50), b.columns[0].i64s[0]);
+    }
 }
 
 test "FROM subquery IN subquery scalar CTE LEFT JOIN" {
@@ -2356,4 +2713,784 @@ test "FROM subquery IN subquery scalar CTE LEFT JOIN" {
         error.UnsupportedSql,
         session.execute("WITH t AS (SELECT * FROM t) SELECT * FROM t"),
     );
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM glacier_sub_sales WHERE EXISTS (SELECT 1)");
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 10),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var result = try session.execute(
+            "SELECT COUNT(*) FROM glacier_sub_sales WHERE NOT EXISTS (SELECT 1 FROM glacier_sub_sales WHERE price < 0)",
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 10),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var result = try session.execute(
+            "SELECT COUNT(*) FROM glacier_sub_sales WHERE EXISTS (SELECT 1 FROM glacier_sub_sales WHERE price < 0)",
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 0),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+}
+
+test "expr pipeline script: filter markup copy join" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try parquet.writeSalesFixture("/tmp/glacier_pipeline_sales.parquet");
+    var session = try Session.open(gpa, io, "/tmp/glacier_pipeline_sales.parquet");
+    defer session.close();
+
+    const marked_path = "/tmp/glacier_pipeline_marked.glacier";
+
+    var warmup = try session.execute("SELECT 2 * 3 + 1");
+    defer warmup.deinit();
+    const w = warmup.nextBatch() orelse return error.EmptyResult;
+    try std.testing.expectEqual(@as(i64, 7), w.columns[0].i64s[0]);
+
+    var counted = try session.execute("SELECT COUNT(*) WHERE price * 1.1 > 110");
+    defer counted.deinit();
+    const n = (counted.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0];
+    try std.testing.expect(n > 0);
+
+    var marked = try session.execute(
+        "SELECT id, price * 1.1 AS p, category WHERE price * 1.1 > 110",
+    );
+    defer marked.deinit();
+    const rows = marked.nextBatch() orelse return error.EmptyResult;
+    try std.testing.expectEqual(@as(usize, @intCast(n)), rows.len);
+    var sum_p: f64 = 0;
+    for (0..rows.len) |i| sum_p += rows.columns[1].f64s[i];
+
+    var copied = try session.execute(
+        "COPY (SELECT id, price * 1.1 AS p, category WHERE price * 1.1 > 110) TO '/tmp/glacier_pipeline_marked.glacier'",
+    );
+    defer copied.deinit();
+    const copy_batch = copied.nextBatch() orelse return error.EmptyResult;
+    try std.testing.expectEqual(n, copy_batch.columns[0].i64s[0]);
+    try std.testing.expectEqualStrings(marked_path, copy_batch.columns[1].strAt(0));
+
+    var native_session = try Session.open(gpa, io, marked_path);
+    defer native_session.close();
+
+    var native_count = try native_session.execute("SELECT COUNT(*)");
+    defer native_count.deinit();
+    try std.testing.expectEqual(
+        n,
+        (native_count.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+    );
+
+    var native_sum = try native_session.execute("SELECT SUM(p)");
+    defer native_sum.deinit();
+    const got_sum = (native_sum.nextBatch() orelse return error.EmptyResult).columns[0].f64s[0];
+    try std.testing.expectApproxEqAbs(sum_p, got_sum, 1e-6);
+
+    var nested = try native_session.execute("SELECT abs(p * -1) WHERE id = 9");
+    defer nested.deinit();
+    const nested_b = nested.nextBatch() orelse return error.EmptyResult;
+    try std.testing.expectEqual(@as(usize, 1), nested_b.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 330.0), nested_b.columns[0].f64s[0], 1e-6);
+
+    var joined = try session.execute(
+        "SELECT COUNT(*) FROM glacier_pipeline_sales a JOIN '/tmp/glacier_pipeline_marked.glacier' b ON a.id = b.id",
+    );
+    defer joined.deinit();
+    try std.testing.expectEqual(
+        n,
+        (joined.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+    );
+
+    {
+        var lowered = try session.execute("SELECT lower(category) LIMIT 1");
+        defer lowered.deinit();
+        const b = lowered.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        const s = b.columns[0].strAt(0);
+        try std.testing.expect(s.len > 0);
+        for (s) |ch| try std.testing.expect(!(ch >= 'A' and ch <= 'Z'));
+    }
+    {
+        var distinct = try session.execute("SELECT COUNT(DISTINCT category)");
+        defer distinct.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 3),
+            (distinct.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var vals = try session.execute("SELECT * FROM (VALUES (1))");
+        defer vals.deinit();
+        const b = vals.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    {
+        var sub = try session.execute("SELECT substr(category, 1, 2) LIMIT 1");
+        defer sub.deinit();
+        const b = sub.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expectEqual(@as(usize, 2), b.columns[0].strAt(0).len);
+    }
+    {
+        var cat = try session.execute("SELECT concat(category, 'x') LIMIT 1");
+        defer cat.deinit();
+        const s = (cat.nextBatch() orelse return error.EmptyResult).columns[0].strAt(0);
+        try std.testing.expect(s.len > 0);
+        try std.testing.expectEqual(@as(u8, 'x'), s[s.len - 1]);
+    }
+    {
+        var trunc = try session.execute("SELECT date_trunc('year', id) LIMIT 1");
+        defer trunc.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 0),
+            (trunc.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var grouped = try session.execute(
+            "SELECT price * 1.1 FROM glacier_pipeline_sales GROUP BY category",
+        );
+        defer grouped.deinit();
+        try std.testing.expectEqual(
+            @as(usize, 3),
+            (grouped.nextBatch() orelse return error.EmptyResult).len,
+        );
+    }
+    {
+        var up = try session.execute("SELECT upper(category) LIMIT 1");
+        defer up.deinit();
+        try std.testing.expectEqualStrings("FRUIT", (up.nextBatch() orelse return error.EmptyResult).columns[0].strAt(0));
+    }
+    {
+        var len = try session.execute("SELECT length(category) LIMIT 1");
+        defer len.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 5),
+            (len.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var tr = try session.execute("SELECT trim('  x  ')");
+        defer tr.deinit();
+        try std.testing.expectEqualStrings("x", (tr.nextBatch() orelse return error.EmptyResult).columns[0].strAt(0));
+    }
+    {
+        var rep = try session.execute("SELECT replace('aba', 'a', 'z')");
+        defer rep.deinit();
+        try std.testing.expectEqualStrings("zbz", (rep.nextBatch() orelse return error.EmptyResult).columns[0].strAt(0));
+    }
+    {
+        var y = try session.execute("SELECT year(0), month(0), day(0), EXTRACT(YEAR FROM 0)");
+        defer y.deinit();
+        const b = y.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1970), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[1].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[2].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1970), b.columns[3].i64s[0]);
+    }
+    {
+        var exists_q = try session.execute("SELECT COUNT(*) FROM glacier_pipeline_sales WHERE EXISTS (SELECT 1)");
+        defer exists_q.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 10),
+            (exists_q.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var nexists = try session.execute(
+            "SELECT COUNT(*) FROM glacier_pipeline_sales WHERE NOT EXISTS (SELECT 1 FROM glacier_pipeline_sales WHERE price < 0)",
+        );
+        defer nexists.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 10),
+            (nexists.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var scal = try session.execute("SELECT (SELECT 1)");
+        defer scal.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 1),
+            (scal.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var sumd = try session.execute("SELECT SUM(DISTINCT price)");
+        defer sumd.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 1275),
+            (sumd.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var lr = try session.execute("SELECT left('fruit', 2), right('fruit', 2)");
+        defer lr.deinit();
+        const b = lr.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("fr", b.columns[0].strAt(0));
+        try std.testing.expectEqualStrings("it", b.columns[1].strAt(0));
+    }
+    {
+        var pred = try session.execute("SELECT starts_with('fruit', 'fr'), contains('fruit', 'ui'), strpos('fruit', 'ui')");
+        defer pred.deinit();
+        const b = pred.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(u8, 1), b.columns[0].bools[0]);
+        try std.testing.expectEqual(@as(u8, 1), b.columns[1].bools[0]);
+        try std.testing.expectEqual(@as(i64, 3), b.columns[2].i64s[0]);
+    }
+    {
+        var num = try session.execute("SELECT ceil(1.2), floor(1.8), sign(-4), greatest(1, 3, 2), least(1, 3, 2)");
+        defer num.deinit();
+        const b = num.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(f64, 2), b.columns[0].f64s[0]);
+        try std.testing.expectEqual(@as(f64, 1), b.columns[1].f64s[0]);
+        try std.testing.expectEqual(@as(i64, -1), b.columns[2].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 3), b.columns[3].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[4].i64s[0]);
+    }
+    {
+        var hms = try session.execute("SELECT hour(3661000000), minute(3661000000), second(3661000000)");
+        defer hms.deinit();
+        const b = hms.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[1].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[2].i64s[0]);
+    }
+
+    std.debug.print("pipeline ok: n={d} sum(p)={d:.4} (COPY+JOIN+expr matched)\n", .{ n, got_sum });
+}
+
+test "stress mixed SQL surface and volume" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try parquet.writeSalesFixture("/tmp/glacier_stress_sales.parquet");
+    var session = try Session.open(gpa, io, "/tmp/glacier_stress_sales.parquet");
+    defer session.close();
+
+    {
+        var result = try session.execute(
+            \\WITH
+            \\  fruit AS (
+            \\    SELECT id, price, category FROM glacier_stress_sales
+            \\    WHERE category LIKE 'f%' AND price BETWEEN 50 AND 200
+            \\  ),
+            \\  totals AS (
+            \\    SELECT COUNT(*) AS n, SUM(price) AS s FROM fruit
+            \\  )
+            \\SELECT
+            \\  (SELECT n FROM totals) AS n,
+            \\  (SELECT s FROM totals) AS s,
+            \\  upper(concat(left(category, 1), right(category, 3))),
+            \\  abs(greatest(price, least(price, 1000))),
+            \\  CASE WHEN price > 200 THEN 'high' WHEN price > 100 THEN 'mid' ELSE 'low' END
+            \\FROM glacier_stress_sales
+            \\WHERE EXISTS (SELECT 1 FROM fruit)
+            \\  AND id IN (SELECT id FROM fruit)
+            \\  AND price > (SELECT MIN(price) FROM glacier_stress_sales)
+            \\ORDER BY price DESC, id
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 4), b.len);
+        try std.testing.expectEqual(@as(i64, 5), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 445), b.columns[1].i64s[0]);
+        try std.testing.expectEqualStrings("FUIT", b.columns[2].strAt(0));
+        try std.testing.expectEqual(@as(i64, 150), b.columns[3].i64s[0]);
+        try std.testing.expectEqualStrings("mid", b.columns[4].strAt(0));
+        try std.testing.expectEqual(@as(i64, 90), b.columns[3].i64s[1]);
+        try std.testing.expectEqualStrings("low", b.columns[4].strAt(1));
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT category, COUNT(*) AS n, SUM(price) AS s, SUM(DISTINCT price) AS sd,
+            \\       MIN(price) AS mn, MAX(price) AS mx, AVG(price) AS av
+            \\FROM glacier_stress_sales
+            \\WHERE price >= (SELECT MIN(price) FROM glacier_stress_sales)
+            \\  AND EXISTS (SELECT 1 FROM glacier_stress_sales WHERE price > 0)
+            \\  AND category IN (SELECT category FROM glacier_stress_sales)
+            \\GROUP BY category
+            \\HAVING COUNT(*) >= 2
+            \\ORDER BY s DESC
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 3), b.len);
+        try std.testing.expectEqualStrings("dairy", b.columns[0].strAt(0));
+        try std.testing.expectEqual(@as(i64, 2), b.columns[1].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 500), b.columns[2].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 500), b.columns[3].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 200), b.columns[4].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 300), b.columns[5].i64s[0]);
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(1));
+        try std.testing.expectEqual(@as(i64, 5), b.columns[1].i64s[1]);
+        try std.testing.expectEqual(@as(i64, 445), b.columns[2].i64s[1]);
+        try std.testing.expectEqualStrings("veg", b.columns[0].strAt(2));
+        try std.testing.expectEqual(@as(i64, 3), b.columns[1].i64s[2]);
+        try std.testing.expectEqual(@as(i64, 330), b.columns[2].i64s[2]);
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT COUNT(*) FROM glacier_stress_sales a
+            \\JOIN glacier_stress_sales b ON a.category = b.category
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 38),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT COUNT(*) FROM (
+            \\  SELECT * FROM (
+            \\    SELECT id, price FROM glacier_stress_sales WHERE price > 80
+            \\  ) x WHERE price < 200
+            \\) y
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 5),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+
+    {
+        var result = try session.execute(
+            \\WITH hi AS (SELECT id, price FROM glacier_stress_sales WHERE price >= 150),
+            \\     lo AS (SELECT id FROM glacier_stress_sales WHERE price < 100)
+            \\SELECT COUNT(*) FROM hi a LEFT JOIN lo b ON a.id = b.id WHERE b.id IS NULL
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 3),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT upper(category), ROW_NUMBER() OVER (PARTITION BY category ORDER BY price DESC) AS rn, price
+            \\FROM glacier_stress_sales
+            \\WHERE category = 'fruit'
+            \\ORDER BY price DESC, id
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 5), b.len);
+        try std.testing.expectEqualStrings("FRUIT", b.columns[0].strAt(0));
+        try std.testing.expectEqual(@as(i64, 1), b.columns[1].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 150), b.columns[2].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 5), b.columns[1].i64s[4]);
+        try std.testing.expectEqual(@as(i64, 50), b.columns[2].i64s[4]);
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT category FROM glacier_stress_sales WHERE category = 'fruit'
+            \\UNION
+            \\SELECT category FROM glacier_stress_sales WHERE category = 'dairy'
+            \\UNION ALL
+            \\SELECT 'veg'
+            \\ORDER BY category
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 3), b.len);
+        try std.testing.expectEqualStrings("dairy", b.columns[0].strAt(0));
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(1));
+        try std.testing.expectEqualStrings("veg", b.columns[0].strAt(2));
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT category, SUM(price) AS s FROM glacier_stress_sales WHERE category = 'fruit' GROUP BY category
+            \\UNION
+            \\SELECT category, SUM(price) FROM glacier_stress_sales WHERE category = 'veg' GROUP BY category
+            \\UNION ALL
+            \\SELECT 'dairy', 500
+            \\ORDER BY category DESC
+            \\LIMIT 2
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 2), b.len);
+        try std.testing.expectEqualStrings("veg", b.columns[0].strAt(0));
+        try std.testing.expectEqual(@as(i64, 330), b.columns[1].i64s[0]);
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(1));
+        try std.testing.expectEqual(@as(i64, 445), b.columns[1].i64s[1]);
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT x FROM (
+            \\  SELECT 2 AS x UNION SELECT 1 UNION ALL SELECT 3
+            \\) t ORDER BY x LIMIT 2 OFFSET 1
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 2), b.len);
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[1]);
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT a.category, COUNT(*) AS n
+            \\FROM glacier_stress_sales a
+            \\JOIN glacier_stress_sales b ON a.id = b.id
+            \\WHERE a.price >= (SELECT MIN(price) FROM glacier_stress_sales)
+            \\  AND EXISTS (SELECT 1 FROM glacier_stress_sales WHERE category = 'fruit')
+            \\GROUP BY a.category
+            \\HAVING COUNT(*) >= 2
+            \\ORDER BY n DESC, a.category
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 3), b.len);
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(0));
+        try std.testing.expectEqual(@as(i64, 5), b.columns[1].i64s[0]);
+        try std.testing.expectEqualStrings("veg", b.columns[0].strAt(1));
+        try std.testing.expectEqual(@as(i64, 3), b.columns[1].i64s[1]);
+        try std.testing.expectEqualStrings("dairy", b.columns[0].strAt(2));
+        try std.testing.expectEqual(@as(i64, 2), b.columns[1].i64s[2]);
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT category, s FROM (
+            \\  SELECT category, SUM(price) AS s FROM glacier_stress_sales GROUP BY category
+            \\) g
+            \\WHERE s > (SELECT AVG(price) FROM glacier_stress_sales)
+            \\ORDER BY s DESC
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 3), b.len);
+        try std.testing.expectEqualStrings("dairy", b.columns[0].strAt(0));
+        try std.testing.expectEqual(@as(i64, 500), b.columns[1].i64s[0]);
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(1));
+        try std.testing.expectEqual(@as(i64, 445), b.columns[1].i64s[1]);
+        try std.testing.expectEqualStrings("veg", b.columns[0].strAt(2));
+        try std.testing.expectEqual(@as(i64, 330), b.columns[1].i64s[2]);
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT
+            \\  (SELECT COUNT(*) FROM glacier_stress_sales) AS n,
+            \\  (SELECT SUM(price) FROM glacier_stress_sales) AS s,
+            \\  (SELECT COUNT(DISTINCT category) FROM glacier_stress_sales) AS d,
+            \\  left(replace(concat(upper(trim('  fruit  ')), 'X'), 'X', 'Y'), 6),
+            \\  ceil(1.1) + floor(1.9) + sign(-2),
+            \\  hour(0), minute(0), second(0), year(0),
+            \\  starts_with('fruit', 'fr'), contains('fruit', 'ui'), strpos('fruit', 'ui')
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expectEqual(@as(i64, 10), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1275), b.columns[1].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 3), b.columns[2].i64s[0]);
+        try std.testing.expectEqualStrings("FRUITY", b.columns[3].strAt(0));
+        try std.testing.expectEqual(@as(f64, 2.0), b.columns[4].f64s[0]);
+        try std.testing.expectEqual(@as(i64, 0), b.columns[5].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1970), b.columns[8].i64s[0]);
+        try std.testing.expectEqual(@as(u8, 1), b.columns[9].bools[0]);
+        try std.testing.expectEqual(@as(u8, 1), b.columns[10].bools[0]);
+        try std.testing.expectEqual(@as(i64, 3), b.columns[11].i64s[0]);
+    }
+
+    {
+        var result = try session.execute(
+            "SELECT (SELECT id FROM glacier_stress_sales WHERE price < 0)",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expect(b.columns[0].isNull(0));
+    }
+
+    try std.testing.expectError(
+        error.SubqueryCardinality,
+        session.execute("SELECT (SELECT id FROM glacier_stress_sales)"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSql,
+        session.execute(
+            "SELECT * FROM glacier_stress_sales a WHERE EXISTS (SELECT 1 FROM glacier_stress_sales b WHERE a.id = b.id)",
+        ),
+    );
+
+    {
+        var result = try session.execute(
+            \\SELECT COUNT(*) FROM glacier_stress_sales
+            \\WHERE (price > 100 AND category IN ('fruit', 'veg'))
+            \\   OR (price < 80 AND NOT EXISTS (SELECT 1 FROM glacier_stress_sales WHERE price < 0))
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 5),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+
+    {
+        var result = try session.execute(
+            \\SELECT 1 UNION ALL SELECT 1 UNION SELECT 2 UNION ALL SELECT id
+            \\FROM glacier_stress_sales WHERE id = 2
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 3), b.len);
+    }
+
+    const n: usize = 2500;
+    const ids = try gpa.alloc(i64, n);
+    defer gpa.free(ids);
+    const prices = try gpa.alloc(i64, n);
+    defer gpa.free(prices);
+    const cats = try gpa.alloc([*:0]const u8, n);
+    defer gpa.free(cats);
+    const pool = [_][:0]const u8{ "fruit", "veg", "dairy" };
+    var expect_sum: i64 = 0;
+    for (0..n) |i| {
+        ids[i] = @intCast(i + 1);
+        const p: i64 = @intCast((i % 97) + 1);
+        prices[i] = p;
+        expect_sum += p;
+        cats[i] = pool[i % 3].ptr;
+    }
+    try parquet.writeSalesRows("/tmp/glacier_stress_volume.parquet", ids, prices, cats);
+    var vol = try Session.open(gpa, io, "/tmp/glacier_stress_volume.parquet");
+    defer vol.close();
+
+    {
+        var result = try vol.execute(
+            \\SELECT COUNT(*), SUM(price), COUNT(DISTINCT category), MIN(price), MAX(price)
+            \\FROM glacier_stress_volume
+            \\WHERE id IN (SELECT id FROM glacier_stress_volume WHERE price > 0)
+            \\  AND EXISTS (SELECT 1)
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2500), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(expect_sum, b.columns[1].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 3), b.columns[2].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[3].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 97), b.columns[4].i64s[0]);
+    }
+    {
+        var result = try vol.execute(
+            "SELECT COUNT(*) FROM glacier_stress_volume a JOIN glacier_stress_volume b ON a.id = b.id",
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 2500),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var result = try vol.execute(
+            \\SELECT category, COUNT(*) AS n, SUM(price) AS s
+            \\FROM glacier_stress_volume
+            \\GROUP BY category
+            \\ORDER BY category
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 3), b.len);
+        try std.testing.expectEqual(@as(i64, 833), b.columns[1].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 834), b.columns[1].i64s[1]);
+        try std.testing.expectEqual(@as(i64, 833), b.columns[1].i64s[2]);
+        var grouped: i64 = 0;
+        grouped += b.columns[1].i64s[0] + b.columns[1].i64s[1] + b.columns[1].i64s[2];
+        try std.testing.expectEqual(@as(i64, 2500), grouped);
+        var gsum: i64 = 0;
+        gsum += b.columns[2].i64s[0] + b.columns[2].i64s[1] + b.columns[2].i64s[2];
+        try std.testing.expectEqual(expect_sum, gsum);
+    }
+    {
+        var result = try vol.execute(
+            "SELECT COUNT(*) OVER () FROM glacier_stress_volume LIMIT 1",
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 2500),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var result = try vol.execute(
+            \\SELECT COUNT(*) FROM (
+            \\  SELECT id FROM glacier_stress_volume WHERE price > 50
+            \\) t
+            \\WHERE id IN (SELECT id FROM glacier_stress_volume WHERE id <= 2000)
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        var expect_hi: i64 = 0;
+        for (0..n) |i| {
+            const p: i64 = @intCast((i % 97) + 1);
+            const id: i64 = @intCast(i + 1);
+            if (p > 50 and id <= 2000) expect_hi += 1;
+        }
+        try std.testing.expectEqual(expect_hi, b.columns[0].i64s[0]);
+    }
+    {
+        var result = try vol.execute(
+            \\SELECT category FROM glacier_stress_volume WHERE id <= 5
+            \\UNION
+            \\SELECT category FROM glacier_stress_volume WHERE id > 2495
+            \\ORDER BY category
+            \\LIMIT 3
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 3), b.len);
+        try std.testing.expectEqualStrings("dairy", b.columns[0].strAt(0));
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(1));
+        try std.testing.expectEqualStrings("veg", b.columns[0].strAt(2));
+    }
+}
+
+fn expectRestPruneCount(gpa: std.mem.Allocator, io: std.Io, opts: rest_catalog.Options) !void {
+    var session = try Session.openRest(gpa, io, opts);
+    defer session.close();
+    var result = try session.execute("SELECT COUNT(*) FROM default.prune");
+    defer result.deinit();
+    const b = result.nextBatch() orelse return error.EmptyResult;
+    try std.testing.expectEqual(@as(i64, 10), b.columns[0].i64s[0]);
+    try std.testing.expectEqualStrings("ya29.test", session.gcs_token.?);
+    try std.testing.expectEqualStrings("proj", session.gcs_user_project.?);
+}
+
+test "REST catalog loadTable COUNT(*)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try iceberg.writePruneFixture(gpa, io, "/tmp/glacier_rest_iceberg");
+    var srv = try remote_test.spawnRestCatalog(io, "/tmp/glacier_rest_iceberg", "", "none", "");
+    defer srv.child.kill(io);
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{srv.port});
+    defer gpa.free(endpoint);
+    try expectRestPruneCount(gpa, io, .{ .endpoint = endpoint, .warehouse = "wh" });
+}
+
+test "REST catalog bearer and extra header" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try iceberg.writePruneFixture(gpa, io, "/tmp/glacier_rest_iceberg");
+    var srv = try remote_test.spawnRestCatalog(io, "/tmp/glacier_rest_iceberg", "tok-1", "bearer", "X-Custom: glacier");
+    defer srv.child.kill(io);
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{srv.port});
+    defer gpa.free(endpoint);
+
+    try std.testing.expectError(error.AccessDenied, Session.openRest(gpa, io, .{
+        .endpoint = endpoint,
+        .token = "wrong",
+        .extra_headers = &.{.{ .name = "X-Custom", .value = "glacier" }},
+    }));
+
+    const headers = [_]rest_catalog.Header{.{ .name = "X-Custom", .value = "glacier" }};
+    try expectRestPruneCount(gpa, io, .{
+        .endpoint = endpoint,
+        .token = "tok-1",
+        .extra_headers = &headers,
+    });
+}
+
+test "REST catalog OAuth client_credentials" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try iceberg.writePruneFixture(gpa, io, "/tmp/glacier_rest_iceberg");
+    var srv = try remote_test.spawnRestCatalog(io, "/tmp/glacier_rest_iceberg", "oauth-tok", "oauth", "");
+    defer srv.child.kill(io);
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{srv.port});
+    defer gpa.free(endpoint);
+    try expectRestPruneCount(gpa, io, .{
+        .endpoint = endpoint,
+        .oauth_client_id = "id",
+        .oauth_client_secret = "s3cret",
+        .auth = .oauth2,
+    });
+}
+
+test "REST catalog SigV4" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try iceberg.writePruneFixture(gpa, io, "/tmp/glacier_rest_iceberg");
+    var srv = try remote_test.spawnRestCatalog(io, "/tmp/glacier_rest_iceberg", "", "sigv4", "");
+    defer srv.child.kill(io);
+
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{srv.port});
+    defer gpa.free(endpoint);
+
+    const ak = try remote_test.captureEnv(gpa, "AWS_ACCESS_KEY_ID");
+    const sk = try remote_test.captureEnv(gpa, "AWS_SECRET_ACCESS_KEY");
+    const region = try remote_test.captureEnv(gpa, "AWS_REGION");
+    const tok = try remote_test.captureEnv(gpa, "AWS_SESSION_TOKEN");
+    defer {
+        remote_test.restoreEnv(gpa, tok);
+        remote_test.restoreEnv(gpa, region);
+        remote_test.restoreEnv(gpa, sk);
+        remote_test.restoreEnv(gpa, ak);
+    }
+    _ = remote_test.posix_env.setenv("AWS_ACCESS_KEY_ID", "AKIATEST", 1);
+    _ = remote_test.posix_env.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", 1);
+    _ = remote_test.posix_env.setenv("AWS_REGION", "us-east-1", 1);
+    _ = remote_test.posix_env.unsetenv("AWS_SESSION_TOKEN");
+
+    try expectRestPruneCount(gpa, io, .{
+        .endpoint = endpoint,
+        .auth = .sigv4,
+        .sigv4_service = "glue",
+    });
 }

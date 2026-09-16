@@ -14,6 +14,7 @@ pub const batch = @import("execution/batch.zig");
 pub const physical = @import("execution/physical.zig");
 pub const session = @import("session.zig");
 pub const iceberg = @import("table/iceberg.zig");
+pub const rest_catalog = @import("table/rest_catalog.zig");
 pub const err = @import("error.zig");
 pub const c_api = @import("c_api.zig");
 
@@ -51,6 +52,7 @@ test {
     _ = sql;
     _ = session;
     _ = iceberg;
+    _ = rest_catalog;
     _ = err;
     _ = c_api;
     _ = cache;

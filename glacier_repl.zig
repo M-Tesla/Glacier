@@ -7,8 +7,17 @@ const glacier = @import("glacier");
 const usage_text =
     \\usage: glacier [options] [path]
     \\
-    \\  path              parquet, avro, .glacier, iceberg dir, s3://, or http(s)://
+    \\  path              parquet, avro, .glacier, iceberg dir, s3://, gs://, or http(s)://
+    \\                    with --catalog: default table (namespace.table)
     \\                    omitted: TUI source picker (local / S3 / HTTP / empty)
+    \\  --catalog URL     Iceberg REST Catalog (read-only)
+    \\  --warehouse NAME  warehouse query for GET /v1/config
+    \\  --token TOKEN     bearer token (or ICEBERG_TOKEN)
+    \\  --header 'N: v'   extra catalog header (repeatable)
+    \\  --auth MODE       auto, none, bearer, oauth2, sigv4 (default auto)
+    \\  --oauth-client-id / --oauth-client-secret / --oauth-server / --oauth-scope
+    \\  --sigv4-service   glue (default) or s3tables
+    \\  --namespace NS    default namespace (default)
     \\  -c, --command SQL run SQL and exit (repeatable)
     \\  --timer           print wall time + peak RSS after each query (default)
     \\  --no-timer        hide stats
@@ -24,6 +33,17 @@ const usage_text =
 
 const Args = struct {
     path: ?[]const u8 = null,
+    catalog: ?[]const u8 = null,
+    warehouse: []const u8 = "",
+    token: ?[]const u8 = null,
+    headers: []const []const u8 = &.{},
+    auth: glacier.rest_catalog.Auth = .auto,
+    oauth_client_id: ?[]const u8 = null,
+    oauth_client_secret: ?[]const u8 = null,
+    oauth_server: ?[]const u8 = null,
+    oauth_scope: ?[]const u8 = null,
+    sigv4_service: []const u8 = "glue",
+    namespace: []const u8 = "default",
     commands: []const []const u8 = &.{},
     timer: bool = true,
     tui: bool = true,
@@ -47,9 +67,12 @@ pub fn main(init: std.process.Init) !void {
 
     var cmd_store: std.ArrayList([]const u8) = .empty;
     defer cmd_store.deinit(gpa);
-    const args = parseArgs(raw_args.items, &cmd_store, gpa) catch |err| {
+    var header_store: std.ArrayList([]const u8) = .empty;
+    defer header_store.deinit(gpa);
+    const args = parseArgs(raw_args.items, &cmd_store, &header_store, gpa) catch |err| {
         switch (err) {
             error.MissingCommand => try out.print("glacier: -c needs a SQL string\n{s}", .{usage_text}),
+            error.MissingOptionValue => try out.print("glacier: option needs a value\n{s}", .{usage_text}),
             error.UnknownOption => try out.print("glacier: unknown option\n{s}", .{usage_text}),
             error.ExtraPath => try out.print("glacier: extra path\n{s}", .{usage_text}),
             else => return err,
@@ -68,7 +91,34 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var session = if (args.path) |path|
+    var session = if (args.catalog) |endpoint| blk: {
+        var parsed_headers: std.ArrayList(glacier.rest_catalog.Header) = .empty;
+        defer parsed_headers.deinit(gpa);
+        for (args.headers) |line| {
+            try parsed_headers.append(gpa, glacier.rest_catalog.parseHeaderLine(line) catch {
+                try out.print("glacier: invalid --header (want Name: value)\n", .{});
+                die(out);
+            });
+        }
+        break :blk glacier.Session.openRest(gpa, io, .{
+            .endpoint = endpoint,
+            .warehouse = args.warehouse,
+            .token = args.token,
+            .extra_headers = parsed_headers.items,
+            .oauth_client_id = args.oauth_client_id,
+            .oauth_client_secret = args.oauth_client_secret,
+            .oauth_server = args.oauth_server,
+            .oauth_scope = args.oauth_scope,
+            .auth = args.auth,
+            .sigv4_service = args.sigv4_service,
+            .default_namespace = args.namespace,
+            .default_table = args.path,
+        }) catch {
+            const ge = glacier.session.lastOpenError().?;
+            try out.print("open failed: {s}\n", .{ge.message});
+            die(out);
+        };
+    } else if (args.path) |path|
         glacier.Session.open(gpa, io, path) catch {
             const ge = glacier.session.lastOpenError().?;
             try out.print("open failed: {s}\n", .{ge.message});
@@ -1786,7 +1836,12 @@ fn handleDot(session: *glacier.Session, ctx: *RunCtx, line: []const u8) !LineRes
     return .fail;
 }
 
-fn parseArgs(argv: []const []const u8, commands: *std.ArrayList([]const u8), gpa: std.mem.Allocator) !Args {
+fn parseArgs(
+    argv: []const []const u8,
+    commands: *std.ArrayList([]const u8),
+    headers: *std.ArrayList([]const u8),
+    gpa: std.mem.Allocator,
+) !Args {
     var out: Args = .{};
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -1805,6 +1860,50 @@ fn parseArgs(argv: []const []const u8, commands: *std.ArrayList([]const u8), gpa
             i += 1;
             if (i >= argv.len) return error.MissingCommand;
             try commands.append(gpa, argv[i]);
+        } else if (eql(a, "--catalog")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.catalog = argv[i];
+        } else if (eql(a, "--warehouse")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.warehouse = argv[i];
+        } else if (eql(a, "--token")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.token = argv[i];
+        } else if (eql(a, "--header")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            try headers.append(gpa, argv[i]);
+        } else if (eql(a, "--auth")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.auth = parseAuth(argv[i]) orelse return error.UnknownOption;
+        } else if (eql(a, "--oauth-client-id")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.oauth_client_id = argv[i];
+        } else if (eql(a, "--oauth-client-secret")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.oauth_client_secret = argv[i];
+        } else if (eql(a, "--oauth-server")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.oauth_server = argv[i];
+        } else if (eql(a, "--oauth-scope")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.oauth_scope = argv[i];
+        } else if (eql(a, "--sigv4-service")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.sigv4_service = argv[i];
+        } else if (eql(a, "--namespace")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.namespace = argv[i];
         } else if (a.len > 0 and a[0] == '-' and !std.mem.eql(u8, a, "-")) {
             return error.UnknownOption;
         } else {
@@ -1813,7 +1912,17 @@ fn parseArgs(argv: []const []const u8, commands: *std.ArrayList([]const u8), gpa
         }
     }
     out.commands = commands.items;
+    out.headers = headers.items;
     return out;
+}
+
+fn parseAuth(s: []const u8) ?glacier.rest_catalog.Auth {
+    if (eql(s, "auto")) return .auto;
+    if (eql(s, "none")) return .none;
+    if (eql(s, "bearer")) return .bearer;
+    if (eql(s, "oauth2")) return .oauth2;
+    if (eql(s, "sigv4")) return .sigv4;
+    return null;
 }
 
 fn splitStatements(allocator: std.mem.Allocator, src: []const u8) ![][]const u8 {
@@ -2019,7 +2128,9 @@ test "parseArgs empty session and -c" {
     const gpa = std.testing.allocator;
     var cmds: std.ArrayList([]const u8) = .empty;
     defer cmds.deinit(gpa);
-    const a = try parseArgs(&.{ "-c", "SELECT 1" }, &cmds, gpa);
+    var hdrs: std.ArrayList([]const u8) = .empty;
+    defer hdrs.deinit(gpa);
+    const a = try parseArgs(&.{ "-c", "SELECT 1" }, &cmds, &hdrs, gpa);
     try std.testing.expect(a.path == null);
     try std.testing.expectEqual(@as(usize, 1), a.commands.len);
     try std.testing.expectEqualStrings("SELECT 1", a.commands[0]);
@@ -2030,10 +2141,35 @@ test "parseArgs path and --no-timer" {
     const gpa = std.testing.allocator;
     var cmds: std.ArrayList([]const u8) = .empty;
     defer cmds.deinit(gpa);
-    const a = try parseArgs(&.{ "sales.parquet", "--no-timer", "-c", "SELECT COUNT(*)" }, &cmds, gpa);
+    var hdrs: std.ArrayList([]const u8) = .empty;
+    defer hdrs.deinit(gpa);
+    const a = try parseArgs(&.{ "sales.parquet", "--no-timer", "-c", "SELECT COUNT(*)" }, &cmds, &hdrs, gpa);
     try std.testing.expectEqualStrings("sales.parquet", a.path.?);
     try std.testing.expect(!a.timer);
     try std.testing.expectEqualStrings("SELECT COUNT(*)", a.commands[0]);
+}
+
+test "parseArgs REST catalog flags" {
+    const gpa = std.testing.allocator;
+    var cmds: std.ArrayList([]const u8) = .empty;
+    defer cmds.deinit(gpa);
+    var hdrs: std.ArrayList([]const u8) = .empty;
+    defer hdrs.deinit(gpa);
+    const a = try parseArgs(&.{
+        "--catalog", "http://127.0.0.1:8181",
+        "--warehouse", "s3://wh",
+        "--token", "t",
+        "--header", "X-Goog-User-Project: p",
+        "--auth", "bearer",
+        "default.prune",
+        "-c", "SELECT COUNT(*)",
+    }, &cmds, &hdrs, gpa);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8181", a.catalog.?);
+    try std.testing.expectEqualStrings("s3://wh", a.warehouse);
+    try std.testing.expectEqualStrings("t", a.token.?);
+    try std.testing.expectEqual(@as(usize, 1), a.headers.len);
+    try std.testing.expectEqual(glacier.rest_catalog.Auth.bearer, a.auth);
+    try std.testing.expectEqualStrings("default.prune", a.path.?);
 }
 
 test "splitStatements trims and skips empty" {

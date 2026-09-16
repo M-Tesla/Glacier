@@ -49,7 +49,8 @@ pub fn codeOf(err: anyerror) Code {
         error.AvroOpenFailed, error.AvroWriteFailed => .avro,
         error.InvalidNativeFile => .io,
         error.InvalidMetadata, error.SnapshotNotFound, error.SchemaNotFound, error.ManifestsNeedAvro => .iceberg,
-        error.AwsCredentialsMissing => .io,
+        error.RestCatalogFailed, error.OauthFailed, error.InvalidHeader => .iceberg,
+        error.AwsCredentialsMissing, error.InvalidGsUrl => .io,
         else => .io,
     };
 }
@@ -84,6 +85,10 @@ pub fn staticMessage(err: anyerror) []const u8 {
         error.SchemaNotFound => "Iceberg schema not found",
         error.ManifestsNeedAvro => "Iceberg manifests are missing or not valid Avro",
         error.AwsCredentialsMissing => "AWS credentials not found",
+        error.InvalidGsUrl => "invalid gs:// URL",
+        error.RestCatalogFailed => "Iceberg REST catalog request failed",
+        error.OauthFailed => "OAuth token request failed",
+        error.InvalidHeader => "invalid HTTP header",
         error.HttpRedirectLocationOversize => "HTTP redirect URL is too long",
         error.HttpRangeUnsupported => "server does not support HTTP Range",
         error.HttpRequestFailed => "HTTP request failed",

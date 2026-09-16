@@ -28,8 +28,28 @@ pub fn isHttp(path: []const u8) bool {
         std.ascii.startsWithIgnoreCase(path, "https://");
 }
 
+pub fn isGs(path: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(path, "gs://");
+}
+
 pub fn isRemote(path: []const u8) bool {
-    return isS3(path) or isHttp(path);
+    return isS3(path) or isHttp(path) or isGs(path);
+}
+
+pub fn parseGs(path: []const u8) !S3Url {
+    if (!isGs(path)) return error.InvalidGsUrl;
+    const rest = path["gs://".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse
+        return S3Url{ .bucket = rest, .key = "" };
+    if (slash == 0) return error.InvalidGsUrl;
+    return .{ .bucket = rest[0..slash], .key = rest[slash + 1 ..] };
+}
+
+/// XML API: `https://storage.googleapis.com/{bucket}/{key}`.
+pub fn httpUrlForGs(allocator: std.mem.Allocator, loc: S3Url) ![]u8 {
+    if (loc.key.len == 0)
+        return std.fmt.allocPrint(allocator, "https://storage.googleapis.com/{s}", .{loc.bucket});
+    return std.fmt.allocPrint(allocator, "https://storage.googleapis.com/{s}/{s}", .{ loc.bucket, loc.key });
 }
 
 pub fn parseS3(path: []const u8) !S3Url {
@@ -461,6 +481,10 @@ fn loadRegion(allocator: std.mem.Allocator, io: Io, profile: ?[]const u8) ![]u8 
     return allocator.dupe(u8, "us-east-1");
 }
 
+pub fn defaultRegion(allocator: std.mem.Allocator, io: Io) ![]u8 {
+    return loadRegion(allocator, io, null);
+}
+
 fn iniValue(text: []const u8, profile: []const u8, key: []const u8) ?[]const u8 {
     var in_section = false;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -614,4 +638,13 @@ test "amz date from epoch" {
     var buf: [16]u8 = undefined;
     const s = formatAmzDate(1440938160, &buf); // 2015-08-30 12:36:00 UTC
     try std.testing.expectEqualStrings("20150830T123600Z", s);
+}
+
+test "gs URL to XML HTTPS" {
+    const loc = try parseGs("gs://lake/ns/tbl/data/f.parquet");
+    try std.testing.expectEqualStrings("lake", loc.bucket);
+    try std.testing.expectEqualStrings("ns/tbl/data/f.parquet", loc.key);
+    const url = try httpUrlForGs(std.testing.allocator, loc);
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://storage.googleapis.com/lake/ns/tbl/data/f.parquet", url);
 }

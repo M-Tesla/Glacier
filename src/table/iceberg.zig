@@ -1,4 +1,6 @@
 //! Iceberg catalog: metadata.json via std.json; manifests via libavro.
+//! `version-hint.text` may be Hadoop (`1` → `v1.metadata.json`) or a UUID
+//! filename (`00001-…` → `{hint}.metadata.json`).
 //! The engine never globs `data/*.parquet`. File list comes from the snapshot
 //! manifest-list Avro, then each manifest Avro.
 
@@ -215,9 +217,47 @@ pub fn openTable(allocator: std.mem.Allocator, t: Transport, table_dir: []const 
     const meta_path = try metadataJsonPath(allocator, t, dir);
     const meta_json = try readLocation(allocator, t, meta_path);
     const metadata = try parseMetadata(allocator, meta_json);
+    return finishOpen(allocator, t, dir, metadata);
+}
+
+/// REST Catalog `metadata-location` (a `.metadata.json` URI or path).
+pub fn openTableAtMetadata(allocator: std.mem.Allocator, t: Transport, metadata_location: []const u8) !Table {
+    const loc = stripFileUrl(metadata_location);
+    const meta_json = try readLocation(allocator, t, loc);
+    const metadata = try parseMetadata(allocator, meta_json);
+    const base = tableDirFromMetaPath(loc);
+    const dir = try allocator.dupe(u8, base);
+    return finishOpen(allocator, t, dir, metadata);
+}
+
+/// Already-parsed metadata (embedded in a REST `loadTable` body).
+pub fn openFromMetadata(
+    allocator: std.mem.Allocator,
+    t: Transport,
+    metadata: TableMetadata,
+    file_base: []const u8,
+) !Table {
+    const dir = try allocator.dupe(u8, stripFileUrl(file_base));
+    return finishOpen(allocator, t, dir, metadata);
+}
+
+fn finishOpen(allocator: std.mem.Allocator, t: Transport, dir: []const u8, metadata: TableMetadata) !Table {
     try checkReadSupport(metadata);
     const files = try loadSnapshotFiles(allocator, t, dir, metadata);
     return .{ .dir = dir, .metadata = metadata, .files = files };
+}
+
+pub fn stripFileUrl(path: []const u8) []const u8 {
+    if (std.ascii.startsWithIgnoreCase(path, "file://")) return path["file://".len..];
+    return path;
+}
+
+/// Parent of `.../metadata/<file>.metadata.json`. Hadoop and REST both use that layout.
+pub fn tableDirFromMetaPath(path: []const u8) []const u8 {
+    const p = stripFileUrl(path);
+    if (std.mem.lastIndexOf(u8, p, "/metadata/")) |i| return p[0..i];
+    if (std.fs.path.dirname(p)) |d| return d;
+    return p;
 }
 
 /// Catalog features we do not execute. Opening the table fails instead of
@@ -904,40 +944,36 @@ fn mayMatch(file: DataFile, expr: *const sql.BoolExpr) bool {
     return switch (expr.*) {
         .cmp => |c| cmpMayMatch(file, c),
         .isnull => true,
-        .like, .in_list, .between, .in_query, .cmp_query => true,
+        .like, .in_list, .between, .in_query, .cmp_query, .exists => true,
         .@"and" => |b| mayMatch(file, b.left) and mayMatch(file, b.right),
         .@"or" => |b| mayMatch(file, b.left) or mayMatch(file, b.right),
     };
 }
 
 fn cmpMayMatch(file: DataFile, pred: sql.Cmp) bool {
-    const col_name = switch (pred.left) {
-        .column => |n| n,
-        .agg => return true,
-    };
+    const col_name = sql.asColumn(pred.left) orelse return true;
+    const lit = sql.asLiteral(pred.right) orelse return true;
     const bound = findBound(file, col_name) orelse return true;
-    return rangeMayMatch(bound.lower, bound.upper, pred.op, pred.literal);
+    return rangeMayMatch(bound.lower, bound.upper, pred.op, lit);
 }
 
 fn partitionMayMatch(file: DataFile, expr: *const sql.BoolExpr) bool {
     return switch (expr.*) {
         .cmp => |c| partitionCmpMayMatch(file, c),
         .in_list => |p| partitionInMayMatch(file, p),
-        .isnull, .like, .between, .in_query, .cmp_query => true,
+        .isnull, .like, .between, .in_query, .cmp_query, .exists => true,
         .@"and" => |b| partitionMayMatch(file, b.left) and partitionMayMatch(file, b.right),
         .@"or" => |b| partitionMayMatch(file, b.left) or partitionMayMatch(file, b.right),
     };
 }
 
 fn partitionCmpMayMatch(file: DataFile, pred: sql.Cmp) bool {
-    const col_name = switch (pred.left) {
-        .column => |n| n,
-        .agg => return true,
-    };
+    const col_name = sql.asColumn(pred.left) orelse return true;
+    const lit = sql.asLiteral(pred.right) orelse return true;
     const pv = findPartition(file, col_name) orelse return true;
     const tf = parseTransform(pv.transform) catch return true;
     if (pred.op == .eq) {
-        const want = applyTransform(tf, pred.literal) orelse return true;
+        const want = applyTransform(tf, lit) orelse return true;
         return boundValuesEqual(pv.value, want);
     }
     if (pred.op == .ne) return true;
@@ -1044,11 +1080,25 @@ fn metadataJsonPath(allocator: std.mem.Allocator, t: Transport, table_dir: []con
     const hint_path = try vfs.joinLocation(allocator, table_dir, "metadata/version-hint.text");
     if (readLocation(allocator, t, hint_path)) |hint| {
         const trimmed = std.mem.trim(u8, hint, " \t\r\n");
-        const rel = try std.fmt.allocPrint(allocator, "metadata/v{s}.metadata.json", .{trimmed});
-        return vfs.joinLocation(allocator, table_dir, rel);
+        const with_v = try std.fmt.allocPrint(allocator, "metadata/v{s}.metadata.json", .{trimmed});
+        const without_v = try std.fmt.allocPrint(allocator, "metadata/{s}.metadata.json", .{trimmed});
+        const uuid_style = std.mem.indexOfScalar(u8, trimmed, '-') != null;
+        const first = if (uuid_style) without_v else with_v;
+        const second = if (uuid_style) with_v else without_v;
+        const first_path = try vfs.joinLocation(allocator, table_dir, first);
+        if (locationReadable(t, first_path)) return first_path;
+        const second_path = try vfs.joinLocation(allocator, table_dir, second);
+        if (locationReadable(t, second_path)) return second_path;
+        return first_path;
     } else |_| {
         return vfs.joinLocation(allocator, table_dir, "metadata/v1.metadata.json");
     }
+}
+
+fn locationReadable(t: Transport, path: []const u8) bool {
+    var source = FileSource.openLocation(t, path) catch return false;
+    source.close();
+    return true;
 }
 
 fn readLocation(allocator: std.mem.Allocator, t: Transport, path: []const u8) ![]u8 {
@@ -1421,4 +1471,43 @@ test "parse decimal timestamptz uuid schema fields" {
     try std.testing.expectEqual(@as(i32, 10), fields[3].decimal_precision);
     try std.testing.expectEqual(@as(i32, 2), fields[3].decimal_scale);
     try checkReadSupport(meta);
+}
+
+test "version-hint uuid filename without v prefix" {
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const table_dir = "/tmp/glacier_iceberg_uuid_hint";
+    try std.Io.Dir.cwd().createDirPath(io, table_dir ++ "/metadata");
+    const hint = "00001-46c1f263-0849-4f3a-a898-60409877145b";
+    try writeText(io, table_dir ++ "/metadata/version-hint.text", hint);
+    try writeText(io, table_dir ++ "/metadata/" ++ hint ++ ".metadata.json",
+        \\{"format-version":2,"table-uuid":"u","location":"t","current-schema-id":0,"default-spec-id":0,"schemas":[{"schema-id":0,"fields":[{"id":1,"name":"id","required":true,"type":"long"}]}],"partition-specs":[{"spec-id":0,"fields":[]}],"snapshots":[]}
+    );
+
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    const t = Transport{ .allocator = gpa, .io = io, .http = &http };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    try std.testing.expectError(error.SnapshotNotFound, openTable(arena.allocator(), t, table_dir));
+}
+
+test "tableDirFromMetaPath strips metadata json" {
+    try std.testing.expectEqualStrings(
+        "s3://bucket/table",
+        tableDirFromMetaPath("s3://bucket/table/metadata/00001-uuid.metadata.json"),
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/iceberg_prune",
+        tableDirFromMetaPath("file:///tmp/iceberg_prune/metadata/v1.metadata.json"),
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/iceberg_prune",
+        tableDirFromMetaPath("/tmp/iceberg_prune/metadata/v1.metadata.json"),
+    );
 }

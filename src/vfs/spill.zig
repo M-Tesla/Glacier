@@ -19,6 +19,7 @@ pub var debug_files_written: usize = 0;
 var dir_seq: std.atomic.Value(u32) = .init(0);
 
 pub fn memoryCap() usize {
+    if (comptime @import("builtin").cpu.arch == .wasm32) return default_cap;
     if (std.c.getenv("GLACIER_MEM")) |p| {
         const s = std.mem.trim(u8, std.mem.span(p), " \t");
         if (s.len > 0) {
@@ -58,7 +59,8 @@ pub const Dir = struct {
         defer gpa.free(root);
         try std.Io.Dir.cwd().createDirPath(io, root);
         const n = dir_seq.fetchAdd(1, .monotonic);
-        const path = try std.fmt.allocPrint(gpa, "{s}/{d}-{d}", .{ root, std.c.getpid(), n });
+        const pid: u32 = if (comptime @import("builtin").cpu.arch == .wasm32) 1 else @intCast(std.c.getpid());
+        const path = try std.fmt.allocPrint(gpa, "{s}/{d}-{d}", .{ root, pid, n });
         try std.Io.Dir.cwd().createDirPath(io, path);
         return .{ .gpa = gpa, .io = io, .path = path };
     }

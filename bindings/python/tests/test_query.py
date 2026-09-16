@@ -76,9 +76,7 @@ class TestQuery(unittest.TestCase):
                 con.execute("SELECT 1 UNION SELECT 'x'")
             self.assertEqual(con.execute("SELECT * FROM (SELECT 1 AS x)").fetchall(), [(1,)])
             self.assertEqual(con.execute("WITH t AS (SELECT 1 AS x) SELECT x FROM t").fetchall(), [(1,)])
-            with self.assertRaises(glacier.GlacierError) as ctx:
-                con.execute("SELECT (SELECT 1)")
-            self.assertIn("not supported", str(ctx.exception))
+            self.assertEqual(con.execute("SELECT (SELECT 1)").fetchall(), [(1,)])
         if not SALES.is_file():
             self.skipTest("run `$ZIG build fixtures`")
         with glacier.connect(SALES) as con:
@@ -192,6 +190,93 @@ class TestQuery(unittest.TestCase):
             self.skipTest("run `$ZIG build fixtures`")
         with glacier.connect(NESTED) as con:
             self.assertEqual(con.execute("SELECT *").fetchall(), [("[1, 2, 3]",)])
+
+    def test_stress_mixed_sql(self):
+        if not SALES.is_file():
+            self.skipTest("run `$ZIG build fixtures`")
+        with glacier.connect(SALES) as con:
+            rows = con.execute(
+                """
+                WITH fruit AS (
+                  SELECT id, price, category FROM sales
+                  WHERE category LIKE 'f%' AND price BETWEEN 50 AND 200
+                )
+                SELECT
+                  (SELECT COUNT(*) FROM fruit),
+                  (SELECT SUM(price) FROM fruit),
+                  upper(concat(left(category, 1), right(category, 3))),
+                  CASE WHEN price > 100 THEN 'mid' ELSE 'low' END
+                FROM sales
+                WHERE EXISTS (SELECT 1 FROM fruit)
+                  AND id IN (SELECT id FROM fruit)
+                  AND price > (SELECT MIN(price) FROM sales)
+                ORDER BY price DESC, id
+                """
+            ).fetchall()
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(rows[0][0], 5)
+            self.assertEqual(rows[0][1], 445)
+            self.assertEqual(rows[0][2], "FUIT")
+            self.assertEqual(rows[0][3], "mid")
+            grouped = con.execute(
+                """
+                SELECT category, COUNT(*) AS n, SUM(price) AS s
+                FROM sales
+                WHERE EXISTS (SELECT 1)
+                  AND price >= (SELECT MIN(price) FROM sales)
+                GROUP BY category
+                HAVING COUNT(*) >= 2
+                ORDER BY s DESC
+                """
+            ).fetchall()
+            self.assertEqual(grouped, [("dairy", 2, 500), ("fruit", 5, 445), ("veg", 3, 330)])
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM sales a JOIN sales b ON a.category = b.category"
+                ).fetchall(),
+                [(38,)],
+            )
+            union_ordered = con.execute(
+                """
+                SELECT category FROM sales WHERE category = 'fruit'
+                UNION
+                SELECT category FROM sales WHERE category = 'dairy'
+                UNION ALL
+                SELECT 'veg'
+                ORDER BY category
+                """
+            ).fetchall()
+            self.assertEqual(union_ordered, [("dairy",), ("fruit",), ("veg",)])
+            nested = con.execute(
+                """
+                SELECT COUNT(*) FROM (
+                  SELECT * FROM (
+                    SELECT id, price FROM sales WHERE price > 80
+                  ) x WHERE price < 200
+                ) y
+                """
+            ).fetchall()
+            self.assertEqual(nested, [(5,)])
+            one = con.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM sales),
+                  (SELECT SUM(price) FROM sales),
+                  left(replace(concat(upper(trim('  fruit  ')), 'X'), 'X', 'Y'), 6),
+                  ceil(1.1) + floor(1.9) + sign(-2)
+                """
+            ).fetchall()
+            self.assertEqual(one[0][0], 10)
+            self.assertEqual(one[0][1], 1275)
+            self.assertEqual(one[0][2], "FRUITY")
+            self.assertEqual(one[0][3], 2.0)
+            self.assertEqual(
+                con.execute("SELECT (SELECT id FROM sales WHERE price < 0)").fetchall(),
+                [(None,)],
+            )
+            with self.assertRaises(glacier.GlacierError):
+                con.execute("SELECT (SELECT id FROM sales)")
+
 
     def test_arrow_optional(self):
         try:

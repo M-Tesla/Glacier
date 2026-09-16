@@ -12,7 +12,7 @@
 
 </div>
 
-Glacier is an OLAP engine. You open an Iceberg table, a Parquet file or an Avro file. You can run locally, over `https://`, or on `s3://` and run SQL. Results come back as a columnar batch (Arrow C Data on the public ABI).
+Glacier is an OLAP engine. You open an Iceberg table (Hadoop directory or REST Catalog), a Parquet file or an Avro file. You can run locally, over `https://`, on `s3://`, or on `gs://` and run SQL. Results come back as a columnar batch (Arrow C Data on the public ABI).
 
 The query engine is Zig 0.16. Parquet, Avro, and in-memory Arrow are small C libraries (carquet, libavro, nanoarrow), not a from-scratch codec stack.
 
@@ -28,12 +28,14 @@ What 0.2 adds on top of 0.1 (the SQL surface that 0.1 froze and refused):
 
 - **JOIN.** `LEFT` / `RIGHT` / `FULL JOIN … ON` (equalities, including `AND` of equalities). Null keys do not match. LEFT keeps every left row.
 - **Predicates and scalars.** `LIKE`, `IN` (literals or uncorrelated `SELECT`), `BETWEEN`, `CASE WHEN … THEN … ELSE … END`, `SELECT NULL`.
-- **Set and subquery.** `UNION` / `UNION ALL` (same schema), `FROM (SELECT …)`, `WITH t AS (SELECT …)`, scalar subquery in `WHERE`.
+- **Set and subquery.** `UNION` / `UNION ALL` (same schema), `FROM (SELECT …)`, `WITH t AS (SELECT …)`, scalar subquery in `WHERE` or in the select list, uncorrelated `EXISTS` / `NOT EXISTS`.
 - **Window.** `ROWS` / `RANGE` frames (`UNBOUNDED PRECEDING` / `FOLLOWING`, `CURRENT ROW`, `N PRECEDING` / `FOLLOWING`), `LAG` / `LEAD`, window after `GROUP BY`.
 - **Iceberg.** Position and equality deletes on scan. Partition prune for `bucket[N]` / `year` / `month` / `day` / `hour` / `truncate[W]` / `void`, not only file bounds. Snapshot `schema-id` may differ from `current-schema-id` (promote int32→int64 / float32→float64; incompatible types error; new optional columns are null).
 - **Parquet nested.** A LIST of primitives is utf8 (`[1, 2, 3]`). Flat STRUCT leaves are columns. Maps and nested lists stay rejected.
 - **Python wheel.** `pip install glacier-olap` (`import glacier`). The wheel ships `libglacier.so` with zlib and zstd compiled in (no host `libz` / `libzstd`). CI builds `manylinux_2_28` for x86_64 and aarch64.
 - **Kof JVM.** [`bindings/kof`](bindings/kof): `.kf` API plus Java/JNI on `glacier.h`. `SELECT 1` and parquet `COUNT(*)` were tested on Linux.
+- **SQL scalars and VALUES.** `lower` / `upper` (ASCII), `length` / `char_length`, `trim` / `ltrim` / `rtrim`, `replace`, `substr` / `substring`, `concat`, `left` / `right`, `starts_with` / `ends_with` / `contains`, `strpos`, `date_trunc`, `extract` / `year` / `month` / `day` / `hour` / `minute` / `second` (timestamp as epoch microseconds), `ceil` / `floor` / `sign`, `greatest` / `least`, `COUNT` / `SUM` / `AVG` / `MIN` / `MAX(DISTINCT col)`, `VALUES (…), (…)`, `GROUP BY` expressions.
+- **Iceberg REST Catalog (read-only).** `--catalog` loads tables through `GET /v1/config` and `loadTable`. Auth: none, bearer, OAuth2 client credentials, catalog SigV4. Vended S3/GCS keys from the table `config` map. `gs://` is HTTPS + Bearer.
 
 Linux is still the tested path. `glacier.api_version()` is still `1`.
 
@@ -41,11 +43,11 @@ Linux is still the tested path. `glacier.api_version()` is still `1`.
 
 ## What 0.2 does
 
-**SQL.** `SELECT` (including `SELECT 1` / `SELECT NULL` with no table), `DISTINCT`, `WHERE` (`AND` / `OR`, comparisons, `IS [NOT] NULL`, `LIKE`, `IN (literals or uncorrelated SELECT)`, `BETWEEN`, scalar subquery), `GROUP BY` / `HAVING`, `ORDER BY` (several columns; nulls last on `ASC`), `LIMIT` / `OFFSET`, `UNION` / `UNION ALL` (same schema), `FROM (SELECT …)`, `WITH t AS (SELECT …)`. Aggregates: `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` (`COUNT(*)` counts every row; the others skip nulls). `INNER` / `LEFT` / `RIGHT` / `FULL JOIN … ON` (equalities, including `AND` of equalities; null keys do not match; LEFT keeps every left row). Window: `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` / `ROW_NUMBER` / `RANK` / `DENSE_RANK` / `LAG` / `LEAD` with `OVER ([PARTITION BY …] [ORDER BY …] [ROWS|RANGE …])`. Frames: `UNBOUNDED PRECEDING` / `FOLLOWING`, `CURRENT ROW`, `N PRECEDING` / `FOLLOWING`; `RANGE` offsets need a single numeric `ORDER BY`. Window after `GROUP BY` is allowed. Scalars: `abs`, `round`, `cast`, `coalesce`, `CASE WHEN … THEN … ELSE … END`. `COPY TO` writes a native `.glacier` file you can open again.
+**SQL.** `SELECT` (including `SELECT 1` / `SELECT NULL` with no table), `DISTINCT`, `WHERE` (`AND` / `OR`, comparisons, `IS [NOT] NULL`, `LIKE`, `IN (literals or uncorrelated SELECT)`, `BETWEEN`, scalar subquery, uncorrelated `EXISTS` / `NOT EXISTS`), `GROUP BY` / `HAVING`, `ORDER BY` (several columns; nulls last on `ASC`), `LIMIT` / `OFFSET`, `UNION` / `UNION ALL` (same schema), `FROM (SELECT …)`, `WITH t AS (SELECT …)`, `VALUES (…), (…)` as a query or `FROM (VALUES …)`, scalar subquery in the select list (`SELECT (SELECT 1)`; zero rows is null, more than one row is an error). Aggregates: `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` (`COUNT(*)` counts every row; the others skip nulls), `COUNT` / `SUM` / `AVG` / `MIN` / `MAX(DISTINCT col)`. `GROUP BY` accepts expressions; a select expression that is not a group key uses the first row in the group. `INNER` / `LEFT` / `RIGHT` / `FULL JOIN … ON` (equalities, including `AND` of equalities; null keys do not match; LEFT keeps every left row). Window: `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` / `ROW_NUMBER` / `RANK` / `DENSE_RANK` / `LAG` / `LEAD` with `OVER ([PARTITION BY …] [ORDER BY …] [ROWS|RANGE …])`. Frames: `UNBOUNDED PRECEDING` / `FOLLOWING`, `CURRENT ROW`, `N PRECEDING` / `FOLLOWING`; `RANGE` offsets need a single numeric `ORDER BY`. Window after `GROUP BY` is allowed. Scalars: `abs`, `round`, `cast`, `coalesce`, `lower` / `upper` (ASCII), `length` / `char_length` (byte length), `trim` / `ltrim` / `rtrim` (ASCII space / tab / CR / LF), `replace` (all occurrences; empty search leaves the string unchanged), `substr` / `substring` (1-based), `concat`, `left` / `right`, `starts_with` / `ends_with` / `contains`, `strpos` / `instr` (1-based, 0 if missing), `date_trunc` (timestamp as epoch microseconds; units `year` / `month` / `day` / `hour` / `minute` / `second`), `extract` / `year` / `month` / `day` / `hour` / `minute` / `second` (`EXTRACT(HOUR FROM ts)` or `hour(ts)`), `ceil` / `ceiling` / `floor` / `sign`, `greatest` / `least` (skip nulls; all-null is null), `CASE WHEN … THEN … ELSE … END`. `COPY TO` writes a native `.glacier` file you can open again.
 
 **Data.** Parquet (Snappy, GZIP, LZ4, ZSTD), Avro (null / deflate / snappy), Iceberg (`metadata.json` + Avro manifests). Iceberg prune uses column bounds and partition values (`identity`, `bucket[N]`, `year` / `month` / `day` / `hour`, `truncate[W]`, `void`; unknown transform is still rejected). Position and equality deletes (`content` 1 / 2) are applied on scan. Schema evolution: a snapshot `schema-id` may differ from `current-schema-id`; int32 promotes to int64 and float32 to float64; incompatible types error; new optional columns are null. Optional Parquet columns are real SQL nulls. A LIST of primitives is utf8 (`[1, 2, 3]`, `["a"]`). Flat STRUCT leaves are ordinary columns. Maps and nested lists (`max_rep_level > 1`) are rejected.
 
-**Access.** Local path, `http(s)://` Range GET, `s3://` (SigV4; `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or `~/.aws/credentials`; `AWS_ENDPOINT_URL` for path-style). Large scans stream; `ORDER BY` / `GROUP BY` / `DISTINCT` can spill under `GLACIER_MEM` (default 256 MiB) into `$GLACIER_TEMP`.
+**Access.** Local path, `http(s)://` Range GET, `s3://` (SigV4; `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or `~/.aws/credentials`; `AWS_ENDPOINT_URL` for path-style), `gs://` (HTTPS + Bearer; `GOOGLE_OAUTH_ACCESS_TOKEN` / `GCS_OAUTH_TOKEN`, or a vended `gcs.oauth2.token`). Iceberg Hadoop-style directories open as a path. Iceberg REST Catalog is read-only: `--catalog URL` (`ICEBERG_REST_URI`), `--warehouse` (`ICEBERG_WAREHOUSE`), `--token` / `ICEBERG_TOKEN`, extra `--header`, `--auth auto|none|bearer|oauth2|sigv4`, OAuth2 client credentials (`ICEBERG_CLIENT_ID` / `ICEBERG_CLIENT_SECRET` / `ICEBERG_OAUTH2_SERVER` / `ICEBERG_OAUTH2_SCOPE`), catalog SigV4 (`--sigv4-service glue` or `s3tables`). `loadTable` sends `X-Iceberg-Access-Delegation: vended-credentials` and applies S3/GCS keys from the table `config` map. SQL `FROM namespace.table` (default namespace `default`, or `--namespace`). Large scans stream; `ORDER BY` / `GROUP BY` / `DISTINCT` can spill under `GLACIER_MEM` (default 256 MiB) into `$GLACIER_TEMP`.
 
 **How you call it.** CLI `glacier` (TUI on a Linux terminal, or `-c SQL`). Shared library `libglacier.so` on Linux + [`include/glacier.h`](include/glacier.h). Bindings on that header: Python (`pip install glacier-olap`, or `bindings/python` after a local `$ZIG build`), Kof JVM (`bindings/kof`), WASM (`$ZIG build wasm`), Node, Go, Rust.
 
@@ -53,7 +55,7 @@ Linux is still the tested path. `glacier.api_version()` is still `1`.
 
 ## What 0.2 does not do
 
-`USING` / `NATURAL` / comma-join, correlated subqueries, recursive `WITH`, `EXISTS`, subquery in the select list, named `WINDOW` clause, `GROUPS` frames. Azure Blob and GCS. ZSTD inside the WASM build (Snappy / GZIP / LZ4 work). A tested Windows (or native cmd) flow.
+`USING` / `NATURAL` / comma-join, correlated subqueries, recursive `WITH`, named `WINDOW` clause, `GROUPS` frames. REST Catalog writes. Azure Blob. ZSTD inside the WASM build (Snappy / GZIP / LZ4 work). A tested Windows (or native cmd) flow.
 
 ---
 
@@ -75,7 +77,14 @@ Output on Linux: `zig-out/bin/glacier`, `zig-out/lib/libglacier.so`, `zig-out/bi
 ./zig-out/bin/glacier                              # TUI: pick a source, then SQL
 ./zig-out/bin/glacier tests/formats/sales.parquet  # SQL on that file
 ./zig-out/bin/glacier tests/formats/sales.parquet -c 'SELECT category, COUNT(*) GROUP BY category'
+./zig-out/bin/glacier tests/formats/sales.parquet -c "SELECT lower(category), substr(category, 1, 2), COUNT(DISTINCT category) GROUP BY category"
+./zig-out/bin/glacier tests/formats/sales.parquet -c "SELECT upper(category), length(category), SUM(DISTINCT price) WHERE EXISTS (SELECT 1)"
 ./zig-out/bin/glacier -c 'SELECT 1'
+./zig-out/bin/glacier -c "SELECT (SELECT 1), year(0), replace('aba', 'a', 'z')"
+./zig-out/bin/glacier -c "SELECT left('fruit', 2), ceil(1.2), greatest(1, 3, 2), hour(3661000000)"
+./zig-out/bin/glacier -c 'SELECT * FROM (VALUES (1), (2))'
+./zig-out/bin/glacier --catalog http://127.0.0.1:8181 --warehouse lake --token "$ICEBERG_TOKEN" \
+  -c 'SELECT COUNT(*) FROM default.sales'
 ```
 
 ---
@@ -148,7 +157,7 @@ cd bindings/rust && cargo test
 
 ## What to expect next
 
-The Windows test suite. Azure / GCS and parallel scan are not on that board.
+The Windows test suite. Azure Blob and parallel scan are not on that board.
 
 Issues and CI live in this repo. The engine version is `0.2.1`; `glacier.api_version()` is `1`.
 

@@ -1,7 +1,7 @@
 //! FileSource — the only I/O type format readers talk to.
 //!
 //! Backends: `Io.File`, `File.MemoryMap`, borrowed memory, HTTP Range
-//! (`std.http.Client`). S3 is HTTP + SigV4.
+//! (`std.http.Client`). S3 is HTTP + SigV4. GCS `gs://` is HTTPS + Bearer.
 
 const std = @import("std");
 const Io = std.Io;
@@ -11,6 +11,13 @@ pub const Transport = struct {
     allocator: std.mem.Allocator,
     io: Io,
     http: *std.http.Client,
+    /// Vended S3 keys from a REST catalog `config` map. When set, skip env/profile.
+    s3_creds: ?aws.Credentials = null,
+    s3_endpoint: ?[]const u8 = null,
+    s3_region: ?[]const u8 = null,
+    /// Vended GCS token (`gcs.oauth2.token`) or `GOOGLE_OAUTH_ACCESS_TOKEN`.
+    gcs_token: ?[]const u8 = null,
+    gcs_user_project: ?[]const u8 = null,
 };
 
 pub const FileSource = struct {
@@ -34,6 +41,8 @@ pub const FileSource = struct {
         url: []u8,
         len: u64,
         sign: ?Sign,
+        bearer: ?[]u8,
+        gcs_project: ?[]u8,
     };
 
     pub fn openPath(io: Io, path: []const u8) Io.File.OpenError!FileSource {
@@ -68,23 +77,43 @@ pub const FileSource = struct {
 
     /// HTTP Range via `std.http.Client`. `client` must outlive the source.
     /// Servers that ignore `Range` yield `error.HttpRangeUnsupported`.
-    /// HTTPS uses std TLS. S3 URLs are signed (SigV4).
+    /// HTTPS uses std TLS. S3 URLs are signed (SigV4). `gs://` uses Bearer.
     pub fn openHttp(allocator: std.mem.Allocator, client: *std.http.Client, url: []const u8) !FileSource {
         const owned = try allocator.dupe(u8, url);
-        return openHttpOwned(allocator, client, owned, null);
+        return openHttpOwned(allocator, client, owned, .{});
     }
 
     pub fn openS3(t: Transport, path: []const u8) !FileSource {
-        const creds = try aws.loadCredentials(t.allocator, t.io);
-        defer {
-            t.allocator.free(creds.access_key);
-            t.allocator.free(creds.secret_key);
-            if (creds.session_token) |tok| t.allocator.free(tok);
-            t.allocator.free(creds.region);
+        if (t.s3_creds) |creds| {
+            const resolved = aws.Credentials{
+                .access_key = creds.access_key,
+                .secret_key = creds.secret_key,
+                .session_token = creds.session_token,
+                .region = t.s3_region orelse creds.region,
+            };
+            return openS3Resolved(t, path, resolved, t.s3_endpoint);
         }
+        if (aws.loadCredentials(t.allocator, t.io)) |creds| {
+            defer {
+                t.allocator.free(creds.access_key);
+                t.allocator.free(creds.secret_key);
+                if (creds.session_token) |tok| t.allocator.free(tok);
+                t.allocator.free(creds.region);
+            }
+            const endpoint = aws.endpointFromEnv(t.allocator);
+            defer if (endpoint) |e| t.allocator.free(e);
+            return openS3Resolved(t, path, creds, endpoint);
+        } else |err| switch (err) {
+            error.AwsCredentialsMissing => {},
+            else => return err,
+        }
+        const loc = try aws.parseS3(path);
+        const region = try aws.defaultRegion(t.allocator, t.io);
+        defer t.allocator.free(region);
         const endpoint = aws.endpointFromEnv(t.allocator);
         defer if (endpoint) |e| t.allocator.free(e);
-        return openS3Resolved(t, path, creds, endpoint);
+        const url = try aws.httpUrlForS3(t.allocator, loc, region, endpoint);
+        return openHttpOwned(t.allocator, t.http, url, .{});
     }
 
     pub fn openS3Resolved(
@@ -99,31 +128,52 @@ pub const FileSource = struct {
             t.allocator.free(url);
             return err;
         };
-        return openHttpOwned(t.allocator, t.http, url, sign);
+        return openHttpOwned(t.allocator, t.http, url, .{ .sign = sign });
+    }
+
+    pub fn openGs(t: Transport, path: []const u8) !FileSource {
+        const loc = try aws.parseGs(path);
+        const url = try aws.httpUrlForGs(t.allocator, loc);
+        errdefer t.allocator.free(url);
+        const bearer = try dupeOptional(t.allocator, gcsToken(t));
+        errdefer if (bearer) |b| t.allocator.free(b);
+        const project = try dupeOptional(t.allocator, t.gcs_user_project);
+        return openHttpOwned(t.allocator, t.http, url, .{ .bearer = bearer, .gcs_project = project });
     }
 
     pub fn openLocation(t: Transport, path: []const u8) !FileSource {
         if (aws.isS3(path)) return openS3(t, path);
+        if (aws.isGs(path)) return openGs(t, path);
         if (aws.isHttp(path)) return openHttp(t.allocator, t.http, path);
         return openMapped(t.io, path);
     }
+
+    const HttpAuth = struct {
+        sign: ?FileSource.Sign = null,
+        bearer: ?[]u8 = null,
+        gcs_project: ?[]u8 = null,
+    };
 
     fn openHttpOwned(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
         owned_url: []u8,
-        sign: ?Sign,
+        auth: HttpAuth,
     ) !FileSource {
         errdefer {
             allocator.free(owned_url);
-            if (sign) |s| freeSign(allocator, s);
+            if (auth.sign) |s| freeSign(allocator, s);
+            if (auth.bearer) |b| allocator.free(b);
+            if (auth.gcs_project) |p| allocator.free(p);
         }
         var h = Http{
             .allocator = allocator,
             .client = client,
             .url = owned_url,
             .len = 0,
-            .sign = sign,
+            .sign = auth.sign,
+            .bearer = auth.bearer,
+            .gcs_project = auth.gcs_project,
         };
         h.len = try httpDiscoverLength(h);
         return .{ .backend = .{ .http = h } };
@@ -140,6 +190,8 @@ pub const FileSource = struct {
             .http => |h| {
                 h.allocator.free(h.url);
                 if (h.sign) |s| freeSign(h.allocator, s);
+                if (h.bearer) |b| h.allocator.free(b);
+                if (h.gcs_project) |p| h.allocator.free(p);
             },
         }
         self.* = undefined;
@@ -270,7 +322,7 @@ fn httpExchange(
     var token_hdr: std.http.Header = undefined;
     var signed_extra: [8]std.http.Header = undefined;
     var extra_all: []const std.http.Header = extra;
-    var ua_headers: [4]std.http.Header = undefined;
+    var ua_headers: [8]std.http.Header = undefined;
     var auth_owned: ?[]u8 = null;
     defer if (auth_owned) |p| h.allocator.free(p);
 
@@ -314,9 +366,23 @@ fn httpExchange(
         }
         extra_all = signed_extra[0..n];
     } else {
-        ua_headers[0] = .{ .name = "user-agent", .value = "glacier/0.2" };
-        for (extra, 0..) |e, i| ua_headers[1 + i] = e;
-        extra_all = ua_headers[0 .. 1 + extra.len];
+        var n: usize = 0;
+        ua_headers[n] = .{ .name = "user-agent", .value = "glacier/0.2" };
+        n += 1;
+        if (h.bearer) |tok| {
+            auth_owned = try std.fmt.allocPrint(h.allocator, "Bearer {s}", .{tok});
+            ua_headers[n] = .{ .name = "authorization", .value = auth_owned.? };
+            n += 1;
+        }
+        if (h.gcs_project) |proj| {
+            ua_headers[n] = .{ .name = "x-goog-user-project", .value = proj };
+            n += 1;
+        }
+        for (extra) |e| {
+            ua_headers[n] = e;
+            n += 1;
+        }
+        extra_all = ua_headers[0..n];
     }
 
     const uri = try std.Uri.parse(h.url);
@@ -464,6 +530,28 @@ fn freeSign(allocator: std.mem.Allocator, s: FileSource.Sign) void {
     allocator.free(s.secret_key);
     if (s.session_token) |t| allocator.free(t);
     allocator.free(s.region);
+}
+
+fn dupeOptional(allocator: std.mem.Allocator, s: ?[]const u8) !?[]u8 {
+    const v = s orelse return null;
+    if (v.len == 0) return null;
+    return try allocator.dupe(u8, v);
+}
+
+fn gcsToken(t: Transport) ?[]const u8 {
+    if (t.gcs_token) |tok| {
+        if (tok.len > 0) return tok;
+    }
+    if (comptime @import("builtin").cpu.arch == .wasm32) return null;
+    if (std.c.getenv("GOOGLE_OAUTH_ACCESS_TOKEN")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0) return s;
+    }
+    if (std.c.getenv("GCS_OAUTH_TOKEN")) |p| {
+        const s = std.mem.span(p);
+        if (s.len > 0) return s;
+    }
+    return null;
 }
 
 pub fn joinLocation(allocator: std.mem.Allocator, base: []const u8, rel: []const u8) ![]u8 {
@@ -667,6 +755,9 @@ test "joinLocation keeps s3 and http schemes" {
     const abs = try joinLocation(a, "s3://bucket/table", "s3://other/file.parquet");
     defer a.free(abs);
     try std.testing.expectEqualStrings("s3://other/file.parquet", abs);
+    const gs = try joinLocation(a, "gs://lake/table", "data/part.parquet");
+    defer a.free(gs);
+    try std.testing.expectEqualStrings("gs://lake/table/data/part.parquet", gs);
 }
 
 test "S3 SigV4 Range GET against path-style mock" {

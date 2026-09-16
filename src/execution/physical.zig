@@ -1,6 +1,8 @@
 //! Scan / filter / aggregate / having / window / project / scalars / CASE / distinct / order / offset / limit.
 //! JOIN is a hash join of two scans (INNER / LEFT / RIGHT / FULL). Window: OVER + ROWS/RANGE + LAG/LEAD.
 //! UNION is concatenated in the session so each arm can scan its own FROM.
+//! Expr: arithmetic, col vs col, nested scalar calls (abs/round/cast/coalesce/lower/upper/length/trim/replace/substr/concat/left/right/date_trunc/extract/year/month/day/hour/ceil/greatest).
+//! Aggregates: COUNT/SUM/AVG/MIN/MAX(DISTINCT col). GROUP BY may emit first-row exprs.
 
 const std = @import("std");
 const parquet = @import("../formats/parquet_wrap.zig");
@@ -30,8 +32,11 @@ pub fn execute(
     stats: ?*ScanStats,
     right_files: ?[]const iceberg.DataFile,
 ) !Batch {
-    if (query.isLiteralOnly()) {
-        var batch = try batchFromLiterals(allocator, query, 1);
+    if (query.isNoFrom()) {
+        var batch = if (query.isLiteralOnly())
+            try batchFromLiterals(allocator, query, 1)
+        else
+            try projectItems(allocator, .{ .columns = &.{}, .len = 1 }, query);
         if (query.offset != null or query.limit != null) {
             batch = try takeRange(allocator, batch, query.offset orelse 0, query.limit);
         }
@@ -142,7 +147,7 @@ fn applyDeletes(allocator: std.mem.Allocator, input: Batch, file: iceberg.DataFi
     const keep = try allocator.alloc(bool, input.len);
     @memset(keep, true);
     for (file.deleted_pos) |p| {
-        if (p < input.len) keep[p] = false;
+        if (p < input.len) keep[@intCast(p)] = false;
     }
     if (file.eq_deletes.len > 0) {
         var row: usize = 0;
@@ -1052,6 +1057,17 @@ pub fn distinctRows(allocator: std.mem.Allocator, input: Batch) !Batch {
     return distinctBatch(allocator, input);
 }
 
+pub fn finishUnion(allocator: std.mem.Allocator, input: Batch, query: sql.Query) !Batch {
+    var batch = input;
+    if (query.order_by.len > 0) {
+        batch = try sortBatch(allocator, batch, query.order_by);
+    }
+    if (query.offset != null or query.limit != null) {
+        batch = try takeRange(allocator, batch, query.offset orelse 0, query.limit);
+    }
+    return batch;
+}
+
 fn copyStream(
     allocator: std.mem.Allocator,
     t: vfs.Transport,
@@ -1243,6 +1259,7 @@ fn projectItems(allocator: std.mem.Allocator, input: Batch, query: sql.Query) !B
             .scalar => |s| try evalScalar(allocator, input, s),
             .literal => |lit| try fillLiteralColumn(allocator, lit, input.len),
             .case => |cs| try evalCase(allocator, input, cs),
+            .expr => |ex| try evalComputed(allocator, input, ex, query),
         };
     }
     return .{ .columns = columns, .len = input.len };
@@ -1762,9 +1779,13 @@ fn executeGlobalAgg(
                 var reader = try native.Reader.openLocation(allocator, t, file.path);
                 defer reader.close();
                 if (wanted != null and wanted.?.len == 0) {
-                    const n = reader.numRows();
+                    var n = reader.numRows();
+                    if (query.where) |expr| {
+                        const probe: Batch = .{ .columns = &.{}, .len = 1 };
+                        if (!try evalBool(allocator, probe, 0, expr, query)) n = 0;
+                    }
                     for (states) |*s| {
-                        if (s.kind != .count) return error.InvalidSyntax;
+                        if (s.kind != .count or s.distinct) return error.InvalidSyntax;
                         s.count += n;
                         if (n > 0) s.inited = true;
                     }
@@ -1794,9 +1815,13 @@ fn executeGlobalAgg(
                 defer reader.close();
                 const picked = try pickParquetColumns(allocator, reader, wanted);
                 if (picked.len == 0) {
-                    const n: u64 = @intCast(reader.numRows());
+                    var n: u64 = @intCast(reader.numRows());
+                    if (query.where) |expr| {
+                        const probe: Batch = .{ .columns = &.{}, .len = 1 };
+                        if (!try evalBool(allocator, probe, 0, expr, query)) n = 0;
+                    }
                     for (states) |*s| {
-                        if (s.kind != .count) return error.InvalidSyntax;
+                        if (s.kind != .count or s.distinct) return error.InvalidSyntax;
                         s.count += n;
                         if (n > 0) s.inited = true;
                     }
@@ -1992,6 +2017,10 @@ fn aggregateFromCursor(allocator: std.mem.Allocator, cur: *spill.Cursor, query: 
     for (query.items) |item| {
         switch (item) {
             .star, .scalar, .literal, .case => return error.UnsupportedSql,
+            .expr => |ex| {
+                out_cols[col_i] = try evalGroupComputed(allocator, snap, first_rows, ex, query);
+                col_i += 1;
+            },
             .window => {},
             .column => |c| {
                 const src_i = snap.columnIndex(c.name) orelse return error.ColumnNotFound;
@@ -2425,6 +2454,7 @@ fn collectScanColumns(allocator: std.mem.Allocator, query: sql.Query) !?[]const 
                 if (s.coalesce_col) |c| try addScanName(&names, allocator, c);
             },
             .literal => {},
+            .expr => |ex| try addScanNamesFromValue(&names, allocator, ex.expr),
             .case => |cs| {
                 for (cs.arms) |arm| {
                     try addScanNamesFromBool(&names, allocator, arm.when);
@@ -2455,6 +2485,26 @@ fn addScanNameFromCaseValue(names: *std.ArrayList([]const u8), allocator: std.me
     }
 }
 
+fn addScanNamesFromValue(names: *std.ArrayList([]const u8), allocator: std.mem.Allocator, e: *const sql.Expr) !void {
+    switch (e.*) {
+        .literal => {},
+        .column => |n| {
+            const bare = if (std.mem.lastIndexOfScalar(u8, n, '.')) |d| n[d + 1 ..] else n;
+            try addScanName(names, allocator, bare);
+        },
+        .agg => |a| if (a.arg) |arg| try addScanName(names, allocator, arg),
+        .binary => |b| {
+            try addScanNamesFromValue(names, allocator, b.left);
+            try addScanNamesFromValue(names, allocator, b.right);
+        },
+        .unary_minus => |a| try addScanNamesFromValue(names, allocator, a),
+        .call => |c| {
+            for (c.args) |arg| try addScanNamesFromValue(names, allocator, arg);
+        },
+        .subquery => {},
+    }
+}
+
 fn addScanNamesFromLeft(names: *std.ArrayList([]const u8), allocator: std.mem.Allocator, left: sql.CmpLeft) !void {
     switch (left) {
         .column => |n| try addScanName(names, allocator, n),
@@ -2464,13 +2514,17 @@ fn addScanNamesFromLeft(names: *std.ArrayList([]const u8), allocator: std.mem.Al
 
 fn addScanNamesFromBool(names: *std.ArrayList([]const u8), allocator: std.mem.Allocator, expr: *const sql.BoolExpr) !void {
     switch (expr.*) {
-        .cmp => |c| try addScanNamesFromLeft(names, allocator, c.left),
+        .cmp => |c| {
+            try addScanNamesFromValue(names, allocator, c.left);
+            try addScanNamesFromValue(names, allocator, c.right);
+        },
         .isnull => |p| try addScanNamesFromLeft(names, allocator, p.left),
         .like => |p| try addScanNamesFromLeft(names, allocator, p.left),
         .in_list => |p| try addScanNamesFromLeft(names, allocator, p.left),
         .in_query => |p| try addScanNamesFromLeft(names, allocator, p.left),
-        .cmp_query => |p| try addScanNamesFromLeft(names, allocator, p.left),
+        .cmp_query => |p| try addScanNamesFromValue(names, allocator, p.left),
         .between => |p| try addScanNamesFromLeft(names, allocator, p.left),
+        .exists => {},
         .@"and", .@"or" => |b| {
             try addScanNamesFromBool(names, allocator, b.left);
             try addScanNamesFromBool(names, allocator, b.right);
@@ -2922,7 +2976,7 @@ fn filterExpr(allocator: std.mem.Allocator, input: Batch, expr: *const sql.BoolE
     var n_keep: usize = 0;
     var row: usize = 0;
     while (row < input.len) : (row += 1) {
-        const ok = try evalBool(input, row, expr, query);
+        const ok = try evalBool(allocator, input, row, expr, query);
         keep[row] = ok;
         if (ok) n_keep += 1;
     }
@@ -2935,9 +2989,9 @@ fn filterExpr(allocator: std.mem.Allocator, input: Batch, expr: *const sql.BoolE
     return .{ .columns = columns, .len = n_keep };
 }
 
-fn evalBool(input: Batch, row: usize, expr: *const sql.BoolExpr, query: ?sql.Query) !bool {
+fn evalBool(allocator: std.mem.Allocator, input: Batch, row: usize, expr: *const sql.BoolExpr, query: ?sql.Query) !bool {
     return switch (expr.*) {
-        .cmp => |c| try evalCmp(input, row, c, query),
+        .cmp => |c| try evalCmp(allocator, input, row, c, query),
         .isnull => |p| blk: {
             const idx = try resolveCmpLeft(input, p.left, query);
             const n = input.columns[idx].isNull(row);
@@ -2951,13 +3005,13 @@ fn evalBool(input: Batch, row: usize, expr: *const sql.BoolExpr, query: ?sql.Que
             const m = try evalInList(input, row, p, query);
             break :blk if (p.negated) !m else m;
         },
-        .in_query, .cmp_query => error.UnsupportedSql,
+        .in_query, .cmp_query, .exists => error.UnsupportedSql,
         .between => |p| blk: {
             const m = try evalBetween(input, row, p, query);
             break :blk if (p.negated) !m else m;
         },
-        .@"and" => |b| try evalBool(input, row, b.left, query) and try evalBool(input, row, b.right, query),
-        .@"or" => |b| try evalBool(input, row, b.left, query) or try evalBool(input, row, b.right, query),
+        .@"and" => |b| try evalBool(allocator, input, row, b.left, query) and try evalBool(allocator, input, row, b.right, query),
+        .@"or" => |b| try evalBool(allocator, input, row, b.left, query) or try evalBool(allocator, input, row, b.right, query),
     };
 }
 
@@ -2970,22 +3024,22 @@ fn evalLike(input: Batch, row: usize, pred: sql.Like, query: ?sql.Query) !bool {
 }
 
 fn evalInList(input: Batch, row: usize, pred: sql.InList, query: ?sql.Query) !bool {
-    const idx = try resolveCmpLeft(input, pred.left, query);
-    const col = input.columns[idx];
-    if (col.isNull(row)) return false;
+    const lhs = try cellFromCmpLeft(input, row, pred.left, query);
+    if (lhs == .null) return false;
     for (pred.values) |lit| {
         if (lit == .null) continue;
-        const cmp = sql.Cmp{ .op = .eq, .left = pred.left, .literal = lit };
-        if (try evalCmp(input, row, cmp, query)) return true;
+        if (try cmpCells(.eq, lhs, cellFromLiteral(lit))) return true;
     }
     return false;
 }
 
 fn evalBetween(input: Batch, row: usize, pred: sql.Between, query: ?sql.Query) !bool {
     if (pred.lo == .null or pred.hi == .null) return false;
-    const ge = sql.Cmp{ .op = .ge, .left = pred.left, .literal = pred.lo };
-    const le = sql.Cmp{ .op = .le, .left = pred.left, .literal = pred.hi };
-    return try evalCmp(input, row, ge, query) and try evalCmp(input, row, le, query);
+    const lhs = try cellFromCmpLeft(input, row, pred.left, query);
+    if (lhs == .null) return false;
+    const ge = try cmpCells(.ge, lhs, cellFromLiteral(pred.lo));
+    const le = try cmpCells(.le, lhs, cellFromLiteral(pred.hi));
+    return ge and le;
 }
 
 fn utf8Step(s: []const u8, i: usize) usize {
@@ -3099,9 +3153,9 @@ fn resolveCaseValue(input: Batch, row: usize, v: sql.CaseValue) !CaseResolved {
     };
 }
 
-fn pickCase(input: Batch, row: usize, c: sql.Case) !CaseResolved {
+fn pickCase(allocator: std.mem.Allocator, input: Batch, row: usize, c: sql.Case) !CaseResolved {
     for (c.arms) |arm| {
-        if (try evalBool(input, row, arm.when, null)) {
+        if (try evalBool(allocator, input, row, arm.when, null)) {
             return resolveCaseValue(input, row, arm.then);
         }
     }
@@ -3138,7 +3192,7 @@ fn evalCase(allocator: std.mem.Allocator, input: Batch, c: sql.Case) !Column {
         var strs = try allocator.alloc([]const u8, n);
         var nbytes: usize = 0;
         while (row < n) : (row += 1) {
-            const picked = try pickCase(input, row, c);
+            const picked = try pickCase(allocator, input, row, c);
             switch (picked) {
                 .none => {
                     strs[row] = "";
@@ -3168,7 +3222,7 @@ fn evalCase(allocator: std.mem.Allocator, input: Batch, c: sql.Case) !Column {
     } else {
         try allocTyped(allocator, &dst, n);
         while (row < n) : (row += 1) {
-            const picked = try pickCase(input, row, c);
+            const picked = try pickCase(allocator, input, row, c);
             if (picked == .none) {
                 valid[row] = 0;
                 any_null = true;
@@ -3292,24 +3346,690 @@ fn compactColumn(allocator: std.mem.Allocator, src: Column, keep: []const bool, 
     return dst;
 }
 
-fn evalCmp(input: Batch, row: usize, pred: sql.Cmp, query: ?sql.Query) !bool {
-    const idx = try resolveLeft(input, pred, query);
-    const col = input.columns[idx];
-    if (col.isNull(row)) return false;
-    return switch (col.data_type) {
-        .int32 => cmpInt(@as(i64, col.i32s[row]), pred),
-        .int64, .timestamp, .timestamptz => cmpInt(col.i64s[row], pred),
-        .float32 => cmpFloat(@floatCast(col.f32s[row]), pred),
-        .float64 => cmpFloat(col.f64s[row], pred),
-        .utf8 => cmpStr(col.strAt(row), pred),
-        .uuid => cmpUuid(col.uuids[row], pred),
-        .decimal128 => cmpDecimal(col, row, pred),
-        .boolean => error.TypeMismatch,
+fn evalCmp(allocator: std.mem.Allocator, input: Batch, row: usize, pred: sql.Cmp, query: ?sql.Query) !bool {
+    const lhs = try evalValue(allocator, input, row, pred.left, query);
+    const rhs = try evalValue(allocator, input, row, pred.right, query);
+    return cmpCells(pred.op, lhs, rhs);
+}
+
+const Cell = union(enum) {
+    null,
+    bool: bool,
+    i64: i64,
+    f64: f64,
+    utf8: []const u8,
+    uuid: [16]u8,
+    decimal: struct { v: i128, scale: i32 },
+};
+
+const EvalError = error{
+    ColumnNotFound,
+    AmbiguousColumn,
+    TypeMismatch,
+    InvalidSyntax,
+    OutOfMemory,
+    UnsupportedSql,
+};
+
+fn cellFromLiteral(lit: sql.Literal) Cell {
+    return switch (lit) {
+        .int => |v| .{ .i64 = v },
+        .float => |v| .{ .f64 = v },
+        .string => |s| .{ .utf8 = s },
+        .null => .null,
     };
 }
 
-fn resolveLeft(input: Batch, pred: sql.Cmp, query: ?sql.Query) !usize {
-    return resolveCmpLeft(input, pred.left, query);
+fn cellFromColumn(col: Column, row: usize) Cell {
+    if (col.isNull(row)) return .null;
+    return switch (col.data_type) {
+        .boolean => .{ .bool = col.bools[row] != 0 },
+        .int32 => .{ .i64 = col.i32s[row] },
+        .int64, .timestamp, .timestamptz => .{ .i64 = col.i64s[row] },
+        .float32 => .{ .f64 = col.f32s[row] },
+        .float64 => .{ .f64 = col.f64s[row] },
+        .utf8 => .{ .utf8 = col.strAt(row) },
+        .uuid => .{ .uuid = col.uuids[row] },
+        .decimal128 => .{ .decimal = .{ .v = col.i128s[row], .scale = col.decimal_scale } },
+    };
+}
+
+fn cellFromCmpLeft(input: Batch, row: usize, left: sql.CmpLeft, query: ?sql.Query) !Cell {
+    const idx = try resolveCmpLeft(input, left, query);
+    return cellFromColumn(input.columns[idx], row);
+}
+
+fn evalValue(allocator: std.mem.Allocator, input: Batch, row: usize, expr: *const sql.Expr, query: ?sql.Query) EvalError!Cell {
+    return switch (expr.*) {
+        .literal => |lit| cellFromLiteral(lit),
+        .column => |name| blk: {
+            const idx = try input.lookup(name);
+            break :blk cellFromColumn(input.columns[idx], row);
+        },
+        .agg => |a| blk: {
+            const idx = try resolveCmpLeft(input, .{ .agg = .{ .kind = a.kind, .arg = a.arg } }, query);
+            break :blk cellFromColumn(input.columns[idx], row);
+        },
+        .unary_minus => |arg| blk: {
+            const v = try evalValue(allocator, input, row, arg, query);
+            break :blk try cellNeg(v);
+        },
+        .binary => |b| blk: {
+            const l = try evalValue(allocator, input, row, b.left, query);
+            const r = try evalValue(allocator, input, row, b.right, query);
+            break :blk try cellArith(b.op, l, r);
+        },
+        .call => |c| try evalCall(allocator, input, row, c, query),
+        .subquery => error.UnsupportedSql,
+    };
+}
+
+fn cellNeg(v: Cell) !Cell {
+    return switch (v) {
+        .null => .null,
+        .i64 => |n| .{ .i64 = -n },
+        .f64 => |n| .{ .f64 = -n },
+        .decimal => |d| .{ .decimal = .{ .v = -d.v, .scale = d.scale } },
+        else => error.TypeMismatch,
+    };
+}
+
+fn asF64(v: Cell) !?f64 {
+    return switch (v) {
+        .null => null,
+        .i64 => |n| @floatFromInt(n),
+        .f64 => |n| n,
+        .decimal => |d| @as(f64, @floatFromInt(d.v)) / @as(f64, @floatFromInt(pow10i128(d.scale))),
+        else => error.TypeMismatch,
+    };
+}
+
+fn asI64(v: Cell) !?i64 {
+    return switch (v) {
+        .null => null,
+        .i64 => |n| n,
+        .f64 => |n| @intFromFloat(n),
+        else => error.TypeMismatch,
+    };
+}
+
+fn cellArith(op: sql.ArithOp, lhs: Cell, rhs: Cell) !Cell {
+    if (lhs == .null or rhs == .null) return .null;
+    const use_float = lhs == .f64 or rhs == .f64 or lhs == .decimal or rhs == .decimal or op == .div;
+    if (op == .mod) {
+        const a = try asI64(lhs) orelse return .null;
+        const b = try asI64(rhs) orelse return .null;
+        if (b == 0) return error.TypeMismatch;
+        return .{ .i64 = @rem(a, b) };
+    }
+    if (use_float) {
+        const a = try asF64(lhs) orelse return .null;
+        const b = try asF64(rhs) orelse return .null;
+        if (op == .div and b == 0) return .null;
+        const out: f64 = switch (op) {
+            .add => a + b,
+            .sub => a - b,
+            .mul => a * b,
+            .div => a / b,
+            .mod => return error.TypeMismatch,
+        };
+        return .{ .f64 = out };
+    }
+    const a = try asI64(lhs) orelse return .null;
+    const b = try asI64(rhs) orelse return .null;
+    const out: i64 = switch (op) {
+        .add => a + b,
+        .sub => a - b,
+        .mul => a * b,
+        .div => if (b == 0) return .null else @divTrunc(a, b),
+        .mod => return error.TypeMismatch,
+    };
+    return .{ .i64 = out };
+}
+
+fn evalCall(allocator: std.mem.Allocator, input: Batch, row: usize, c: sql.Call, query: ?sql.Query) EvalError!Cell {
+    if (c.args.len == 0) return error.InvalidSyntax;
+    const a0 = try evalValue(allocator, input, row, c.args[0], query);
+    switch (c.kind) {
+        .abs => return switch (a0) {
+            .null => .null,
+            .i64 => |n| .{ .i64 = absI64(n) },
+            .f64 => |n| .{ .f64 = @abs(n) },
+            .decimal => |d| .{ .decimal = .{ .v = if (d.v < 0) -d.v else d.v, .scale = d.scale } },
+            else => error.TypeMismatch,
+        },
+        .round => return switch (a0) {
+            .null => .null,
+            .i64 => a0,
+            .f64 => |n| .{ .f64 = @round(n) },
+            else => error.TypeMismatch,
+        },
+        .cast => {
+            const ty = c.cast_type orelse return error.InvalidSyntax;
+            return castCell(a0, ty);
+        },
+        .coalesce => {
+            var i: usize = 0;
+            while (i < c.args.len) : (i += 1) {
+                const v = try evalValue(allocator, input, row, c.args[i], query);
+                if (v != .null) return v;
+            }
+            return .null;
+        },
+        .lower => {
+            const s = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            const out = try allocator.alloc(u8, s.len);
+            for (s, 0..) |ch, i| {
+                out[i] = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+            }
+            return .{ .utf8 = out };
+        },
+        .substr => {
+            const s = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            const start_v = try evalValue(allocator, input, row, c.args[1], query);
+            const start = try asI64(start_v) orelse return .null;
+            var count: ?i64 = null;
+            if (c.args.len > 2) {
+                const len_v = try evalValue(allocator, input, row, c.args[2], query);
+                count = try asI64(len_v) orelse return .null;
+            }
+            return .{ .utf8 = substrUtf8(s, start, count) };
+        },
+        .concat => {
+            var buf: std.ArrayList(u8) = .empty;
+            for (c.args) |arg| {
+                const v = try evalValue(allocator, input, row, arg, query);
+                const s = switch (v) {
+                    .null => return .null,
+                    .utf8 => |s| s,
+                    else => return error.TypeMismatch,
+                };
+                try buf.appendSlice(allocator, s);
+            }
+            return .{ .utf8 = try buf.toOwnedSlice(allocator) };
+        },
+        .date_trunc => {
+            const unit = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            const ts = try evalValue(allocator, input, row, c.args[1], query);
+            const micros = try asI64(ts) orelse return .null;
+            return .{ .i64 = try dateTruncMicros(unit, micros) };
+        },
+        .upper => {
+            const s = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            const out = try allocator.alloc(u8, s.len);
+            for (s, 0..) |ch, i| {
+                out[i] = if (ch >= 'a' and ch <= 'z') ch - 32 else ch;
+            }
+            return .{ .utf8 = out };
+        },
+        .length => {
+            const s = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            return .{ .i64 = @intCast(s.len) };
+        },
+        .trim, .ltrim, .rtrim => {
+            const s = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            return .{ .utf8 = trimAscii(s, c.kind) };
+        },
+        .replace => {
+            const s = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            const from_v = try evalValue(allocator, input, row, c.args[1], query);
+            const to_v = try evalValue(allocator, input, row, c.args[2], query);
+            const from = switch (from_v) {
+                .null => return .null,
+                .utf8 => |x| x,
+                else => return error.TypeMismatch,
+            };
+            const to = switch (to_v) {
+                .null => return .null,
+                .utf8 => |x| x,
+                else => return error.TypeMismatch,
+            };
+            return .{ .utf8 = try replaceAll(allocator, s, from, to) };
+        },
+        .extract => {
+            const unit = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            const ts = try evalValue(allocator, input, row, c.args[1], query);
+            const micros = try asI64(ts) orelse return .null;
+            return .{ .i64 = try extractField(unit, micros) };
+        },
+        .year, .month, .day, .hour, .minute, .second => {
+            const micros = try asI64(a0) orelse return .null;
+            const unit: []const u8 = switch (c.kind) {
+                .year => "year",
+                .month => "month",
+                .day => "day",
+                .hour => "hour",
+                .minute => "minute",
+                .second => "second",
+                else => unreachable,
+            };
+            return .{ .i64 = try extractField(unit, micros) };
+        },
+        .left, .right => {
+            const s = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            const n_v = try evalValue(allocator, input, row, c.args[1], query);
+            const n = try asI64(n_v) orelse return .null;
+            return .{ .utf8 = leftRightUtf8(s, n, c.kind == .right) };
+        },
+        .starts_with, .ends_with, .contains => {
+            const s = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            const p_v = try evalValue(allocator, input, row, c.args[1], query);
+            const p = switch (p_v) {
+                .null => return .null,
+                .utf8 => |x| x,
+                else => return error.TypeMismatch,
+            };
+            const ok: bool = switch (c.kind) {
+                .starts_with => std.mem.startsWith(u8, s, p),
+                .ends_with => std.mem.endsWith(u8, s, p),
+                .contains => std.mem.indexOf(u8, s, p) != null,
+                else => unreachable,
+            };
+            return .{ .bool = ok };
+        },
+        .position => {
+            const s = switch (a0) {
+                .null => return .null,
+                .utf8 => |s| s,
+                else => return error.TypeMismatch,
+            };
+            const p_v = try evalValue(allocator, input, row, c.args[1], query);
+            const p = switch (p_v) {
+                .null => return .null,
+                .utf8 => |x| x,
+                else => return error.TypeMismatch,
+            };
+            if (p.len == 0) return .{ .i64 = 1 };
+            if (std.mem.indexOf(u8, s, p)) |i| return .{ .i64 = @intCast(i + 1) };
+            return .{ .i64 = 0 };
+        },
+        .ceil, .floor => {
+            if (a0 == .null) return .null;
+            if (a0 == .i64) return a0;
+            const n = try asF64(a0) orelse return .null;
+            const out = if (c.kind == .ceil) @ceil(n) else @floor(n);
+            return .{ .f64 = out };
+        },
+        .sign => {
+            if (a0 == .null) return .null;
+            const n = try asF64(a0) orelse return .null;
+            const s: i64 = if (n < 0) -1 else if (n > 0) 1 else 0;
+            return .{ .i64 = s };
+        },
+        .greatest, .least => {
+            var best: ?Cell = null;
+            const want_min = c.kind == .least;
+            for (c.args) |arg| {
+                const v = try evalValue(allocator, input, row, arg, query);
+                if (v == .null) continue;
+                if (best) |b| {
+                    const ord = try cellOrd(b, v);
+                    if (want_min) {
+                        if (ord == .gt) best = v;
+                    } else if (ord == .lt) best = v;
+                } else {
+                    best = v;
+                }
+            }
+            return best orelse .null;
+        },
+    }
+}
+
+fn leftRightUtf8(s: []const u8, n: i64, from_right: bool) []const u8 {
+    if (n <= 0 or s.len == 0) return s[0..0];
+    const take: usize = @intCast(n);
+    if (take >= s.len) return s;
+    if (from_right) return s[s.len - take ..];
+    return s[0..take];
+}
+
+fn cellOrd(a: Cell, b: Cell) EvalError!std.math.Order {
+    if (a == .utf8 and b == .utf8) return std.mem.order(u8, a.utf8, b.utf8);
+    const af = asF64(a) catch return error.TypeMismatch;
+    const bf = asF64(b) catch return error.TypeMismatch;
+    const x = af orelse return error.TypeMismatch;
+    const y = bf orelse return error.TypeMismatch;
+    if (x < y) return .lt;
+    if (x > y) return .gt;
+    return .eq;
+}
+
+fn isAsciiSpace(ch: u8) bool {
+    return ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r';
+}
+
+fn trimAscii(s: []const u8, kind: sql.ScalarKind) []const u8 {
+    var a: usize = 0;
+    var b: usize = s.len;
+    if (kind == .trim or kind == .ltrim) {
+        while (a < b and isAsciiSpace(s[a])) a += 1;
+    }
+    if (kind == .trim or kind == .rtrim) {
+        while (b > a and isAsciiSpace(s[b - 1])) b -= 1;
+    }
+    return s[a..b];
+}
+
+fn replaceAll(allocator: std.mem.Allocator, s: []const u8, from: []const u8, to: []const u8) ![]const u8 {
+    if (from.len == 0) return s;
+    var buf: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (i + from.len <= s.len and std.mem.eql(u8, s[i..][0..from.len], from)) {
+            try buf.appendSlice(allocator, to);
+            i += from.len;
+        } else {
+            try buf.append(allocator, s[i]);
+            i += 1;
+        }
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+fn extractField(unit: []const u8, micros: i64) EvalError!i64 {
+    const days = @divFloor(micros, us_per_day);
+    const civil = civilFromUnixDays(days);
+    if (eqlUnit(unit, "year") or eqlUnit(unit, "years")) return civil.year;
+    if (eqlUnit(unit, "month") or eqlUnit(unit, "months")) return @intCast(civil.month);
+    if (eqlUnit(unit, "day") or eqlUnit(unit, "days")) return @intCast(civil.day);
+    const tod = micros - days * us_per_day;
+    if (eqlUnit(unit, "hour") or eqlUnit(unit, "hours")) return @divFloor(tod, us_per_hour);
+    if (eqlUnit(unit, "minute") or eqlUnit(unit, "minutes")) return @divFloor(@mod(tod, us_per_hour), us_per_minute);
+    if (eqlUnit(unit, "second") or eqlUnit(unit, "seconds")) return @divFloor(@mod(tod, us_per_minute), us_per_second);
+    return error.InvalidSyntax;
+}
+
+fn substrUtf8(s: []const u8, start: i64, count: ?i64) []const u8 {
+    if (s.len == 0) return s;
+    const begin: usize = if (start <= 1) 0 else blk: {
+        const i: usize = @intCast(start - 1);
+        break :blk if (i > s.len) s.len else i;
+    };
+    if (begin >= s.len) return s[s.len..];
+    if (count) |n| {
+        if (n <= 0) return s[begin..begin];
+        const take: usize = @intCast(n);
+        const end = @min(s.len, begin + take);
+        return s[begin..end];
+    }
+    return s[begin..];
+}
+
+const us_per_second: i64 = 1_000_000;
+const us_per_minute: i64 = 60 * us_per_second;
+const us_per_hour: i64 = 60 * us_per_minute;
+const us_per_day: i64 = 24 * us_per_hour;
+
+fn dateTruncMicros(unit: []const u8, micros: i64) EvalError!i64 {
+    if (eqlUnit(unit, "second") or eqlUnit(unit, "seconds"))
+        return @divFloor(micros, us_per_second) * us_per_second;
+    if (eqlUnit(unit, "minute") or eqlUnit(unit, "minutes"))
+        return @divFloor(micros, us_per_minute) * us_per_minute;
+    if (eqlUnit(unit, "hour") or eqlUnit(unit, "hours"))
+        return @divFloor(micros, us_per_hour) * us_per_hour;
+    if (eqlUnit(unit, "day") or eqlUnit(unit, "days"))
+        return @divFloor(micros, us_per_day) * us_per_day;
+    const days = @divFloor(micros, us_per_day);
+    const civil = civilFromUnixDays(days);
+    if (eqlUnit(unit, "month") or eqlUnit(unit, "months"))
+        return unixDaysFromCivil(civil.year, civil.month, 1) * us_per_day;
+    if (eqlUnit(unit, "year") or eqlUnit(unit, "years"))
+        return unixDaysFromCivil(civil.year, 1, 1) * us_per_day;
+    return error.InvalidSyntax;
+}
+
+fn eqlUnit(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+fn civilFromUnixDays(z: i64) struct { year: i64, month: u32, day: u32 } {
+    const z0 = z + 719468;
+    const era = @divFloor(z0, 146097);
+    const doe: i64 = z0 - era * 146097;
+    const yoe: i64 = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    var y = yoe + era * 400;
+    const doy: i64 = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp: i64 = @divFloor(5 * doy + 2, 153);
+    const d: i64 = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m: i64 = mp + (if (mp < 10) @as(i64, 3) else -9);
+    if (m <= 2) y += 1;
+    return .{ .year = y, .month = @intCast(m), .day = @intCast(d) };
+}
+
+fn unixDaysFromCivil(y: i64, m: u32, d: u32) i64 {
+    var yy = y;
+    const mm: i64 = m;
+    if (mm <= 2) yy -= 1;
+    const era = @divFloor(yy, 400);
+    const yoe = yy - era * 400;
+    const doy = @divFloor(153 * (mm + (if (mm > 2) @as(i64, -3) else 9)) + 2, 5) + @as(i64, d) - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn castCell(v: Cell, ty: sql.CastType) !Cell {
+    if (v == .null) return .null;
+    return switch (ty) {
+        .int64 => .{ .i64 = try asI64(v) orelse return .null },
+        .float64 => .{ .f64 = try asF64(v) orelse return .null },
+        .boolean => switch (v) {
+            .bool => |b| .{ .bool = b },
+            .i64 => |n| .{ .bool = n != 0 },
+            else => error.TypeMismatch,
+        },
+        .utf8 => error.TypeMismatch,
+    };
+}
+
+fn cmpCells(op: sql.CmpOp, lhs: Cell, rhs: Cell) !bool {
+    if (lhs == .null or rhs == .null) return false;
+    if (lhs == .uuid or rhs == .uuid) {
+        const a = switch (lhs) {
+            .uuid => |u| u,
+            .utf8 => |s| try parseUuid(s),
+            else => return error.TypeMismatch,
+        };
+        const b = switch (rhs) {
+            .uuid => |u| u,
+            .utf8 => |s| try parseUuid(s),
+            else => return error.TypeMismatch,
+        };
+        const ord = std.mem.order(u8, &a, &b);
+        return switch (op) {
+            .eq => ord == .eq,
+            .ne => ord != .eq,
+            .lt => ord == .lt,
+            .le => ord != .gt,
+            .gt => ord == .gt,
+            .ge => ord != .lt,
+        };
+    }
+    if (lhs == .utf8 or rhs == .utf8) {
+        const a = switch (lhs) {
+            .utf8 => |s| s,
+            else => return error.TypeMismatch,
+        };
+        const b = switch (rhs) {
+            .utf8 => |s| s,
+            else => return error.TypeMismatch,
+        };
+        const ord = std.mem.order(u8, a, b);
+        return switch (op) {
+            .eq => ord == .eq,
+            .ne => ord != .eq,
+            .lt => ord == .lt,
+            .le => ord != .gt,
+            .gt => ord == .gt,
+            .ge => ord != .lt,
+        };
+    }
+    const use_float = lhs == .f64 or rhs == .f64 or lhs == .decimal or rhs == .decimal;
+    if (use_float) {
+        const a = try asF64(lhs) orelse return false;
+        const b = try asF64(rhs) orelse return false;
+        return switch (op) {
+            .eq => a == b,
+            .ne => a != b,
+            .lt => a < b,
+            .le => a <= b,
+            .gt => a > b,
+            .ge => a >= b,
+        };
+    }
+    const a = try asI64(lhs) orelse return false;
+    const b = try asI64(rhs) orelse return false;
+    return cmpOrd(a, op, b);
+}
+
+fn cellType(v: Cell) DataType {
+    return switch (v) {
+        .null, .i64 => .int64,
+        .bool => .boolean,
+        .f64 => .float64,
+        .utf8 => .utf8,
+        .uuid => .uuid,
+        .decimal => .decimal128,
+    };
+}
+
+fn evalComputed(allocator: std.mem.Allocator, input: Batch, c: sql.Computed, query: sql.Query) !Column {
+    const name = c.alias orelse c.sql_text;
+    var ty: DataType = .int64;
+    var row: usize = 0;
+    while (row < input.len) : (row += 1) {
+        const v = try evalValue(allocator, input, row, c.expr, query);
+        if (v != .null) {
+            ty = cellType(v);
+            break;
+        }
+    }
+    var dst: Column = .{ .name = name, .data_type = ty, .len = input.len };
+    const valid = try allocator.alloc(u8, input.len);
+    switch (ty) {
+        .int64, .timestamp, .timestamptz => dst.i64s = try allocator.alloc(i64, input.len),
+        .float64 => dst.f64s = try allocator.alloc(f64, input.len),
+        .boolean => dst.bools = try allocator.alloc(u8, input.len),
+        .utf8 => dst.utf8 = .{
+            .offsets = try allocator.alloc(u32, input.len + 1),
+            .bytes = &.{},
+        },
+        .uuid => dst.uuids = try allocator.alloc([16]u8, input.len),
+        .decimal128 => dst.i128s = try allocator.alloc(i128, input.len),
+        else => return error.TypeMismatch,
+    }
+    var utf8_bytes: std.ArrayList(u8) = .empty;
+    row = 0;
+    while (row < input.len) : (row += 1) {
+        const v = try evalValue(allocator, input, row, c.expr, query);
+        if (v == .null) {
+            valid[row] = 0;
+            switch (ty) {
+                .int64, .timestamp, .timestamptz => dst.i64s[row] = 0,
+                .float64 => dst.f64s[row] = 0,
+                .boolean => dst.bools[row] = 0,
+                .utf8 => dst.utf8.offsets[row] = @intCast(utf8_bytes.items.len),
+                .uuid => dst.uuids[row] = @splat(0),
+                .decimal128 => dst.i128s[row] = 0,
+                else => {},
+            }
+            continue;
+        }
+        valid[row] = 1;
+        switch (ty) {
+            .int64, .timestamp, .timestamptz => dst.i64s[row] = try asI64(v) orelse 0,
+            .float64 => dst.f64s[row] = try asF64(v) orelse 0,
+            .boolean => dst.bools[row] = switch (v) {
+                .bool => |b| if (b) 1 else 0,
+                .i64 => |n| if (n != 0) 1 else 0,
+                else => return error.TypeMismatch,
+            },
+            .utf8 => {
+                dst.utf8.offsets[row] = @intCast(utf8_bytes.items.len);
+                try utf8_bytes.appendSlice(allocator, switch (v) {
+                    .utf8 => |s| s,
+                    else => return error.TypeMismatch,
+                });
+            },
+            .uuid => dst.uuids[row] = switch (v) {
+                .uuid => |u| u,
+                else => return error.TypeMismatch,
+            },
+            .decimal128 => {
+                const d = switch (v) {
+                    .decimal => |x| x,
+                    else => return error.TypeMismatch,
+                };
+                dst.i128s[row] = d.v;
+                dst.decimal_scale = d.scale;
+            },
+            else => return error.TypeMismatch,
+        }
+    }
+    if (ty == .utf8) {
+        dst.utf8.offsets[input.len] = @intCast(utf8_bytes.items.len);
+        dst.utf8.bytes = try utf8_bytes.toOwnedSlice(allocator);
+    }
+    var any_null = false;
+    for (valid) |b| {
+        if (b == 0) {
+            any_null = true;
+            break;
+        }
+    }
+    dst.valid = if (any_null) valid else &.{};
+    return dst;
+}
+
+fn evalGroupComputed(
+    allocator: std.mem.Allocator,
+    input: Batch,
+    first_rows: []const usize,
+    c: sql.Computed,
+    query: sql.Query,
+) !Column {
+    const subset = try gatherRows(allocator, input, first_rows);
+    return evalComputed(allocator, subset, c, query);
 }
 
 fn resolveCmpLeft(input: Batch, left: sql.CmpLeft, query: ?sql.Query) !usize {
@@ -3325,50 +4045,6 @@ fn resolveCmpLeft(input: Batch, left: sql.CmpLeft, query: ?sql.Query) !usize {
             return error.ColumnNotFound;
         },
     }
-}
-
-fn cmpInt(value: i64, pred: sql.Cmp) !bool {
-    const rhs: i64 = switch (pred.literal) {
-        .int => |v| v,
-        .float => |v| @intFromFloat(v),
-        .string => return error.TypeMismatch,
-        .null => return false,
-    };
-    return cmpOrd(value, pred.op, rhs);
-}
-
-fn cmpFloat(value: f64, pred: sql.Cmp) !bool {
-    const rhs: f64 = switch (pred.literal) {
-        .int => |v| @floatFromInt(v),
-        .float => |v| v,
-        .string => return error.TypeMismatch,
-        .null => return false,
-    };
-    return switch (pred.op) {
-        .eq => value == rhs,
-        .ne => value != rhs,
-        .lt => value < rhs,
-        .le => value <= rhs,
-        .gt => value > rhs,
-        .ge => value >= rhs,
-    };
-}
-
-fn cmpStr(value: []const u8, pred: sql.Cmp) !bool {
-    const rhs = switch (pred.literal) {
-        .string => |s| s,
-        .null => return false,
-        else => return error.TypeMismatch,
-    };
-    const ord = std.mem.order(u8, value, rhs);
-    return switch (pred.op) {
-        .eq => ord == .eq,
-        .ne => ord != .eq,
-        .lt => ord == .lt,
-        .le => ord != .gt,
-        .gt => ord == .gt,
-        .ge => ord != .lt,
-    };
 }
 
 fn cmpOrd(lhs: i64, op: sql.CmpOp, rhs: i64) bool {
@@ -3389,27 +4065,6 @@ fn pow10i128(scale: i32) i128 {
     return p;
 }
 
-fn cmpDecimal(col: Column, row: usize, pred: sql.Cmp) !bool {
-    const lhs = col.i128s[row];
-    const rhs: i128 = switch (pred.literal) {
-        .int => |v| @as(i128, v) * pow10i128(col.decimal_scale),
-        .float => |v| blk: {
-            const scaled = v * @as(f64, @floatFromInt(pow10i128(col.decimal_scale)));
-            break :blk @intFromFloat(@round(scaled));
-        },
-        .string => return error.TypeMismatch,
-        .null => return false,
-    };
-    return switch (pred.op) {
-        .eq => lhs == rhs,
-        .ne => lhs != rhs,
-        .lt => lhs < rhs,
-        .le => lhs <= rhs,
-        .gt => lhs > rhs,
-        .ge => lhs >= rhs,
-    };
-}
-
 fn parseUuid(s: []const u8) ![16]u8 {
     var hex: [32]u8 = undefined;
     var n: usize = 0;
@@ -3425,28 +4080,32 @@ fn parseUuid(s: []const u8) ![16]u8 {
     return out;
 }
 
-fn cmpUuid(value: [16]u8, pred: sql.Cmp) !bool {
-    const rhs = switch (pred.literal) {
-        .string => |s| try parseUuid(s),
-        .null => return false,
-        else => return error.TypeMismatch,
-    };
-    const ord = std.mem.order(u8, &value, &rhs);
-    return switch (pred.op) {
-        .eq => ord == .eq,
-        .ne => ord != .eq,
-        .lt => ord == .lt,
-        .le => ord != .gt,
-        .gt => ord == .gt,
-        .ge => ord != .lt,
-    };
+fn identTail(name: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, name, '.')) |d| name[d + 1 ..] else name;
+}
+
+fn identQual(name: []const u8) ?[]const u8 {
+    const d = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    if (d == 0) return null;
+    return name[0..d];
+}
+
+fn sameGroupKey(group_key: []const u8, qual: ?[]const u8, name: []const u8) bool {
+    if (!std.ascii.eqlIgnoreCase(identTail(group_key), name)) return false;
+    const gq = identQual(group_key);
+    if (gq == null or qual == null) return true;
+    return std.ascii.eqlIgnoreCase(gq.?, qual.?);
+}
+
+fn groupHas(query: sql.Query, qual: ?[]const u8, name: []const u8) bool {
+    for (query.group_by) |g| {
+        if (sameGroupKey(g, qual, name)) return true;
+    }
+    return false;
 }
 
 fn inGroupBy(query: sql.Query, name: []const u8) bool {
-    for (query.group_by) |g| {
-        if (std.ascii.eqlIgnoreCase(g, name)) return true;
-    }
-    return false;
+    return groupHas(query, identQual(name), identTail(name));
 }
 
 fn inGroupedOutput(query: sql.Query, name: []const u8) bool {
@@ -3496,10 +4155,11 @@ fn validateAgg(query: sql.Query) !void {
     for (query.items) |item| {
         switch (item) {
             .star => return error.UnsupportedSql,
-            .column => |c| if (!inGroupBy(query, c.name)) return error.InvalidSyntax,
+            .column => |c| if (!groupHas(query, c.qualifier, c.name)) return error.InvalidSyntax,
             .scalar => return error.UnsupportedSql,
             .literal => return error.UnsupportedSql,
             .case => return error.UnsupportedSql,
+            .expr => {},
             .agg => {},
             .window => |w| try validateWindowInAgg(query, w),
         }
@@ -3529,6 +4189,8 @@ const AggState = struct {
     inited: bool = false,
     decimal_precision: i32 = 0,
     decimal_scale: i32 = 0,
+    distinct: bool = false,
+    seen: std.StringHashMapUnmanaged(void) = .empty,
 };
 
 const Group = struct {
@@ -3546,11 +4208,20 @@ fn numericI64(col: Column, row: usize) !i64 {
 
 fn feed(state: *AggState, col: ?Column, row: usize, str_alloc: ?std.mem.Allocator) !void {
     const c = col orelse {
-        if (state.kind != .count) return error.InvalidSyntax;
+        if (state.kind != .count or state.distinct) return error.InvalidSyntax;
         state.count += 1;
         return;
     };
     if (c.isNull(row)) return;
+    if (state.distinct) {
+        const a = str_alloc orelse return error.InvalidSyntax;
+        const key = try encodeColKey(a, c, row);
+        const gop = try state.seen.getOrPut(a, key);
+        if (gop.found_existing) {
+            a.free(key);
+            return;
+        }
+    }
     state.count += 1;
     switch (state.kind) {
         .count => {},
@@ -3683,6 +4354,13 @@ fn encodeKey(allocator: std.mem.Allocator, input: Batch, row: usize, group_idxs:
     return buf.toOwnedSlice(allocator);
 }
 
+fn encodeColKey(allocator: std.mem.Allocator, col: Column, row: usize) ![]u8 {
+    var cols = [_]Column{col};
+    const input = Batch{ .columns = &cols, .len = row + 1 };
+    const idxs = [_]usize{0};
+    return encodeKey(allocator, input, row, &idxs);
+}
+
 fn aggColumn(input: Batch, agg: sql.Agg) !?Column {
     const name = agg.arg orelse return null;
     const idx = try input.lookup(name);
@@ -3712,7 +4390,7 @@ fn makeStates(allocator: std.mem.Allocator, query: sql.Query) ![]AggState {
     var i: usize = 0;
     for (query.items) |item| {
         if (item == .agg) {
-            states[i] = .{ .kind = item.agg.kind };
+            states[i] = .{ .kind = item.agg.kind, .distinct = item.agg.distinct };
             i += 1;
         }
     }
@@ -3898,10 +4576,10 @@ fn aggregateBatch(allocator: std.mem.Allocator, input: Batch, query: sql.Query) 
     while (row < input.len) : (row += 1) {
         if (group_idxs.len == 0) {
             if (groups.getPtr("")) |g| {
-                try feedRow(g.states, input, query, row, null);
+                try feedRow(g.states, input, query, row, allocator);
             } else {
                 const states = try makeStates(allocator, query);
-                try feedRow(states, input, query, row, null);
+                try feedRow(states, input, query, row, allocator);
                 try groups.put(allocator, "", .{ .first_row = row, .states = states });
             }
             continue;
@@ -3909,11 +4587,11 @@ fn aggregateBatch(allocator: std.mem.Allocator, input: Batch, query: sql.Query) 
 
         const encoded = try encodeKey(allocator, input, row, group_idxs);
         if (groups.getPtr(encoded)) |g| {
-            try feedRow(g.states, input, query, row, null);
+            try feedRow(g.states, input, query, row, allocator);
             allocator.free(encoded);
         } else {
             const states = try makeStates(allocator, query);
-            try feedRow(states, input, query, row, null);
+            try feedRow(states, input, query, row, allocator);
             try groups.put(allocator, encoded, .{ .first_row = row, .states = states });
         }
     }
@@ -3956,6 +4634,10 @@ fn aggregateBatch(allocator: std.mem.Allocator, input: Batch, query: sql.Query) 
     for (query.items) |item| {
         switch (item) {
             .star, .scalar, .literal, .case => return error.UnsupportedSql,
+            .expr => |ex| {
+                out_cols[col_i] = try evalGroupComputed(allocator, input, first_rows, ex, query);
+                col_i += 1;
+            },
             .window => {},
             .column => |c| {
                 const key = if (c.qualifier) |q|
@@ -4061,6 +4743,34 @@ fn scalarName(s: sql.Scalar) []const u8 {
         .round => "round",
         .cast => "cast",
         .coalesce => "coalesce",
+        .lower => "lower",
+        .upper => "upper",
+        .length => "length",
+        .trim => "trim",
+        .ltrim => "ltrim",
+        .rtrim => "rtrim",
+        .replace => "replace",
+        .substr => "substr",
+        .concat => "concat",
+        .date_trunc => "date_trunc",
+        .extract => "extract",
+        .year => "year",
+        .month => "month",
+        .day => "day",
+        .hour => "hour",
+        .minute => "minute",
+        .second => "second",
+        .left => "left",
+        .right => "right",
+        .starts_with => "starts_with",
+        .ends_with => "ends_with",
+        .contains => "contains",
+        .position => "strpos",
+        .ceil => "ceil",
+        .floor => "floor",
+        .sign => "sign",
+        .greatest => "greatest",
+        .least => "least",
     };
 }
 
@@ -4073,6 +4783,7 @@ fn evalScalar(allocator: std.mem.Allocator, input: Batch, s: sql.Scalar) !Column
         .round => evalRound(allocator, src, name),
         .cast => evalCast(allocator, src, s.cast_type orelse return error.InvalidSyntax, name),
         .coalesce => evalCoalesce(allocator, input, s),
+        .lower, .upper, .length, .trim, .ltrim, .rtrim, .replace, .substr, .concat, .date_trunc, .extract, .year, .month, .day, .hour, .minute, .second, .left, .right, .starts_with, .ends_with, .contains, .position, .ceil, .floor, .sign, .greatest, .least => error.UnsupportedSql,
     };
 }
 

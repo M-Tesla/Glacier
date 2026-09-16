@@ -478,3 +478,27 @@ static struct lconv glacier_lconv = { .decimal_point = glacier_dot };
 struct lconv *localeconv(void) {
     return &glacier_lconv;
 }
+
+#include <sys/stat.h>
+
+int fstat(int fd, struct stat *st) {
+    (void)fd;
+    (void)st;
+    return -1;
+}
+
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off) {
+    (void)addr;
+    (void)len;
+    (void)prot;
+    (void)flags;
+    (void)fd;
+    (void)off;
+    return (void *)-1;
+}
+
+int munmap(void *addr, size_t len) {
+    (void)addr;
+    (void)len;
+    return -1;
+}
