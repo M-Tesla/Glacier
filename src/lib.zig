@@ -1,4 +1,4 @@
-//! Glacier 0.2 — Zig query engine. Format codecs are C (carquet, libavro).
+//! Glacier 0.2. Zig query engine. Format codecs are C (carquet, libavro).
 
 pub const FileSource = @import("vfs/source.zig").FileSource;
 pub const Transport = @import("vfs/source.zig").Transport;
@@ -8,13 +8,18 @@ pub const aws = @import("kernel/aws.zig");
 pub const parquet = @import("formats/parquet_wrap.zig");
 pub const avro = @import("formats/avro_wrap.zig");
 pub const arrow = @import("formats/arrow_wrap.zig");
+pub const arrow_ipc = @import("formats/arrow_ipc.zig");
 pub const native = @import("formats/native.zig");
 pub const sql = @import("sql/parser.zig");
 pub const batch = @import("execution/batch.zig");
 pub const physical = @import("execution/physical.zig");
 pub const session = @import("session.zig");
 pub const iceberg = @import("table/iceberg.zig");
+pub const catalog = @import("table/catalog.zig");
 pub const rest_catalog = @import("table/rest_catalog.zig");
+pub const hadoop_catalog = @import("table/hadoop_catalog.zig");
+pub const glacier_catalog = @import("table/glacier_catalog.zig");
+pub const rest_server = @import("table/rest_server.zig");
 pub const err = @import("error.zig");
 pub const c_api = @import("c_api.zig");
 
@@ -29,6 +34,7 @@ pub const version = "0.2.1";
 comptime {
     _ = &c_api.glacier_open;
     _ = &c_api.glacier_open_buffer;
+    _ = &c_api.glacier_open_catalog;
     _ = &c_api.glacier_malloc;
     _ = &c_api.glacier_malloc_free;
     _ = &c_api.glacier_close;
@@ -49,10 +55,15 @@ test {
     _ = parquet;
     _ = avro;
     _ = arrow;
+    _ = arrow_ipc;
     _ = sql;
     _ = session;
     _ = iceberg;
+    _ = catalog;
     _ = rest_catalog;
+    _ = hadoop_catalog;
+    _ = glacier_catalog;
+    _ = rest_server;
     _ = err;
     _ = c_api;
     _ = cache;

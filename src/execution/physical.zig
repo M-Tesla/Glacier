@@ -1,5 +1,6 @@
 //! Scan / filter / aggregate / having / window / project / scalars / CASE / distinct / order / offset / limit.
-//! JOIN is a hash join of two scans (INNER / LEFT / RIGHT / FULL). Window: OVER + ROWS/RANGE + LAG/LEAD.
+//! JOIN is a hash join of two scans (INNER / LEFT / RIGHT / FULL). `COUNT(*)` after
+//! JOIN counts key frequencies (no gathered match rows). Window: OVER + ROWS/RANGE + LAG/LEAD.
 //! UNION is concatenated in the session so each arm can scan its own FROM.
 //! Expr: arithmetic, col vs col, nested scalar calls (abs/round/cast/coalesce/lower/upper/length/trim/replace/substr/concat/left/right/date_trunc/extract/year/month/day/hour/ceil/greatest).
 //! Aggregates: COUNT/SUM/AVG/MIN/MAX(DISTINCT col). GROUP BY may emit first-row exprs.
@@ -58,12 +59,17 @@ fn executeNoJoin(
     fallback_schema: ?[]const iceberg.SchemaField,
     stats: ?*ScanStats,
 ) !Batch {
-    if (files.len == 0) return error.TableNotFound;
+    if (files.len == 0) {
+        const fields = fallback_schema orelse return error.TableNotFound;
+        return executeOnBatch(allocator, try emptyFromSchema(allocator, fields), query);
+    }
 
     if (canStreamQuery(query) and filesAreStreamable(files) and !filesHaveDeletes(files)) {
         return executeStream(allocator, t, files, query, fallback_schema, stats);
     }
-    if (filesAreStreamable(files) and !query.hasWindow() and !filesHaveDeletes(files)) {
+    if (filesAreStreamable(files) and !filesHaveDeletes(files) and
+        (!query.hasWindow() or (query.order_by.len > 0 and !query.needsAgg())))
+    {
         return executeCapped(allocator, t, files, query, fallback_schema, stats);
     }
 
@@ -362,6 +368,11 @@ pub fn joinAndTail(allocator: std.mem.Allocator, left: Batch, right: Batch, quer
     const rq = tableQual(j.table, j.alias, "right");
     if (std.ascii.eqlIgnoreCase(lq, rq)) return error.InvalidSyntax;
     const keys = try resolveJoinKeys(allocator, left, right, lq, rq, j.eqs);
+    if (isJoinCountStar(query)) {
+        const n = try hashJoinCount(allocator, left, right, keys.left, keys.right, j.kind);
+        const counted = try countStarBatch(allocator, n, query);
+        return applyTail(allocator, counted, query, .{ .agg_done = true });
+    }
     const joined = try hashJoin(allocator, left, right, keys.left, keys.right, lq, rq, j.kind);
     return applyTail(allocator, joined, query, .{});
 }
@@ -558,6 +569,125 @@ fn hashJoin(
     return hconcat(allocator, l_q, r_q);
 }
 
+fn isJoinCountStar(query: sql.Query) bool {
+    if (query.where != null or query.having != null) return false;
+    if (query.group_by.len != 0) return false;
+    if (query.distinct or query.hasWindow()) return false;
+    if (query.items.len != 1) return false;
+    const agg = switch (query.items[0]) {
+        .agg => |a| a,
+        else => return false,
+    };
+    return agg.kind == .count and !agg.distinct and agg.arg == null;
+}
+
+fn countStarBatch(allocator: std.mem.Allocator, n: i64, query: sql.Query) !Batch {
+    const name = try aggName(allocator, query.items[0].agg);
+    const i64s = try allocator.alloc(i64, 1);
+    i64s[0] = n;
+    const columns = try allocator.alloc(Column, 1);
+    columns[0] = .{ .name = name, .data_type = .int64, .len = 1, .i64s = i64s };
+    return .{ .columns = columns, .len = 1 };
+}
+
+const KeyCounts = struct {
+    map: std.StringArrayHashMapUnmanaged(u64),
+    nulls: u64,
+};
+
+fn keyCounts(
+    allocator: std.mem.Allocator,
+    batch: Batch,
+    idxs: []const usize,
+) !KeyCounts {
+    var map: std.StringArrayHashMapUnmanaged(u64) = .empty;
+    var nulls: u64 = 0;
+    var row: usize = 0;
+    while (row < batch.len) : (row += 1) {
+        if (rowHasNullKey(batch, row, idxs)) {
+            nulls += 1;
+            continue;
+        }
+        const key = try encodeKey(allocator, batch, row, idxs);
+        if (map.getPtr(key)) |n| {
+            n.* += 1;
+            allocator.free(key);
+        } else {
+            try map.put(allocator, key, 1);
+        }
+    }
+    return .{ .map = map, .nulls = nulls };
+}
+
+fn addProduct(n: *u64, a: u64, b: u64) !void {
+    const prod = try std.math.mul(u64, a, b);
+    n.* = try std.math.add(u64, n.*, prod);
+}
+
+fn hashJoinCount(
+    allocator: std.mem.Allocator,
+    left: Batch,
+    right: Batch,
+    left_idxs: []const usize,
+    right_idxs: []const usize,
+    kind: sql.JoinKind,
+) !i64 {
+    const left_c = try keyCounts(allocator, left, left_idxs);
+    const right_c = try keyCounts(allocator, right, right_idxs);
+    var n: u64 = 0;
+    switch (kind) {
+        .inner => {
+            var it = left_c.map.iterator();
+            while (it.next()) |kv| {
+                const r = right_c.map.get(kv.key_ptr.*) orelse 0;
+                try addProduct(&n, kv.value_ptr.*, r);
+            }
+        },
+        .left => {
+            n = left_c.nulls;
+            var it = left_c.map.iterator();
+            while (it.next()) |kv| {
+                const r = right_c.map.get(kv.key_ptr.*) orelse 0;
+                if (r == 0) {
+                    n = try std.math.add(u64, n, kv.value_ptr.*);
+                } else {
+                    try addProduct(&n, kv.value_ptr.*, r);
+                }
+            }
+        },
+        .right => {
+            n = right_c.nulls;
+            var it = right_c.map.iterator();
+            while (it.next()) |kv| {
+                const l = left_c.map.get(kv.key_ptr.*) orelse 0;
+                if (l == 0) {
+                    n = try std.math.add(u64, n, kv.value_ptr.*);
+                } else {
+                    try addProduct(&n, l, kv.value_ptr.*);
+                }
+            }
+        },
+        .full => {
+            n = try std.math.add(u64, left_c.nulls, right_c.nulls);
+            var lit = left_c.map.iterator();
+            while (lit.next()) |kv| {
+                const r = right_c.map.get(kv.key_ptr.*) orelse 0;
+                if (r == 0) {
+                    n = try std.math.add(u64, n, kv.value_ptr.*);
+                } else {
+                    try addProduct(&n, kv.value_ptr.*, r);
+                }
+            }
+            var rit = right_c.map.iterator();
+            while (rit.next()) |kv| {
+                if (left_c.map.contains(kv.key_ptr.*)) continue;
+                n = try std.math.add(u64, n, kv.value_ptr.*);
+            }
+        },
+    }
+    return std.math.cast(i64, n) orelse error.Overflow;
+}
+
 fn rowHasNullKey(batch: Batch, row: usize, idxs: []const usize) bool {
     for (idxs) |i| {
         if (batch.columns[i].isNull(row)) return true;
@@ -586,6 +716,29 @@ fn applyTail(allocator: std.mem.Allocator, scanned: Batch, query: sql.Query, t: 
             batch = try filterExpr(allocator, batch, expr, query);
         }
     }
+    const push_win = canPushLimitBeforeWindow(query);
+    if (push_win) {
+        if (query.order_by.len > 0 and !t.sort_done) {
+            batch = try sortBatch(allocator, batch, query.order_by);
+        }
+        if (!t.range_done) {
+            const keep = (query.offset orelse 0) + (query.limit orelse 0);
+            batch = try takeRange(allocator, batch, 0, keep);
+        }
+        if (query.hasWindow()) {
+            batch = try applyWindows(allocator, batch, query);
+        }
+        if ((!query.needsAgg() and !query.isStar()) or (query.needsAgg() and query.hasWindow())) {
+            batch = try projectItems(allocator, batch, query);
+        }
+        if (query.distinct and !t.distinct_done) {
+            batch = try distinctBatch(allocator, batch);
+        }
+        if (!t.range_done and (query.offset != null or query.limit != null)) {
+            batch = try takeRange(allocator, batch, query.offset orelse 0, query.limit);
+        }
+        return batch;
+    }
     if (query.hasWindow()) {
         batch = try applyWindows(allocator, batch, query);
     }
@@ -602,6 +755,62 @@ fn applyTail(allocator: std.mem.Allocator, scanned: Batch, query: sql.Query, t: 
         batch = try takeRange(allocator, batch, query.offset orelse 0, query.limit);
     }
     return batch;
+}
+
+fn ordersEqual(a: []const sql.OrderBy, b: []const sql.OrderBy) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |l, r| {
+        if (!std.ascii.eqlIgnoreCase(l.column, r.column)) return false;
+        if (l.desc != r.desc) return false;
+    }
+    return true;
+}
+
+fn boundLooksForward(b: sql.FrameBound) bool {
+    return switch (b) {
+        .unbounded_following, .following => true,
+        else => false,
+    };
+}
+
+fn windowPrefixPushable(w: sql.Window, order: []const sql.OrderBy) bool {
+    if (w.kind == .lead) return false;
+    if (!ordersEqual(w.spec.order_by, order)) return false;
+    switch (w.kind) {
+        .lead => return false,
+        .row_number, .rank, .dense_rank, .lag => return true,
+        .count, .sum, .avg, .min, .max => {
+            const frame = w.spec.frame orelse return false;
+            if (frame.unit != .rows) return false;
+            return !boundLooksForward(frame.start) and !boundLooksForward(frame.end);
+        },
+    }
+}
+
+fn canPushLimitBeforeWindow(query: sql.Query) bool {
+    if (query.limit == null) return false;
+    if (query.order_by.len == 0) return false;
+    if (query.needsAgg() or query.distinct) return false;
+    if (!query.hasWindow()) return false;
+    for (query.items) |item| {
+        switch (item) {
+            .window => |w| if (!windowPrefixPushable(w, query.order_by)) return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+fn frameIsRunningRows(frame: sql.WindowFrame) bool {
+    return frame.unit == .rows and frame.start == .unbounded_preceding and frame.end == .current_row;
+}
+
+fn frameIsRunningRange(frame: sql.WindowFrame) bool {
+    return frame.unit == .range and frame.start == .unbounded_preceding and frame.end == .current_row;
+}
+
+fn frameIsWholePartition(frame: sql.WindowFrame) bool {
+    return frame.start == .unbounded_preceding and frame.end == .unbounded_following;
 }
 
 fn applyWindows(allocator: std.mem.Allocator, input: Batch, query: sql.Query) !Batch {
@@ -959,7 +1168,41 @@ fn evalWindow(allocator: std.mem.Allocator, input: Batch, w: sql.Window) !Column
                 return col;
             }
             const snaps = try allocator.alloc(AggState, n);
-            if (w.spec.frame) |frame| {
+            const running_rows = if (w.spec.frame) |frame| frameIsRunningRows(frame) else w.spec.order_by.len > 0;
+            const running_range = if (w.spec.frame) |frame| frameIsRunningRange(frame) else false;
+            const whole = if (w.spec.frame) |frame| frameIsWholePartition(frame) else w.spec.order_by.len == 0;
+            if (running_range) {
+                for (groups) |g| {
+                    var state = AggState{ .kind = kind };
+                    var i: usize = 0;
+                    while (i < g.len) {
+                        const pe = peerEnd(input, g, i, w.spec.order_by);
+                        var k = i;
+                        while (k <= pe) : (k += 1) {
+                            try feed(&state, src, g[k], allocator);
+                        }
+                        k = i;
+                        while (k <= pe) : (k += 1) {
+                            snaps[g[k]] = state;
+                        }
+                        i = pe + 1;
+                    }
+                }
+            } else if (running_rows) {
+                for (groups) |g| {
+                    var state = AggState{ .kind = kind };
+                    for (g) |orig| {
+                        try feed(&state, src, orig, allocator);
+                        snaps[orig] = state;
+                    }
+                }
+            } else if (whole) {
+                for (groups) |g| {
+                    var state = AggState{ .kind = kind };
+                    for (g) |orig| try feed(&state, src, orig, allocator);
+                    for (g) |orig| snaps[orig] = state;
+                }
+            } else if (w.spec.frame) |frame| {
                 for (groups) |g| {
                     for (g, 0..) |orig, i| {
                         const span = try windowFrameSpan(input, g, i, w.spec, frame);
@@ -973,19 +1216,11 @@ fn evalWindow(allocator: std.mem.Allocator, input: Batch, w: sql.Window) !Column
                         snaps[orig] = state;
                     }
                 }
-            } else if (w.spec.order_by.len == 0) {
+            } else {
                 for (groups) |g| {
                     var state = AggState{ .kind = kind };
                     for (g) |orig| try feed(&state, src, orig, allocator);
                     for (g) |orig| snaps[orig] = state;
-                }
-            } else {
-                for (groups) |g| {
-                    var state = AggState{ .kind = kind };
-                    for (g) |orig| {
-                        try feed(&state, src, orig, allocator);
-                        snaps[orig] = state;
-                    }
                 }
             }
             const template = snaps[0];
@@ -1684,20 +1919,29 @@ const CapCtx = struct {
         switch (self.mode) {
             .order => {
                 if (self.grow != null) try self.spillWork();
-                const push = !self.query.distinct and !self.query.needsAgg();
+                const q = self.query;
+                const win_push = q.hasWindow() and canPushLimitBeforeWindow(q);
+                const plain_push = !q.distinct and !q.needsAgg() and !q.hasWindow();
+                const merge_off: u64 = if (plain_push) q.offset orelse 0 else 0;
+                const merge_lim: ?u64 = if (plain_push)
+                    q.limit
+                else if (win_push)
+                    (q.offset orelse 0) + q.limit.?
+                else
+                    null;
                 const merged = try mergeRuns(
                     self.allocator,
                     self.io,
                     self.run_paths.items,
-                    self.query.order_by,
-                    if (push) self.query.offset orelse 0 else 0,
-                    if (push) self.query.limit else null,
+                    q.order_by,
+                    merge_off,
+                    merge_lim,
                     self.schema_batch,
                 );
-                return applyTail(self.allocator, merged, self.query, .{
+                return applyTail(self.allocator, merged, q, .{
                     .where_done = true,
                     .sort_done = true,
-                    .range_done = push,
+                    .range_done = plain_push,
                 });
             },
             .hash_agg => {

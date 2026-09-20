@@ -4,6 +4,7 @@ const std = @import("std");
 const FileSource = @import("../vfs/source.zig").FileSource;
 const aws = @import("../kernel/aws.zig");
 const cache = @import("../vfs/cache.zig");
+const batch_mod = @import("../execution/batch.zig");
 
 pub const LogicalC = extern struct {
     id: i32,
@@ -12,6 +13,27 @@ pub const LogicalC = extern struct {
     time_unit: i32,
     utc: i32,
     type_length: i32,
+};
+
+pub const WriteCol = extern struct {
+    name: [*:0]const u8,
+    physical: i32,
+    logical: i32,
+    values: ?*const anyopaque = null,
+    utf8_offsets: ?[*]const u32 = null,
+    utf8_bytes: ?[*]const u8 = null,
+    n_rows: i64,
+};
+
+pub const ColStats = extern struct {
+    has_min_max: i32,
+    has_null_count: i32,
+    null_count: i64,
+    num_values: i64,
+    min_len: i32,
+    max_len: i32,
+    min_bytes: [32]u8,
+    max_bytes: [32]u8,
 };
 
 const c = struct {
@@ -55,6 +77,7 @@ const c = struct {
     extern fn glacier_carquet_column_name(reader: ?*anyopaque, index: i32) ?[*:0]const u8;
     extern fn glacier_carquet_column_type(reader: ?*anyopaque, index: i32) c_int;
     extern fn glacier_carquet_column_logical(reader: ?*anyopaque, index: i32, out: *LogicalC) c_int;
+    extern fn glacier_carquet_column_stats(reader: ?*anyopaque, row_group: i32, column: i32, out: *ColStats) c_int;
     extern fn glacier_carquet_read_i64_prefix(reader: ?*anyopaque, col: i32, out: [*]i64, max: i64) i64;
     extern fn glacier_carquet_write_i64_fixture(path: [*:0]const u8, compression: c_int) c_int;
     extern fn glacier_carquet_write_sales_fixture(path: [*:0]const u8) c_int;
@@ -86,6 +109,7 @@ const c = struct {
         n: i32,
     ) c_int;
     extern fn glacier_carquet_write_struct_fixture(path: [*:0]const u8) c_int;
+    extern fn glacier_carquet_write_columns(path: [*:0]const u8, cols: [*]const WriteCol, n_cols: i32) c_int;
 };
 
 pub const PhysicalType = enum(c_int) {
@@ -158,6 +182,13 @@ pub const Reader = struct {
 
     pub fn columnRepLevel(self: Reader, index: i32) i16 {
         return c.glacier_carquet_column_rep_level(self.handle, index);
+    }
+
+    pub fn columnStats(self: Reader, row_group: i32, col: i32) !ColStats {
+        var out: ColStats = std.mem.zeroes(ColStats);
+        if (c.glacier_carquet_column_stats(self.handle, row_group, col, &out) != 0)
+            return error.ParquetStatsFailed;
+        return out;
     }
 
     pub fn readI64Prefix(self: Reader, col: i32, out: []i64) i64 {
@@ -375,6 +406,65 @@ pub fn writeStructFixture(path: [:0]const u8) !void {
     if (c.glacier_carquet_write_struct_fixture(path.ptr) != 0) return error.ParquetWriteFailed;
 }
 
+pub fn writeColumns(path: [:0]const u8, cols: []const WriteCol) !void {
+    try ensureInit();
+    if (cols.len == 0) return error.ParquetWriteFailed;
+    if (c.glacier_carquet_write_columns(path.ptr, cols.ptr, @intCast(cols.len)) != 0)
+        return error.ParquetWriteFailed;
+}
+
+pub fn writeBatch(allocator: std.mem.Allocator, path: [:0]const u8, input: batch_mod.Batch) !void {
+    if (input.len == 0 or input.columns.len == 0) return error.ParquetWriteFailed;
+    const cols = try allocator.alloc(WriteCol, input.columns.len);
+    for (input.columns, 0..) |col, i| {
+        const name = try allocator.dupeZ(u8, col.name);
+        var physical: i32 = undefined;
+        var logical: i32 = 0;
+        var values: ?*const anyopaque = null;
+        var utf8_offsets: ?[*]const u32 = null;
+        var utf8_bytes: ?[*]const u8 = null;
+        switch (col.data_type) {
+            .boolean => {
+                physical = 0;
+                values = if (col.bools.len > 0) col.bools.ptr else null;
+            },
+            .int32 => {
+                physical = 1;
+                values = if (col.i32s.len > 0) col.i32s.ptr else null;
+            },
+            .int64, .timestamp, .timestamptz => {
+                physical = 2;
+                values = if (col.i64s.len > 0) col.i64s.ptr else null;
+            },
+            .float32 => {
+                physical = 4;
+                values = if (col.f32s.len > 0) col.f32s.ptr else null;
+            },
+            .float64 => {
+                physical = 5;
+                values = if (col.f64s.len > 0) col.f64s.ptr else null;
+            },
+            .utf8 => {
+                physical = 6;
+                logical = 1;
+                utf8_offsets = col.utf8.offsets.ptr;
+                utf8_bytes = if (col.utf8.bytes.len > 0) col.utf8.bytes.ptr else null;
+            },
+            else => return error.UnsupportedType,
+        }
+        cols[i] = .{
+            .name = name.ptr,
+            .physical = physical,
+            .logical = logical,
+            .values = values,
+            .utf8_offsets = utf8_offsets,
+            .utf8_bytes = utf8_bytes,
+            .n_rows = @intCast(input.len),
+        };
+    }
+    try writeColumns(path, cols);
+}
+
 pub const ByteArray = extern struct {
     data: [*]u8,
     length: i32,
@@ -481,6 +571,60 @@ test "write and read snappy i64 parquet" {
     var sample: [5]i64 = undefined;
     try std.testing.expectEqual(@as(i64, 5), reader.readI64Prefix(0, &sample));
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4, 5 }, &sample);
+}
+
+fn expectFooterMinMax(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    min_id: i64,
+    max_id: i64,
+    min_cat: []const u8,
+    max_cat: []const u8,
+) !void {
+    var reader = try openPath(gpa, io, path);
+    defer reader.close();
+    try std.testing.expectEqual(@as(i32, 1), reader.numRowGroups());
+    const id = try reader.columnStats(0, 0);
+    try std.testing.expectEqual(@as(i32, 1), id.has_min_max);
+    try std.testing.expectEqual(@as(i32, 1), id.has_null_count);
+    try std.testing.expectEqual(@as(i64, 0), id.null_count);
+    try std.testing.expectEqual(@as(i64, 2), id.num_values);
+    try std.testing.expectEqual(@as(i32, 8), id.min_len);
+    try std.testing.expectEqual(@as(i32, 8), id.max_len);
+    try std.testing.expectEqual(min_id, std.mem.readInt(i64, id.min_bytes[0..8], .little));
+    try std.testing.expectEqual(max_id, std.mem.readInt(i64, id.max_bytes[0..8], .little));
+    const cat = try reader.columnStats(0, 1);
+    try std.testing.expectEqual(@as(i32, 1), cat.has_min_max);
+    try std.testing.expectEqual(@as(i64, 2), cat.num_values);
+    try std.testing.expectEqualSlices(u8, min_cat, cat.min_bytes[0..@intCast(cat.min_len)]);
+    try std.testing.expectEqualSlices(u8, max_cat, cat.max_bytes[0..@intCast(cat.max_len)]);
+}
+
+test "written parquet footer has column min max" {
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const ids = [_]i64{ 1, 2 };
+    const cats = "fruitveg";
+    const offs = [_]u32{ 0, 5, 8 };
+    const cols = [_]WriteCol{
+        .{ .name = "id", .physical = 2, .logical = 0, .values = &ids, .n_rows = 2 },
+        .{
+            .name = "category",
+            .physical = 6,
+            .logical = 1,
+            .utf8_offsets = &offs,
+            .utf8_bytes = cats,
+            .n_rows = 2,
+        },
+    };
+    try writeColumns("/tmp/glacier-footer-stats.parquet", &cols);
+    try expectFooterMinMax(gpa, io, "/tmp/glacier-footer-stats.parquet", 1, 2, "fruit", "veg");
 }
 
 test "open parquet from FileSource memory" {

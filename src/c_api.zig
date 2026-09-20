@@ -81,6 +81,46 @@ pub export fn glacier_open(path: ?[*:0]const u8, err_out: ?*?[*:0]u8) callconv(.
     return db;
 }
 
+fn cSlice(p: ?[*:0]const u8) []const u8 {
+    return if (p) |z| std.mem.span(z) else "";
+}
+
+fn cOptSlice(p: ?[*:0]const u8) ?[]const u8 {
+    const s = cSlice(p);
+    return if (s.len == 0) null else s;
+}
+
+pub export fn glacier_open_catalog(
+    uri: ?[*:0]const u8,
+    warehouse: ?[*:0]const u8,
+    token: ?[*:0]const u8,
+    err_out: ?*?[*:0]u8,
+) callconv(.c) ?*Database {
+    const endpoint = cOptSlice(uri) orelse {
+        setErr(err_out, "catalog uri is required");
+        return null;
+    };
+    const gpa = heap();
+    const db = gpa.create(Database) catch {
+        setErr(err_out, "out of memory");
+        return null;
+    };
+    db.gpa = gpa;
+    db.threaded = threadedInit(gpa);
+    db.session = session_mod.Session.openRest(gpa, db.threaded.io(), .{
+        .endpoint = endpoint,
+        .warehouse = cSlice(warehouse),
+        .token = cOptSlice(token),
+    }) catch |e| {
+        db.threaded.deinit();
+        gpa.destroy(db);
+        const ge = session_mod.lastOpenError() orelse errmod.GlacierError.fromZig(e);
+        setErr(err_out, ge.message);
+        return null;
+    };
+    return db;
+}
+
 pub export fn glacier_open_buffer(buf: ?*const anyopaque, n: usize, err_out: ?*?[*:0]u8) callconv(.c) ?*Database {
     const ptr = buf orelse {
         setErr(err_out, "buffer is required");
@@ -353,4 +393,57 @@ test "C ABI SELECT 1 on empty session and open_buffer" {
     defer q.deinit();
     try std.testing.expectEqual(@as(i64, 1), q.array.length);
     try std.testing.expectEqual(@as(i64, 10), q.i64s(0)[0]);
+}
+
+test "C ABI glacier_open REST URI and glacier_open_catalog" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const iceberg = @import("table/iceberg.zig");
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try iceberg.writePruneFixture(gpa, io, "/tmp/glacier_abi_rest");
+    var srv = try session_mod.remote_test.spawnRestCatalog(io, "/tmp/glacier_abi_rest", "", "none", "");
+    defer srv.child.kill(io);
+    const uri_owned = try std.fmt.allocPrintSentinel(gpa, "http://127.0.0.1:{d}", .{srv.port}, 0);
+    defer gpa.free(uri_owned);
+
+    {
+        var err: ?[*:0]u8 = null;
+        const db = glacier_open_catalog(null, null, null, &err);
+        try std.testing.expect(db == null);
+        const msg = err orelse return error.MissingOpenError;
+        defer glacier_free(msg);
+        try std.testing.expectEqualStrings("catalog uri is required", std.mem.span(msg));
+    }
+
+    {
+        var err: ?[*:0]u8 = null;
+        const db = glacier_open(uri_owned, &err) orelse return error.OpenFailed;
+        defer glacier_close(db);
+        var q = try runSql(db, "SHOW CATALOGS");
+        defer q.deinit();
+        try std.testing.expectEqual(@as(i64, 1), q.array.length);
+        try std.testing.expectEqualStrings("rest", q.utf8At(0, 0));
+        try std.testing.expectEqualStrings("iceberg_rest", q.utf8At(1, 0));
+    }
+
+    {
+        var err: ?[*:0]u8 = null;
+        const db = glacier_open_catalog(uri_owned, "", null, &err) orelse return error.OpenCatalogFailed;
+        defer glacier_close(db);
+        {
+            var q = try runSql(db, "SELECT COUNT(*) FROM rest.default.prune");
+            defer q.deinit();
+            try std.testing.expectEqual(@as(i64, 10), q.i64s(0)[0]);
+        }
+        {
+            var q = try runSql(db, "SELECT name FROM glacier.catalogs");
+            defer q.deinit();
+            try std.testing.expectEqualStrings("rest", q.utf8At(0, 0));
+        }
+    }
 }

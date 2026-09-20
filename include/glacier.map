@@ -2,6 +2,7 @@ GLACIER_1 {
     global:
         glacier_open;
         glacier_open_buffer;
+        glacier_open_catalog;
         glacier_malloc;
         glacier_malloc_free;
         glacier_close;

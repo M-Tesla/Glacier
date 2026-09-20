@@ -22,6 +22,21 @@ class TestQuery(unittest.TestCase):
         self.assertEqual(glacier.version(), "0.2.1")
         self.assertEqual(glacier.api_version(), 1)
 
+    def test_catalog_session(self):
+        if not SALES.is_file():
+            self.skipTest("run `$ZIG build fixtures`")
+        with glacier.connect(SALES) as con:
+            self.assertEqual(
+                con.execute("SELECT name, type FROM glacier.catalogs").fetchall(),
+                [("files", "files")],
+            )
+            tables = con.execute("SELECT name, catalog FROM glacier.tables").fetchall()
+            self.assertEqual(len(tables), 1)
+            self.assertEqual(tables[0][1], "files")
+        with self.assertRaises(glacier.GlacierError) as ctx:
+            glacier.connect_catalog("")
+        self.assertIn("catalog uri", str(ctx.exception).lower())
+
     def test_query_parquet(self):
         if not SALES.is_file():
             self.skipTest("run `$ZIG build fixtures`")

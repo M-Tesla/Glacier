@@ -5,6 +5,8 @@
 //! manifest-list Avro, then each manifest Avro.
 
 const std = @import("std");
+const aws = @import("../kernel/aws.zig");
+const cache = @import("../vfs/cache.zig");
 const vfs = @import("../vfs/source.zig");
 const FileSource = vfs.FileSource;
 const Transport = vfs.Transport;
@@ -57,6 +59,11 @@ pub const Snapshot = struct {
     schema_id: ?i32 = null,
 };
 
+pub const AsOf = union(enum) {
+    snapshot: i64,
+    timestamp_ms: i64,
+};
+
 pub const BoundValue = union(enum) {
     int: i64,
     float: f64,
@@ -69,7 +76,19 @@ pub const ColBound = struct {
     upper: BoundValue,
 };
 
-pub const FileFormat = enum { parquet, avro, glacier };
+pub const FileFormat = enum {
+    parquet,
+    avro,
+    glacier,
+
+    pub fn label(self: FileFormat) []const u8 {
+        return switch (self) {
+            .parquet => "parquet",
+            .avro => "avro",
+            .glacier => "glacier",
+        };
+    }
+};
 
 pub const PartitionValue = struct {
     name: []const u8,
@@ -152,12 +171,51 @@ pub const TableMetadata = struct {
         if (self.partition_specs.len == 1) return &self.partition_specs[0];
         return null;
     }
+
+    pub fn snapshotById(self: TableMetadata, id: i64) ?*const Snapshot {
+        for (self.snapshots) |*s| {
+            if (s.snapshot_id == id) return s;
+        }
+        return null;
+    }
+
+    /// Latest snapshot with `timestamp-ms <= ts`.
+    pub fn snapshotAsOfTimestamp(self: TableMetadata, ts: i64) ?*const Snapshot {
+        var best: ?*const Snapshot = null;
+        for (self.snapshots) |*s| {
+            if (s.timestamp_ms > ts) continue;
+            if (best) |b| {
+                if (s.timestamp_ms > b.timestamp_ms) best = s;
+            } else {
+                best = s;
+            }
+        }
+        return best;
+    }
+
+    pub fn snapshotFor(self: TableMetadata, as_of: ?AsOf) !*const Snapshot {
+        if (as_of) |spec| {
+            const snap = switch (spec) {
+                .snapshot => |id| self.snapshotById(id),
+                .timestamp_ms => |ts| self.snapshotAsOfTimestamp(ts),
+            };
+            return snap orelse error.SnapshotNotFound;
+        }
+        return self.currentSnapshot() orelse error.SnapshotNotFound;
+    }
+
+    pub fn schemaForSnapshot(self: TableMetadata, snap: *const Snapshot) ?*const Schema {
+        if (snap.schema_id) |sid| return self.schemaById(sid);
+        return self.currentSchema();
+    }
 };
 
 pub const Table = struct {
     dir: []const u8,
     metadata: TableMetadata,
     files: []DataFile,
+    /// Position (content 1) and equality (content 2) delete files in the snapshot.
+    delete_files: []DataFile = &.{},
 };
 
 pub fn parseMetadata(allocator: std.mem.Allocator, json_text: []const u8) !TableMetadata {
@@ -171,7 +229,14 @@ pub fn parseMetadata(allocator: std.mem.Allocator, json_text: []const u8) !Table
     const format_version: i32 = @intCast(try getInt(root, "format-version"));
     const table_uuid = try allocator.dupe(u8, try getString(root, "table-uuid"));
     const location = try allocator.dupe(u8, try getString(root, "location"));
-    const current_snapshot_id: ?i64 = if (root.get("current-snapshot-id")) |v| try asInt(v) else null;
+    const current_snapshot_id: ?i64 = blk: {
+        const v = root.get("current-snapshot-id") orelse break :blk null;
+        const n = switch (v) {
+            .null => break :blk null,
+            else => try asInt(v),
+        };
+        break :blk if (n < 0) null else n;
+    };
     const current_schema_id: i32 = @intCast(if (root.get("current-schema-id")) |v| try asInt(v) else 0);
     const default_spec_id: i32 = @intCast(if (root.get("default-spec-id")) |v| try asInt(v) else 0);
 
@@ -213,11 +278,15 @@ pub fn parseMetadata(allocator: std.mem.Allocator, json_text: []const u8) !Table
 }
 
 pub fn openTable(allocator: std.mem.Allocator, t: Transport, table_dir: []const u8) !Table {
+    return openTableAsOf(allocator, t, table_dir, null);
+}
+
+pub fn openTableAsOf(allocator: std.mem.Allocator, t: Transport, table_dir: []const u8, as_of: ?AsOf) !Table {
     const dir = try allocator.dupe(u8, table_dir);
     const meta_path = try metadataJsonPath(allocator, t, dir);
     const meta_json = try readLocation(allocator, t, meta_path);
     const metadata = try parseMetadata(allocator, meta_json);
-    return finishOpen(allocator, t, dir, metadata);
+    return finishOpen(allocator, t, dir, metadata, as_of);
 }
 
 /// REST Catalog `metadata-location` (a `.metadata.json` URI or path).
@@ -227,7 +296,7 @@ pub fn openTableAtMetadata(allocator: std.mem.Allocator, t: Transport, metadata_
     const metadata = try parseMetadata(allocator, meta_json);
     const base = tableDirFromMetaPath(loc);
     const dir = try allocator.dupe(u8, base);
-    return finishOpen(allocator, t, dir, metadata);
+    return finishOpen(allocator, t, dir, metadata, null);
 }
 
 /// Already-parsed metadata (embedded in a REST `loadTable` body).
@@ -237,14 +306,24 @@ pub fn openFromMetadata(
     metadata: TableMetadata,
     file_base: []const u8,
 ) !Table {
-    const dir = try allocator.dupe(u8, stripFileUrl(file_base));
-    return finishOpen(allocator, t, dir, metadata);
+    return openFromMetadataAsOf(allocator, t, metadata, file_base, null);
 }
 
-fn finishOpen(allocator: std.mem.Allocator, t: Transport, dir: []const u8, metadata: TableMetadata) !Table {
+pub fn openFromMetadataAsOf(
+    allocator: std.mem.Allocator,
+    t: Transport,
+    metadata: TableMetadata,
+    file_base: []const u8,
+    as_of: ?AsOf,
+) !Table {
+    const dir = try allocator.dupe(u8, stripFileUrl(file_base));
+    return finishOpen(allocator, t, dir, metadata, as_of);
+}
+
+fn finishOpen(allocator: std.mem.Allocator, t: Transport, dir: []const u8, metadata: TableMetadata, as_of: ?AsOf) !Table {
     try checkReadSupport(metadata);
-    const files = try loadSnapshotFiles(allocator, t, dir, metadata);
-    return .{ .dir = dir, .metadata = metadata, .files = files };
+    const loaded = try loadSnapshotFiles(allocator, t, dir, metadata, as_of);
+    return .{ .dir = dir, .metadata = metadata, .files = loaded.data, .delete_files = loaded.deletes };
 }
 
 pub fn stripFileUrl(path: []const u8) []const u8 {
@@ -409,41 +488,56 @@ fn dayFromEpoch(v: i64) i64 {
     return v;
 }
 
+const LoadedSnapshot = struct {
+    data: []DataFile,
+    deletes: []DataFile,
+};
+
 fn loadSnapshotFiles(
     allocator: std.mem.Allocator,
     t: Transport,
     table_dir: []const u8,
     metadata: TableMetadata,
-) ![]DataFile {
-    const snap = metadata.currentSnapshot() orelse return error.SnapshotNotFound;
-    const list_path = resolveListedPath(allocator, table_dir, snap.manifest_list) catch return error.ManifestsNeedAvro;
+    as_of: ?AsOf,
+) !LoadedSnapshot {
+    if (as_of == null and metadata.currentSnapshot() == null) return .{ .data = &.{}, .deletes = &.{} };
+    const snap = try metadata.snapshotFor(as_of);
+    const list_path = resolveListedPath(allocator, table_dir, metadata.location, snap.manifest_list) catch return error.ManifestsNeedAvro;
     const list_buf = readLocation(allocator, t, list_path) catch return error.ManifestsNeedAvro;
     const manifest_paths = avro.collectStringField(allocator, list_buf, "manifest_path") catch return error.ManifestsNeedAvro;
 
     var data: std.ArrayList(DataFile) = .empty;
+    var deletes: std.ArrayList(DataFile) = .empty;
     var pos_paths: std.ArrayList([]const u8) = .empty;
     var eq_paths: std.ArrayList([]const u8) = .empty;
-    const schema_fields = if (metadata.snapshotSchema()) |s| s.fields else if (metadata.currentSchema()) |s| s.fields else &.{};
+    const schema_fields = if (metadata.schemaForSnapshot(snap)) |s| s.fields else if (metadata.currentSchema()) |s| s.fields else &.{};
     const spec = metadata.currentPartitionSpec();
     for (manifest_paths) |rel| {
-        const man_path = resolveListedPath(allocator, table_dir, rel) catch continue;
+        const man_path = resolveListedPath(allocator, table_dir, metadata.location, rel) catch continue;
         const man_buf = readLocation(allocator, t, man_path) catch continue;
         const entries = avro.readIcebergEntries(allocator, man_buf) catch continue;
         for (entries) |e| {
             if (e.status == 2) continue;
-            const path = try resolveListedPath(allocator, table_dir, e.path);
-            if (e.content == 1) {
-                try pos_paths.append(allocator, path);
-                continue;
-            }
-            if (e.content == 2) {
-                try eq_paths.append(allocator, path);
+            const path = try resolveListedPath(allocator, table_dir, metadata.location, e.path);
+            if (e.content == 1 or e.content == 2) {
+                try deletes.append(allocator, .{
+                    .path = path,
+                    .format = .parquet,
+                    .record_count = e.record_count,
+                    .content = e.content,
+                });
+                if (e.content == 1) {
+                    try pos_paths.append(allocator, path);
+                } else {
+                    try eq_paths.append(allocator, path);
+                }
                 continue;
             }
             if (e.content != 0) return error.UnsupportedDeletes;
             try data.append(allocator, try dataFileFromEntry(allocator, path, schema_fields, spec, e));
         }
     }
+    if (manifest_paths.len == 0) return .{ .data = &.{}, .deletes = deletes.items };
     if (data.items.len == 0) return error.ManifestsNeedAvro;
 
     const eq_deletes = try loadEqDeletes(allocator, t, eq_paths.items);
@@ -459,7 +553,7 @@ fn loadSnapshotFiles(
             }
         }
     }
-    return data.items;
+    return .{ .data = data.items, .deletes = deletes.items };
 }
 
 const PosHit = struct { path: []const u8, pos: u64 };
@@ -525,6 +619,12 @@ fn loadBa(ptr: [*]const u8, row: usize) parquet.ByteArray {
     return v;
 }
 
+fn loadI32(ptr: [*]const u8, row: usize) i32 {
+    var v: i32 = undefined;
+    @memcpy(std.mem.asBytes(&v), ptr[row * 4 ..][0..4]);
+    return v;
+}
+
 fn loadI64(ptr: [*]const u8, row: usize) i64 {
     var v: i64 = undefined;
     @memcpy(std.mem.asBytes(&v), ptr[row * 8 ..][0..8]);
@@ -581,6 +681,13 @@ fn loadOneEqDelete(allocator: std.mem.Allocator, t: Transport, path: []const u8)
                     @memcpy(more[0..col.i64s.len], col.i64s);
                     var r: usize = 0;
                     while (r < nrows) : (r += 1) more[col.i64s.len + r] = loadI64(vals.ptr, r);
+                    col.i64s = more;
+                },
+                .int32 => {
+                    const more = try allocator.alloc(i64, col.i64s.len + nrows);
+                    @memcpy(more[0..col.i64s.len], col.i64s);
+                    var r: usize = 0;
+                    while (r < nrows) : (r += 1) more[col.i64s.len + r] = loadI32(vals.ptr, r);
                     col.i64s = more;
                 },
                 .byte_array => {
@@ -718,8 +825,753 @@ fn decodeBound(allocator: std.mem.Allocator, type_name: []const u8, bytes: []con
     return error.UnsupportedNested;
 }
 
-fn resolveListedPath(allocator: std.mem.Allocator, table_dir: []const u8, listed: []const u8) ![]u8 {
-    return vfs.joinLocation(allocator, table_dir, listed);
+/// If the table was copied (Hadoop warehouse moved, S3 prefix rewritten),
+/// absolute paths in manifests still start with `metadata.location`. Swap that
+/// prefix for the directory we actually opened.
+pub fn relocatePath(allocator: std.mem.Allocator, table_dir: []const u8, location: []const u8, listed: []const u8) ![]u8 {
+    const loc = std.mem.trimEnd(u8, stripFileUrl(location), "/");
+    const dir = std.mem.trimEnd(u8, stripFileUrl(table_dir), "/");
+    const path = stripFileUrl(listed);
+    if (loc.len > 0 and dir.len > 0 and !std.mem.eql(u8, loc, dir) and std.mem.startsWith(u8, path, loc)) {
+        const rest = path[loc.len..];
+        if (rest.len == 0) return allocator.dupe(u8, dir);
+        if (rest[0] == '/' or rest[0] == '\\') {
+            return vfs.joinLocation(allocator, dir, rest[1..]);
+        }
+    }
+    return vfs.joinLocation(allocator, dir, listed);
+}
+
+fn resolveListedPath(
+    allocator: std.mem.Allocator,
+    table_dir: []const u8,
+    location: []const u8,
+    listed: []const u8,
+) ![]u8 {
+    return relocatePath(allocator, table_dir, location, listed);
+}
+
+/// Hadoop / REST table root: `metadata/version-hint.text` or `v1.metadata.json`.
+pub fn isTableDir(allocator: std.mem.Allocator, t: Transport, table_dir: []const u8) bool {
+    const hint = vfs.joinLocation(allocator, table_dir, "metadata/version-hint.text") catch return false;
+    if (locationReadable(t, hint)) return true;
+    const v1 = vfs.joinLocation(allocator, table_dir, "metadata/v1.metadata.json") catch return false;
+    return locationReadable(t, v1);
+}
+
+const batch_mod = @import("../execution/batch.zig");
+
+fn jsonEscapeAppend(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            else => try buf.append(allocator, c),
+        }
+    }
+    try buf.append(allocator, '"');
+}
+
+fn formatUuid(buf: *[36]u8, hi: u64, lo: u64) []const u8 {
+    const hex = "0123456789abcdef";
+    const bits: u128 = (@as(u128, hi) << 64) | lo;
+    var i: usize = 0;
+    var nibble: usize = 0;
+    while (i < 36) : (i += 1) {
+        if (i == 8 or i == 13 or i == 18 or i == 23) {
+            buf[i] = '-';
+            continue;
+        }
+        const shift: u7 = @intCast((31 - nibble) * 4);
+        buf[i] = hex[@intCast((bits >> shift) & 0xf)];
+        nibble += 1;
+    }
+    return buf;
+}
+
+fn nowMs(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .awake).toMilliseconds();
+}
+
+fn listedRel(table_dir: []const u8, path: []const u8) []const u8 {
+    const prefix = std.mem.trimEnd(u8, table_dir, "/");
+    if (path.len > prefix.len and std.mem.startsWith(u8, path, prefix) and
+        (path[prefix.len] == '/' or path[prefix.len] == '\\'))
+    {
+        return path[prefix.len + 1 ..];
+    }
+    return path;
+}
+
+fn firstLongField(fields: []const SchemaField) ?SchemaField {
+    for (fields) |f| {
+        if (std.ascii.eqlIgnoreCase(f.type_name, "long") or std.ascii.eqlIgnoreCase(f.type_name, "int"))
+            return f;
+    }
+    return if (fields.len > 0) fields[0] else null;
+}
+
+fn boundI64(file: DataFile, col_name: []const u8, is_lower: bool) i64 {
+    for (file.bounds) |b| {
+        if (!std.ascii.eqlIgnoreCase(b.column, col_name)) continue;
+        const v = if (is_lower) b.lower else b.upper;
+        return switch (v) {
+            .int => |n| n,
+            else => 0,
+        };
+    }
+    return 0;
+}
+
+fn batchBoundI64(input: batch_mod.Batch, col_name: []const u8) struct { lo: i64, hi: i64 } {
+    const idx = input.columnIndex(col_name) orelse return .{ .lo = 0, .hi = 0 };
+    const col = input.columns[idx];
+    if (col.data_type != .int64 and col.data_type != .int32 and !col.data_type.storesI64())
+        return .{ .lo = 0, .hi = 0 };
+    var lo: i64 = std.math.maxInt(i64);
+    var hi: i64 = std.math.minInt(i64);
+    var any = false;
+    var row: usize = 0;
+    while (row < input.len) : (row += 1) {
+        if (col.isNull(row)) continue;
+        const v: i64 = if (col.data_type == .int32) col.i32s[row] else col.i64s[row];
+        if (!any or v < lo) lo = v;
+        if (!any or v > hi) hi = v;
+        any = true;
+    }
+    if (!any) return .{ .lo = 0, .hi = 0 };
+    return .{ .lo = lo, .hi = hi };
+}
+
+fn nextHintVersion(allocator: std.mem.Allocator, t: Transport, table_dir: []const u8) !i32 {
+    const hint_path = vfs.joinLocation(allocator, table_dir, "metadata/version-hint.text") catch return 1;
+    const text = readLocation(allocator, t, hint_path) catch return 1;
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const n = std.fmt.parseInt(i32, trimmed, 10) catch return 1;
+    return n + 1;
+}
+
+pub fn specFromNames(
+    allocator: std.mem.Allocator,
+    fields: []const SchemaField,
+    names: []const []const u8,
+) ![]PartitionField {
+    if (names.len == 0) return &.{};
+    for (names) |n| {
+        _ = fieldByName(fields, n) orelse return error.ColumnNotFound;
+    }
+    const out = try allocator.alloc(PartitionField, names.len);
+    for (names, 0..) |n, i| {
+        const sf = fieldByName(fields, n).?;
+        out[i] = .{
+            .source_id = sf.id,
+            .field_id = @intCast(1000 + i),
+            .name = sf.name,
+            .transform = "identity",
+        };
+    }
+    return out;
+}
+
+fn fieldByName(fields: []const SchemaField, name: []const u8) ?SchemaField {
+    for (fields) |f| {
+        if (std.ascii.eqlIgnoreCase(f.name, name)) return f;
+    }
+    return null;
+}
+
+fn writeMetadataFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    uuid: []const u8,
+    location: []const u8,
+    last_updated_ms: i64,
+    last_column_id: i32,
+    current_snapshot_id: ?i64,
+    last_sequence: i64,
+    fields: []const SchemaField,
+    snapshots: []const Snapshot,
+    partition_fields: []const PartitionField,
+) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\n  \"format-version\": 2,\n  \"table-uuid\": ");
+    try jsonEscapeAppend(&buf, allocator, uuid);
+    try buf.appendSlice(allocator, ",\n  \"location\": ");
+    try jsonEscapeAppend(&buf, allocator, location);
+    try buf.appendSlice(allocator, ",\n  \"last-updated-ms\": ");
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{last_updated_ms}));
+    try buf.appendSlice(allocator, ",\n  \"last-column-id\": ");
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{last_column_id}));
+    if (current_snapshot_id) |sid| {
+        try buf.appendSlice(allocator, ",\n  \"current-snapshot-id\": ");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{sid}));
+    }
+    try buf.appendSlice(allocator, ",\n  \"last-sequence-number\": ");
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{last_sequence}));
+    try buf.appendSlice(allocator, ",\n  \"current-schema-id\": 0,\n  \"default-spec-id\": 0,\n  \"partition-specs\": [{ \"spec-id\": 0, \"fields\": [");
+    for (partition_fields, 0..) |pf, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, "{\"source-id\": ");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{pf.source_id}));
+        try buf.appendSlice(allocator, ", \"field-id\": ");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{pf.field_id}));
+        try buf.appendSlice(allocator, ", \"name\": ");
+        try jsonEscapeAppend(&buf, allocator, pf.name);
+        try buf.appendSlice(allocator, ", \"transform\": ");
+        try jsonEscapeAppend(&buf, allocator, pf.transform);
+        try buf.append(allocator, '}');
+    }
+    try buf.appendSlice(allocator, "] }]");
+    if (partition_fields.len > 0) {
+        var last_pid: i32 = 999;
+        for (partition_fields) |pf| {
+            if (pf.field_id > last_pid) last_pid = pf.field_id;
+        }
+        try buf.appendSlice(allocator, ",\n  \"last-partition-id\": ");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{last_pid}));
+    }
+    try buf.appendSlice(allocator, ",\n  \"schemas\": [{\n    \"schema-id\": 0,\n    \"type\": \"struct\",\n    \"fields\": [\n");
+    for (fields, 0..) |f, i| {
+        if (i > 0) try buf.appendSlice(allocator, ",\n");
+        try buf.appendSlice(allocator, "      {\"id\": ");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{f.id}));
+        try buf.appendSlice(allocator, ", \"name\": ");
+        try jsonEscapeAppend(&buf, allocator, f.name);
+        try buf.appendSlice(allocator, if (f.required) ", \"required\": true, \"type\": " else ", \"required\": false, \"type\": ");
+        try jsonEscapeAppend(&buf, allocator, f.type_name);
+        try buf.append(allocator, '}');
+    }
+    try buf.appendSlice(allocator, "\n    ]\n  }],\n  \"snapshots\": [");
+    for (snapshots, 0..) |s, i| {
+        if (i > 0) try buf.appendSlice(allocator, ",");
+        try buf.appendSlice(allocator, "\n    {\"snapshot-id\": ");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{s.snapshot_id}));
+        try buf.appendSlice(allocator, ", \"timestamp-ms\": ");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{s.timestamp_ms}));
+        try buf.appendSlice(allocator, ", \"sequence-number\": ");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{s.sequence_number}));
+        try buf.appendSlice(allocator, ", \"schema-id\": ");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{s.schema_id orelse 0}));
+        try buf.appendSlice(allocator, ", \"manifest-list\": ");
+        try jsonEscapeAppend(&buf, allocator, s.manifest_list);
+        try buf.append(allocator, '}');
+    }
+    try buf.appendSlice(allocator, "\n  ]\n}\n");
+    try writeText(io, path, buf.items);
+}
+
+pub fn createTable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    table_dir: []const u8,
+    fields: []const SchemaField,
+    partition_fields: []const PartitionField,
+) !void {
+    if (fields.len == 0) return error.InvalidSyntax;
+    try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ table_dir, "metadata" }));
+    try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ table_dir, "data" }));
+    var uuid_buf: [36]u8 = undefined;
+    const now: u64 = @intCast(@max(nowMs(io), 0));
+    const uuid = formatUuid(&uuid_buf, now, @intCast(table_dir.len));
+    var last_id: i32 = 0;
+    for (fields) |f| {
+        if (f.id > last_id) last_id = f.id;
+    }
+    const meta_path = try std.fs.path.join(allocator, &.{ table_dir, "metadata", "v1.metadata.json" });
+    try writeMetadataFile(
+        allocator,
+        io,
+        meta_path,
+        uuid,
+        table_dir,
+        nowMs(io),
+        last_id,
+        null,
+        0,
+        fields,
+        &.{},
+        partition_fields,
+    );
+    try writeText(io, try std.fs.path.join(allocator, &.{ table_dir, "metadata", "version-hint.text" }), "1\n");
+}
+
+pub fn unpublishTable(io: std.Io, table_dir: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    const meta = std.fmt.bufPrint(&buf, "{s}/metadata", .{table_dir}) catch return;
+    std.Io.Dir.cwd().deleteTree(io, meta) catch {};
+}
+
+pub const AppendResult = struct {
+    snapshot: Snapshot,
+    record_count: i64,
+    operation: []const u8 = "append",
+};
+
+const AddedFile = struct {
+    rel: []const u8,
+    count: i64,
+    lo: i64,
+    hi: i64,
+    content: i32,
+};
+
+fn isObjectStore(path: []const u8) bool {
+    return aws.isS3(path) or aws.isGs(path);
+}
+
+fn localObjectPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest: []const u8,
+    leaf: []const u8,
+) ![:0]u8 {
+    if (isObjectStore(dest)) {
+        const dir = try std.fmt.allocPrint(allocator, "{s}/write", .{cache.tempRoot()});
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+        return try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, leaf }, 0);
+    }
+    return try allocator.dupeZ(u8, dest);
+}
+
+fn publishIfRemote(
+    allocator: std.mem.Allocator,
+    t: Transport,
+    dest: []const u8,
+    local_z: [:0]const u8,
+) !void {
+    if (!isObjectStore(dest)) return;
+    const bytes = try readAll(allocator, t.io, local_z);
+    defer allocator.free(bytes);
+    try vfs.putLocation(t, dest, bytes);
+    std.Io.Dir.cwd().deleteFile(t.io, local_z) catch {};
+}
+
+fn hiveEscape(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    const hex = "0123456789ABCDEF";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (s) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.') {
+            try out.append(allocator, c);
+        } else {
+            try out.append(allocator, '%');
+            try out.append(allocator, hex[c >> 4]);
+            try out.append(allocator, hex[c & 0xf]);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn identityPathValue(allocator: std.mem.Allocator, col: batch_mod.Column, row: usize) ![]const u8 {
+    if (col.isNull(row)) return allocator.dupe(u8, "__HIVE_DEFAULT_PARTITION__");
+    return switch (col.data_type) {
+        .utf8 => hiveEscape(allocator, col.strAt(row)),
+        .boolean => allocator.dupe(u8, if (col.bools[row] != 0) "true" else "false"),
+        .int32 => std.fmt.allocPrint(allocator, "{d}", .{col.i32s[row]}),
+        .int64, .timestamp, .timestamptz => std.fmt.allocPrint(allocator, "{d}", .{col.i64s[row]}),
+        .float32 => std.fmt.allocPrint(allocator, "{d}", .{col.f32s[row]}),
+        .float64 => std.fmt.allocPrint(allocator, "{d}", .{col.f64s[row]}),
+        .decimal128 => std.fmt.allocPrint(allocator, "{d}", .{col.i128s[row]}),
+        .uuid => blk: {
+            const hex = std.fmt.bytesToHex(col.uuids[row], .lower);
+            break :blk allocator.dupe(u8, &hex);
+        },
+    };
+}
+
+fn hivePartitionKey(
+    allocator: std.mem.Allocator,
+    spec: PartitionSpec,
+    schema_fields: []const SchemaField,
+    input: batch_mod.Batch,
+    row: usize,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (spec.fields, 0..) |pf, i| {
+        const tf = try parseTransform(pf.transform);
+        if (tf != .identity) return error.UnsupportedPartitionSpec;
+        const src = fieldById(schema_fields, pf.source_id) orelse return error.ColumnNotFound;
+        const col_i = input.columnIndex(src.name) orelse return error.ColumnNotFound;
+        const val = try identityPathValue(allocator, input.columns[col_i], row);
+        if (i > 0) try buf.append(allocator, '/');
+        try buf.appendSlice(allocator, pf.name);
+        try buf.append(allocator, '=');
+        try buf.appendSlice(allocator, val);
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+fn writeParquetAt(
+    allocator: std.mem.Allocator,
+    t: Transport,
+    dest: []const u8,
+    leaf: []const u8,
+    input: batch_mod.Batch,
+) !void {
+    const local_z = try localObjectPath(allocator, t.io, dest, leaf);
+    if (!isObjectStore(dest)) {
+        if (std.fs.path.dirname(local_z)) |d| {
+            if (d.len > 0) try std.Io.Dir.cwd().createDirPath(t.io, d);
+        }
+    }
+    try parquet.writeBatch(allocator, local_z, input);
+    try publishIfRemote(allocator, t, dest, local_z);
+}
+
+const PartGroup = struct {
+    key: []const u8,
+    rows: std.ArrayList(usize),
+};
+
+fn groupByIdentity(
+    allocator: std.mem.Allocator,
+    spec: PartitionSpec,
+    schema_fields: []const SchemaField,
+    input: batch_mod.Batch,
+) ![]PartGroup {
+    var groups: std.ArrayList(PartGroup) = .empty;
+    var row: usize = 0;
+    while (row < input.len) : (row += 1) {
+        const key = try hivePartitionKey(allocator, spec, schema_fields, input, row);
+        var found = false;
+        for (groups.items) |*g| {
+            if (std.mem.eql(u8, g.key, key)) {
+                try g.rows.append(allocator, row);
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        var rows: std.ArrayList(usize) = .empty;
+        try rows.append(allocator, row);
+        try groups.append(allocator, .{ .key = key, .rows = rows });
+    }
+    return groups.toOwnedSlice(allocator);
+}
+
+/// Writes Parquet + Avro manifests under `table.dir`. Does not rewrite
+/// `metadata.json`; Hadoop does that in `appendBatch`, REST via `commitTable`.
+/// Local path, or stage in `GLACIER_TEMP` then PUT to `s3://` / `gs://`.
+pub fn appendFiles(
+    allocator: std.mem.Allocator,
+    t: Transport,
+    table: Table,
+    input: batch_mod.Batch,
+) !AppendResult {
+    return appendMix(allocator, t, table, .{ .columns = &.{}, .len = 0 }, input);
+}
+
+/// Equality-delete Parquet (`content` 2). Existing data and delete files stay in the snapshot.
+pub fn appendEqDeletes(
+    allocator: std.mem.Allocator,
+    t: Transport,
+    table: Table,
+    input: batch_mod.Batch,
+) !AppendResult {
+    return appendMix(allocator, t, table, input, .{ .columns = &.{}, .len = 0 });
+}
+
+/// One snapshot with optional equality deletes and/or new data files.
+pub fn appendMix(
+    allocator: std.mem.Allocator,
+    t: Transport,
+    table: Table,
+    deletes: batch_mod.Batch,
+    inserts: batch_mod.Batch,
+) !AppendResult {
+    if (deletes.len == 0 and inserts.len == 0) return error.InvalidSyntax;
+    const table_dir = stripFileUrl(table.dir);
+    if (std.mem.indexOf(u8, table_dir, "://") != null and !isObjectStore(table_dir))
+        return error.WriteUnsupported;
+    const schema = table.metadata.currentSchema() orelse return error.SchemaNotFound;
+    const fields = schema.fields;
+
+    if (!isObjectStore(table_dir)) {
+        try std.Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(allocator, &.{ table_dir, "metadata" }));
+        try std.Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(allocator, &.{ table_dir, "data" }));
+    }
+
+    var snap_id: i64 = nowMs(t.io);
+    if (snap_id <= 0) snap_id = 1;
+    if (table.metadata.snapshotById(snap_id) != null) snap_id += 1;
+    const seq: i64 = if (table.metadata.currentSnapshot()) |s| s.sequence_number + 1 else 1;
+    const uniq: usize = @intFromPtr(table.dir.ptr);
+    const bound_field = firstLongField(fields);
+    const bound_id: i32 = if (bound_field) |f| f.id else 1;
+    const bound_name: []const u8 = if (bound_field) |f| f.name else "";
+
+    var added: std.ArrayList(AddedFile) = .empty;
+    if (deletes.len > 0) {
+        const data_name = try std.fmt.allocPrint(allocator, "data/eq-{d}-{d}.parquet", .{ snap_id, seq });
+        const data_dest = try vfs.joinLocation(allocator, table_dir, data_name);
+        const data_leaf = try std.fmt.allocPrint(allocator, "eq-{d}-{d}-{x}.parquet", .{ snap_id, seq, uniq });
+        try writeParquetAt(allocator, t, data_dest, data_leaf, deletes);
+        try added.append(allocator, .{
+            .rel = data_name,
+            .count = @intCast(deletes.len),
+            .lo = 0,
+            .hi = 0,
+            .content = 2,
+        });
+    }
+    if (inserts.len > 0) {
+        const spec = table.metadata.currentPartitionSpec();
+        if (spec == null or spec.?.fields.len == 0) {
+            const data_name = try std.fmt.allocPrint(allocator, "data/{d}-{d}.parquet", .{ snap_id, seq });
+            const data_dest = try vfs.joinLocation(allocator, table_dir, data_name);
+            const data_leaf = try std.fmt.allocPrint(allocator, "{d}-{d}-{x}.parquet", .{ snap_id, seq, uniq });
+            try writeParquetAt(allocator, t, data_dest, data_leaf, inserts);
+            const bounds = batchBoundI64(inserts, bound_name);
+            try added.append(allocator, .{
+                .rel = data_name,
+                .count = @intCast(inserts.len),
+                .lo = bounds.lo,
+                .hi = bounds.hi,
+                .content = 0,
+            });
+        } else {
+            const groups = try groupByIdentity(allocator, spec.?.*, fields, inserts);
+            for (groups, 0..) |g, gi| {
+                const part_batch = try inserts.gather(allocator, g.rows.items);
+                const data_name = try std.fmt.allocPrint(allocator, "data/{s}/{d}-{d}.parquet", .{ g.key, snap_id, seq });
+                const data_dest = try vfs.joinLocation(allocator, table_dir, data_name);
+                const data_leaf = try std.fmt.allocPrint(allocator, "{d}-{d}-{d}-{x}.parquet", .{ snap_id, seq, gi, uniq });
+                try writeParquetAt(allocator, t, data_dest, data_leaf, part_batch);
+                const bounds = batchBoundI64(part_batch, bound_name);
+                try added.append(allocator, .{
+                    .rel = data_name,
+                    .count = @intCast(part_batch.len),
+                    .lo = bounds.lo,
+                    .hi = bounds.hi,
+                    .content = 0,
+                });
+            }
+        }
+    }
+    const op: []const u8 = if (deletes.len > 0 and inserts.len > 0) "overwrite" else if (deletes.len > 0) "delete" else "append";
+    const rec: i64 = if (inserts.len > 0) @intCast(inserts.len) else @intCast(deletes.len);
+    return rewriteWithAdded(allocator, t, table, snap_id, seq, uniq, bound_id, bound_name, added.items, rec, op);
+}
+
+fn rewriteWithAdded(
+    allocator: std.mem.Allocator,
+    t: Transport,
+    table: Table,
+    snap_id: i64,
+    seq: i64,
+    uniq: usize,
+    bound_id: i32,
+    bound_name: []const u8,
+    added: []const AddedFile,
+    record_count: i64,
+    operation: []const u8,
+) !AppendResult {
+    const table_dir = stripFileUrl(table.dir);
+    const schema = table.metadata.currentSchema() orelse return error.SchemaNotFound;
+    const man_rel = try std.fmt.allocPrint(allocator, "metadata/manifest-{d}.avro", .{snap_id});
+    const list_rel = try std.fmt.allocPrint(allocator, "metadata/snap-{d}.avro", .{snap_id});
+    const man_dest = try vfs.joinLocation(allocator, table_dir, man_rel);
+    const list_dest = try vfs.joinLocation(allocator, table_dir, list_rel);
+    const man_z = try localObjectPath(
+        allocator,
+        t.io,
+        man_dest,
+        try std.fmt.allocPrint(allocator, "manifest-{d}-{x}.avro", .{ snap_id, uniq }),
+    );
+    const list_z = try localObjectPath(
+        allocator,
+        t.io,
+        list_dest,
+        try std.fmt.allocPrint(allocator, "snap-{d}-{x}.avro", .{ snap_id, uniq }),
+    );
+
+    const n_files = table.files.len + table.delete_files.len + added.len;
+    const paths = try allocator.alloc([*:0]const u8, n_files);
+    const counts = try allocator.alloc(i64, n_files);
+    const lower = try allocator.alloc(i64, n_files);
+    const upper = try allocator.alloc(i64, n_files);
+    const contents = try allocator.alloc(i32, n_files);
+    var at: usize = 0;
+    for (table.files) |f| {
+        paths[at] = try allocator.dupeZ(u8, listedRel(table_dir, f.path));
+        counts[at] = if (f.record_count > 0) f.record_count else 0;
+        lower[at] = boundI64(f, bound_name, true);
+        upper[at] = boundI64(f, bound_name, false);
+        contents[at] = 0;
+        at += 1;
+    }
+    for (table.delete_files) |f| {
+        paths[at] = try allocator.dupeZ(u8, listedRel(table_dir, f.path));
+        counts[at] = if (f.record_count > 0) f.record_count else 0;
+        lower[at] = 0;
+        upper[at] = 0;
+        contents[at] = f.content;
+        at += 1;
+    }
+    for (added) |f| {
+        paths[at] = try allocator.dupeZ(u8, f.rel);
+        counts[at] = f.count;
+        lower[at] = f.lo;
+        upper[at] = f.hi;
+        contents[at] = f.content;
+        at += 1;
+    }
+    try avro.writeDataManifest(man_z, paths, counts, lower, upper, bound_id, contents);
+    try avro.writeManifestList(list_z, try allocator.dupeZ(u8, man_rel));
+    try publishIfRemote(allocator, t, man_dest, man_z);
+    try publishIfRemote(allocator, t, list_dest, list_z);
+
+    return .{
+        .snapshot = .{
+            .snapshot_id = snap_id,
+            .timestamp_ms = nowMs(t.io),
+            .manifest_list = list_rel,
+            .sequence_number = seq,
+            .schema_id = schema.schema_id,
+        },
+        .record_count = record_count,
+        .operation = operation,
+    };
+}
+
+pub fn appendBatch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    table_dir: []const u8,
+    input: batch_mod.Batch,
+) !void {
+    if (input.len == 0) return;
+    var http: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http.deinit();
+    const t = Transport{ .allocator = allocator, .io = io, .http = &http };
+    const table = try openTable(allocator, t, table_dir);
+    const appended = try appendFiles(allocator, t, table, input);
+    try publishNewSnapshot(allocator, io, table, appended);
+}
+
+pub fn appendEqDeleteBatch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    table_dir: []const u8,
+    input: batch_mod.Batch,
+) !void {
+    if (input.len == 0) return;
+    var http: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http.deinit();
+    const t = Transport{ .allocator = allocator, .io = io, .http = &http };
+    const table = try openTable(allocator, t, table_dir);
+    const appended = try appendEqDeletes(allocator, t, table, input);
+    try publishNewSnapshot(allocator, io, table, appended);
+}
+
+pub fn appendMixBatch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    table_dir: []const u8,
+    deletes: batch_mod.Batch,
+    inserts: batch_mod.Batch,
+) !void {
+    if (deletes.len == 0 and inserts.len == 0) return;
+    var http: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http.deinit();
+    const t = Transport{ .allocator = allocator, .io = io, .http = &http };
+    const table = try openTable(allocator, t, table_dir);
+    const appended = try appendMix(allocator, t, table, deletes, inserts);
+    try publishNewSnapshot(allocator, io, table, appended);
+}
+
+pub fn addOptionalColumn(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    table_dir: []const u8,
+    name: []const u8,
+    type_name: []const u8,
+) !void {
+    var http: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http.deinit();
+    const t = Transport{ .allocator = allocator, .io = io, .http = &http };
+    const table = try openTable(allocator, t, table_dir);
+    const schema = table.metadata.currentSchema() orelse return error.SchemaNotFound;
+    for (schema.fields) |f| {
+        if (std.ascii.eqlIgnoreCase(f.name, name)) return error.InvalidSyntax;
+    }
+    var last_id: i32 = 0;
+    for (schema.fields) |f| {
+        if (f.id > last_id) last_id = f.id;
+    }
+    const fields = try allocator.alloc(SchemaField, schema.fields.len + 1);
+    @memcpy(fields[0..schema.fields.len], schema.fields);
+    fields[schema.fields.len] = .{
+        .id = last_id + 1,
+        .name = try allocator.dupe(u8, name),
+        .required = false,
+        .type_name = try allocator.dupe(u8, type_name),
+    };
+    const next_ver = try nextHintVersion(allocator, t, table.dir);
+    const last_seq: i64 = if (table.metadata.currentSnapshot()) |s| s.sequence_number else 0;
+    const meta_name = try std.fmt.allocPrint(allocator, "v{d}.metadata.json", .{next_ver});
+    const meta_path = try std.fs.path.join(allocator, &.{ table.dir, "metadata", meta_name });
+    const part = if (table.metadata.currentPartitionSpec()) |s| s.fields else &.{};
+    try writeMetadataFile(
+        allocator,
+        io,
+        meta_path,
+        table.metadata.table_uuid,
+        table.metadata.location,
+        nowMs(io),
+        last_id + 1,
+        table.metadata.current_snapshot_id,
+        last_seq,
+        fields,
+        table.metadata.snapshots,
+        part,
+    );
+    const hint = try std.fmt.allocPrint(allocator, "{d}\n", .{next_ver});
+    try writeText(io, try std.fs.path.join(allocator, &.{ table.dir, "metadata", "version-hint.text" }), hint);
+}
+
+fn publishNewSnapshot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    table: Table,
+    appended: AppendResult,
+) !void {
+    const schema = table.metadata.currentSchema() orelse return error.SchemaNotFound;
+    const fields = schema.fields;
+    var http: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http.deinit();
+    const t = Transport{ .allocator = allocator, .io = io, .http = &http };
+    const next_ver = try nextHintVersion(allocator, t, table.dir);
+    const snaps = try allocator.alloc(Snapshot, table.metadata.snapshots.len + 1);
+    @memcpy(snaps[0..table.metadata.snapshots.len], table.metadata.snapshots);
+    snaps[table.metadata.snapshots.len] = appended.snapshot;
+    var last_id: i32 = 0;
+    for (fields) |f| {
+        if (f.id > last_id) last_id = f.id;
+    }
+    const meta_name = try std.fmt.allocPrint(allocator, "v{d}.metadata.json", .{next_ver});
+    const meta_path = try std.fs.path.join(allocator, &.{ table.dir, "metadata", meta_name });
+    const part = if (table.metadata.currentPartitionSpec()) |s| s.fields else &.{};
+    try writeMetadataFile(
+        allocator,
+        io,
+        meta_path,
+        table.metadata.table_uuid,
+        table.metadata.location,
+        nowMs(io),
+        last_id,
+        appended.snapshot.snapshot_id,
+        appended.snapshot.sequence_number,
+        fields,
+        snaps,
+        part,
+    );
+    const hint = try std.fmt.allocPrint(allocator, "{d}\n", .{next_ver});
+    try writeText(io, try std.fs.path.join(allocator, &.{ table.dir, "metadata", "version-hint.text" }), hint);
 }
 
 pub fn parquetDataFile(path: []const u8) DataFile {
@@ -787,6 +1639,151 @@ pub fn writePruneFixture(allocator: std.mem.Allocator, io: std.Io, table_dir: []
     const lower = [_]i64{ 50, 75 };
     const upper = [_]i64{ 150, 300 };
     try avro.writeDataManifest(man_path, &data_paths, &counts, &lower, &upper, 2, &.{});
+}
+
+/// Two snapshots: id 1 is part-a only (5 rows), id 2 (current) is both files (10 rows).
+pub fn writeTravelFixture(allocator: std.mem.Allocator, io: std.Io, table_dir: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ table_dir, "metadata" }));
+    try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ table_dir, "data" }));
+
+    const path_a = try a.dupeZ(u8, try std.fs.path.join(a, &.{ table_dir, "data", "part-a.parquet" }));
+    const path_b = try a.dupeZ(u8, try std.fs.path.join(a, &.{ table_dir, "data", "part-b.parquet" }));
+
+    const ids_a = [_]i64{ 1, 2, 3, 4, 5 };
+    const prices_a = [_]i64{ 50, 80, 100, 120, 150 };
+    const cats_a = [_][*:0]const u8{ "fruit", "fruit", "veg", "veg", "fruit" };
+    const ids_b = [_]i64{ 6, 7, 8, 9, 10 };
+    const prices_b = [_]i64{ 200, 90, 110, 300, 75 };
+    const cats_b = [_][*:0]const u8{ "dairy", "fruit", "veg", "dairy", "fruit" };
+
+    try parquet.writeSalesRows(path_a, &ids_a, &prices_a, &cats_a);
+    try parquet.writeSalesRows(path_b, &ids_b, &prices_b, &cats_b);
+
+    try writeText(io, try std.fs.path.join(a, &.{ table_dir, "metadata", "version-hint.text" }), "1\n");
+    try writeText(io, try std.fs.path.join(a, &.{ table_dir, "metadata", "v1.metadata.json" }),
+        \\{
+        \\  "format-version": 2,
+        \\  "table-uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        \\  "location": "iceberg_travel",
+        \\  "last-updated-ms": 1700000001000,
+        \\  "last-column-id": 3,
+        \\  "current-snapshot-id": 2,
+        \\  "current-schema-id": 0,
+        \\  "default-spec-id": 0,
+        \\  "partition-specs": [{ "spec-id": 0, "fields": [] }],
+        \\  "schemas": [{
+        \\    "schema-id": 0,
+        \\    "fields": [
+        \\      {"id": 1, "name": "id", "required": true, "type": "long"},
+        \\      {"id": 2, "name": "price", "required": true, "type": "long"},
+        \\      {"id": 3, "name": "category", "required": true, "type": "string"}
+        \\    ]
+        \\  }],
+        \\  "snapshots": [
+        \\    {
+        \\      "snapshot-id": 1,
+        \\      "timestamp-ms": 1700000000000,
+        \\      "sequence-number": 1,
+        \\      "manifest-list": "metadata/snap-1.avro"
+        \\    },
+        \\    {
+        \\      "snapshot-id": 2,
+        \\      "timestamp-ms": 1700000001000,
+        \\      "sequence-number": 2,
+        \\      "manifest-list": "metadata/snap-2.avro"
+        \\    }
+        \\  ]
+        \\}
+        \\
+    );
+
+    var list1_z: [1024]u8 = undefined;
+    var man1_z: [1024]u8 = undefined;
+    var list2_z: [1024]u8 = undefined;
+    var man2_z: [1024]u8 = undefined;
+    const list1 = try std.fmt.bufPrintZ(&list1_z, "{s}/metadata/snap-1.avro", .{table_dir});
+    const man1 = try std.fmt.bufPrintZ(&man1_z, "{s}/metadata/manifest-1.avro", .{table_dir});
+    const list2 = try std.fmt.bufPrintZ(&list2_z, "{s}/metadata/snap-2.avro", .{table_dir});
+    const man2 = try std.fmt.bufPrintZ(&man2_z, "{s}/metadata/manifest-2.avro", .{table_dir});
+    try avro.writeManifestList(list1, "metadata/manifest-1.avro");
+    try avro.writeManifestList(list2, "metadata/manifest-2.avro");
+    const paths1 = [_][*:0]const u8{"data/part-a.parquet"};
+    const counts1 = [_]i64{5};
+    const lower1 = [_]i64{50};
+    const upper1 = [_]i64{150};
+    try avro.writeDataManifest(man1, &paths1, &counts1, &lower1, &upper1, 2, &.{});
+    const paths2 = [_][*:0]const u8{ "data/part-a.parquet", "data/part-b.parquet" };
+    const counts2 = [_]i64{ 5, 5 };
+    const lower2 = [_]i64{ 50, 75 };
+    const upper2 = [_]i64{ 150, 300 };
+    try avro.writeDataManifest(man2, &paths2, &counts2, &lower2, &upper2, 2, &.{});
+}
+
+/// Same prune table, but manifests keep the original object URI. Opening the
+/// copied directory must rewrite `s3://reloc-src/t` → `table_dir`.
+pub fn writeRelocatedFixture(allocator: std.mem.Allocator, io: std.Io, table_dir: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writePruneFixture(allocator, io, table_dir);
+
+    const loc = "s3://reloc-src/t";
+    try writeText(io, try std.fs.path.join(a, &.{ table_dir, "metadata", "v1.metadata.json" }),
+        \\{
+        \\  "format-version": 2,
+        \\  "table-uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        \\  "location": "s3://reloc-src/t",
+        \\  "last-updated-ms": 1700000000000,
+        \\  "last-column-id": 3,
+        \\  "current-snapshot-id": 1,
+        \\  "current-schema-id": 0,
+        \\  "default-spec-id": 0,
+        \\  "partition-specs": [{ "spec-id": 0, "fields": [] }],
+        \\  "schemas": [{
+        \\    "schema-id": 0,
+        \\    "fields": [
+        \\      {"id": 1, "name": "id", "required": true, "type": "long"},
+        \\      {"id": 2, "name": "price", "required": true, "type": "long"},
+        \\      {"id": 3, "name": "category", "required": true, "type": "string"}
+        \\    ]
+        \\  }],
+        \\  "snapshots": [{
+        \\    "snapshot-id": 1,
+        \\    "timestamp-ms": 1700000000000,
+        \\    "sequence-number": 1,
+        \\    "manifest-list": "s3://reloc-src/t/metadata/snap-1.avro"
+        \\  }]
+        \\}
+        \\
+    );
+
+    var list_z: [1024]u8 = undefined;
+    var man_z: [1024]u8 = undefined;
+    const list_path = try std.fmt.bufPrintZ(&list_z, "{s}/metadata/snap-1.avro", .{table_dir});
+    const man_path = try std.fmt.bufPrintZ(&man_z, "{s}/metadata/manifest-1.avro", .{table_dir});
+    try avro.writeManifestList(list_path, loc ++ "/metadata/manifest-1.avro");
+    const data_paths = [_][*:0]const u8{
+        loc ++ "/data/part-a.parquet",
+        loc ++ "/data/part-b.parquet",
+    };
+    const counts = [_]i64{ 5, 5 };
+    const lower = [_]i64{ 50, 75 };
+    const upper = [_]i64{ 150, 300 };
+    try avro.writeDataManifest(man_path, &data_paths, &counts, &lower, &upper, 2, &.{});
+}
+
+/// Hadoop warehouse: `root/namespace/table/metadata/…`.
+pub fn writeWarehouseFixture(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try writePruneFixture(allocator, io, try std.fs.path.join(a, &.{ root, "sales", "prune" }));
+    try writePruneFixture(allocator, io, try std.fs.path.join(a, &.{ root, "extra", "prune" }));
 }
 
 pub fn writeLakeFixture(allocator: std.mem.Allocator, io: std.Io, table_dir: []const u8) !void {
@@ -1494,7 +2491,8 @@ test "version-hint uuid filename without v prefix" {
     const t = Transport{ .allocator = gpa, .io = io, .http = &http };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    try std.testing.expectError(error.SnapshotNotFound, openTable(arena.allocator(), t, table_dir));
+    const table = try openTable(arena.allocator(), t, table_dir);
+    try std.testing.expectEqual(@as(usize, 0), table.files.len);
 }
 
 test "tableDirFromMetaPath strips metadata json" {
@@ -1510,4 +2508,65 @@ test "tableDirFromMetaPath strips metadata json" {
         "/tmp/iceberg_prune",
         tableDirFromMetaPath("/tmp/iceberg_prune/metadata/v1.metadata.json"),
     );
+}
+
+test "relocatePath swaps metadata location for the opened directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings(
+        "/tmp/peach-lake/data/part.parquet",
+        try relocatePath(a, "/tmp/peach-lake", "s3://peach-lake", "s3://peach-lake/data/part.parquet"),
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/peach-lake",
+        try relocatePath(a, "/tmp/peach-lake", "s3://peach-lake", "s3://peach-lake"),
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/t/data/part-a.parquet",
+        try relocatePath(a, "/tmp/t", "iceberg_prune", "data/part-a.parquet"),
+    );
+}
+
+test "snapshotFor id and timestamp as of" {
+    const json =
+        \\{
+        \\  "format-version": 2,
+        \\  "table-uuid": "u",
+        \\  "location": "t",
+        \\  "current-schema-id": 0,
+        \\  "current-snapshot-id": 2,
+        \\  "schemas": [{"schema-id": 0, "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]}],
+        \\  "partition-specs": [{"spec-id": 0, "fields": []}],
+        \\  "snapshots": [
+        \\    {"snapshot-id": 1, "timestamp-ms": 100, "manifest-list": "m1"},
+        \\    {"snapshot-id": 2, "timestamp-ms": 200, "manifest-list": "m2"}
+        \\  ]
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const meta = try parseMetadata(arena.allocator(), json);
+    try std.testing.expectEqual(@as(i64, 2), (try meta.snapshotFor(null)).snapshot_id);
+    try std.testing.expectEqual(@as(i64, 1), (try meta.snapshotFor(.{ .snapshot = 1 })).snapshot_id);
+    try std.testing.expectEqual(@as(i64, 1), (try meta.snapshotFor(.{ .timestamp_ms = 100 })).snapshot_id);
+    try std.testing.expectEqual(@as(i64, 1), (try meta.snapshotFor(.{ .timestamp_ms = 150 })).snapshot_id);
+    try std.testing.expectEqual(@as(i64, 2), (try meta.snapshotFor(.{ .timestamp_ms = 200 })).snapshot_id);
+    try std.testing.expectError(error.SnapshotNotFound, meta.snapshotFor(.{ .snapshot = 9 }));
+    try std.testing.expectError(error.SnapshotNotFound, meta.snapshotFor(.{ .timestamp_ms = 50 }));
+}
+
+test "specFromNames identity starts at field-id 1000" {
+    const fields = [_]SchemaField{
+        .{ .id = 1, .name = "id", .required = true, .type_name = "long" },
+        .{ .id = 2, .name = "category", .required = true, .type_name = "string" },
+    };
+    const spec = try specFromNames(std.testing.allocator, &fields, &.{"category"});
+    defer std.testing.allocator.free(spec);
+    try std.testing.expectEqual(@as(usize, 1), spec.len);
+    try std.testing.expectEqual(@as(i32, 2), spec[0].source_id);
+    try std.testing.expectEqual(@as(i32, 1000), spec[0].field_id);
+    try std.testing.expectEqualStrings("category", spec[0].name);
+    try std.testing.expectEqualStrings("identity", spec[0].transform);
+    try std.testing.expectError(error.ColumnNotFound, specFromNames(std.testing.allocator, &fields, &.{"nope"}));
 }

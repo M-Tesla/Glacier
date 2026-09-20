@@ -98,6 +98,14 @@ def _bind(lib) -> None:
     lib.glacier_open_buffer.argtypes = [ctypes.c_void_p, ctypes.c_size_t, char_pp]
     lib.glacier_open_buffer.restype = ctypes.c_void_p
 
+    lib.glacier_open_catalog.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        char_pp,
+    ]
+    lib.glacier_open_catalog.restype = ctypes.c_void_p
+
     lib.glacier_close.argtypes = [ctypes.c_void_p]
     lib.glacier_close.restype = None
 

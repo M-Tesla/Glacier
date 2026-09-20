@@ -26,6 +26,16 @@ pub fn build(b: *std.Build) void {
     if (optimize != .Debug) lib.root_module.strip = true;
     b.installArtifact(lib);
 
+    const flight_mod = b.createModule(.{
+        .root_source_file = b.path("src/table/flight_server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "glacier", .module = glacier_mod },
+        },
+    });
+
     const repl = b.addExecutable(.{
         .name = "glacier",
         .root_module = b.createModule(.{
@@ -35,6 +45,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{
                 .{ .name = "glacier", .module = glacier_mod },
+                .{ .name = "flight_server", .module = flight_mod },
             },
         }),
     });
@@ -72,6 +83,20 @@ pub fn build(b: *std.Build) void {
     run_gen.addArg("tests/iceberg_prune");
     b.step("fixtures", "Write sales.parquet and tests/iceberg_prune").dependOn(&run_gen.step);
 
+    const gen_volume = b.addExecutable(.{
+        .name = "gen-volume",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_volume.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "glacier", .module = glacier_mod },
+            },
+        }),
+    });
+    if (!lib_only) b.installArtifact(gen_volume);
+
     const run_info = b.addRunArtifact(info);
     if (b.args) |args| run_info.addArgs(args);
     const run_step = b.step("run", "Run parquet-info (pass -- path.parquet)");
@@ -90,10 +115,16 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{
                 .{ .name = "glacier", .module = glacier_mod },
+                .{ .name = "flight_server", .module = flight_mod },
             },
         }),
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
+
+    const flight_tests = b.addTest(.{
+        .root_module = flight_mod,
+    });
+    const run_flight_tests = b.addRunArtifact(flight_tests);
 
     const cli_smoke = b.addRunArtifact(repl);
     cli_smoke.addArgs(&.{ "-c", "SELECT 1" });
@@ -107,6 +138,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_flight_tests.step);
     test_step.dependOn(&cli_smoke.step);
     test_step.dependOn(&cli_fail.step);
 

@@ -5,6 +5,27 @@
 //! WITH t AS (SELECT …) [, …] SELECT …
 //! COPY TO 'file.glacier'
 //! COPY (SELECT …) TO 'file.glacier'
+//! COPY t FROM 'file.parquet'   (ingest into an Iceberg table via the catalog)
+//! SHOW CATALOGS
+//! SHOW NAMESPACES [FROM catalog]
+//! SHOW TABLES [FROM catalog[.namespace]]
+//! ATTACH [CATALOG] 'path-or-uri' AS name
+//! DESCRIBE [TABLE] catalog[.namespace].table
+//! USE catalog[.namespace]
+//! DETACH [CATALOG] name
+//! CREATE NAMESPACE [catalog.]ns
+//! CREATE TABLE [catalog.][ns.]name (col BIGINT|INT|STRING|DOUBLE|FLOAT|BOOLEAN, …)
+//! CREATE TABLE [catalog.][ns.]name AS SELECT …
+//! INSERT INTO [catalog.][ns.]name VALUES (…)[, …] | SELECT …
+//! DELETE FROM [catalog.][ns.]name [WHERE bool]   (Iceberg equality deletes)
+//! UPDATE [catalog.][ns.]name SET col = lit|col [, …] [WHERE bool]
+//! MERGE INTO t [AS a] USING u [AS b] ON a.k = b.k
+//!   WHEN MATCHED THEN DELETE | UPDATE SET …
+//!   WHEN NOT MATCHED THEN INSERT [(cols)] VALUES (…)
+//! ALTER TABLE t ADD COLUMN col TYPE
+//! DROP TABLE [catalog.][ns.]name
+//! FROM glacier.catalogs / glacier.tables / glacier.snapshots / glacier.files (Iceberg)
+//! FROM t.snapshots / t.files (Iceberg metadata of t)
 //! Window: agg/ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD OVER ([PARTITION BY …] [ORDER BY …] [ROWS|RANGE …])
 //! Literals: `SELECT 1` / `SELECT NULL` (no FROM). Escalars: abs, round, cast, coalesce, lower, upper, length, trim, replace, substr, concat, left, right, starts_with, date_trunc, extract, year/month/day/hour/minute/second, ceil, floor, sign, greatest, least, CASE.
 //! Expr: `+ - * / %`, unary minus, col vs col, nested calls (`abs(price * 2)`), scalar subquery `(SELECT …)`.
@@ -321,11 +342,17 @@ pub const OrderBy = struct {
     desc: bool = false,
 };
 
+pub const AsOf = union(enum) {
+    snapshot: i64,
+    timestamp_ms: i64,
+};
+
 pub const Query = struct {
     items: []const SelectItem,
     from: []const u8,
     from_alias: ?[]const u8 = null,
     from_sub: ?*Query = null,
+    as_of: ?AsOf = null,
     join: ?Join = null,
     where: ?*BoolExpr,
     group_by: []const []const u8,
@@ -360,7 +387,7 @@ pub const Query = struct {
         return self.hasAgg() or self.group_by.len > 0;
     }
 
-    /// `SELECT 1` / `SELECT 1, 'x'` with no FROM — one row, no scan.
+    /// `SELECT 1` / `SELECT 1, 'x'` with no FROM: one row, no scan.
     pub fn isLiteralOnly(self: Query) bool {
         if (self.union_right != null or self.from_sub != null) return false;
         if (self.from.len != 0) return false;
@@ -373,7 +400,7 @@ pub const Query = struct {
         return true;
     }
 
-    /// `SELECT 1` / `SELECT 1+2` / `SELECT abs(1)` with no FROM — one row, no scan.
+    /// `SELECT 1` / `SELECT 1+2` / `SELECT abs(1)` with no FROM: one row, no scan.
     /// `SELECT *` / `SELECT id` without FROM still scan the connected table.
     pub fn isNoFrom(self: Query) bool {
         if (self.union_right != null or self.from_sub != null or self.join != null) return false;
@@ -408,14 +435,126 @@ fn exprIsConstant(e: *const Expr) bool {
 }
 
 pub const Copy = struct {
-    /// null means `SELECT *` of the connected table.
+    /// null means `SELECT *` of the connected table (`COPY TO`).
     query: ?Query = null,
     path: []const u8,
+    /// Set for `COPY table FROM 'path'`. Then `query` is unused.
+    from_table: ?[]const u8 = null,
+};
+
+pub const Show = union(enum) {
+    catalogs,
+    namespaces: struct { catalog: ?[]const u8 = null },
+    tables: struct { catalog: ?[]const u8 = null, namespace: ?[]const u8 = null },
+};
+
+pub const Attach = struct {
+    source: []const u8,
+    name: []const u8,
+};
+
+pub const Describe = struct {
+    ident: []const u8,
+};
+
+pub const Use = struct {
+    catalog: []const u8,
+    namespace: ?[]const u8 = null,
+};
+
+pub const Detach = struct {
+    name: []const u8,
+};
+
+pub const ColDef = struct {
+    name: []const u8,
+    type_name: []const u8,
+};
+
+pub const CreateNamespace = struct {
+    ident: []const u8,
+};
+
+pub const CreateTable = struct {
+    ident: []const u8,
+    columns: []const ColDef = &.{},
+    as_select: ?Query = null,
+    /// Iceberg identity columns. Empty = unpartitioned.
+    partition_by: []const []const u8 = &.{},
+};
+
+pub const Insert = struct {
+    ident: []const u8,
+    query: Query,
+};
+
+pub const DropTable = struct {
+    ident: []const u8,
+};
+
+pub const Delete = struct {
+    ident: []const u8,
+    where: ?*BoolExpr = null,
+};
+
+pub const AssignValue = union(enum) {
+    literal: Literal,
+    column: QualName,
+};
+
+pub const Assignment = struct {
+    column: []const u8,
+    value: AssignValue,
+};
+
+pub const Update = struct {
+    ident: []const u8,
+    assignments: []const Assignment,
+    where: ?*BoolExpr = null,
+};
+
+pub const MergeMatched = union(enum) {
+    delete,
+    update: []const Assignment,
+};
+
+pub const MergeInsert = struct {
+    columns: []const []const u8 = &.{},
+    values: []const AssignValue = &.{},
+};
+
+pub const Merge = struct {
+    ident: []const u8,
+    alias: ?[]const u8 = null,
+    source: []const u8,
+    source_alias: ?[]const u8 = null,
+    source_sub: ?*Query = null,
+    eqs: []const JoinEq,
+    matched: ?MergeMatched = null,
+    not_matched: ?MergeInsert = null,
+};
+
+pub const AlterTable = struct {
+    ident: []const u8,
+    column: ColDef,
 };
 
 pub const Stmt = union(enum) {
     query: Query,
     copy: Copy,
+    show: Show,
+    attach: Attach,
+    describe: Describe,
+    use: Use,
+    detach: Detach,
+    create_namespace: CreateNamespace,
+    create_table: CreateTable,
+    insert: Insert,
+    delete: Delete,
+    update: Update,
+    merge: Merge,
+    alter_table: AlterTable,
+    drop_table: DropTable,
 };
 
 pub fn aggArgsEqual(a: ?[]const u8, b: ?[]const u8) bool {
@@ -442,6 +581,21 @@ const Kind = enum {
     all,
     copy,
     to,
+    show,
+    attach,
+    describe,
+    use,
+    detach,
+    create,
+    insert,
+    drop,
+    delete,
+    update,
+    merge,
+    alter,
+    set,
+    using,
+    into,
     with,
     join,
     inner,
@@ -467,6 +621,7 @@ const Kind = enum {
     @"union",
     values,
     exists,
+    @"for",
     ident,
     number,
     string,
@@ -660,6 +815,36 @@ const Lexer = struct {
                 .copy
             else if (eqlKw(lexeme, "to"))
                 .to
+            else if (eqlKw(lexeme, "show"))
+                .show
+            else if (eqlKw(lexeme, "attach"))
+                .attach
+            else if (eqlKw(lexeme, "describe"))
+                .describe
+            else if (eqlKw(lexeme, "use"))
+                .use
+            else if (eqlKw(lexeme, "detach"))
+                .detach
+            else if (eqlKw(lexeme, "create"))
+                .create
+            else if (eqlKw(lexeme, "insert"))
+                .insert
+            else if (eqlKw(lexeme, "drop"))
+                .drop
+            else if (eqlKw(lexeme, "delete"))
+                .delete
+            else if (eqlKw(lexeme, "update"))
+                .update
+            else if (eqlKw(lexeme, "merge"))
+                .merge
+            else if (eqlKw(lexeme, "alter"))
+                .alter
+            else if (eqlKw(lexeme, "set"))
+                .set
+            else if (eqlKw(lexeme, "using"))
+                .using
+            else if (eqlKw(lexeme, "into"))
+                .into
             else if (eqlKw(lexeme, "with"))
                 .with
             else if (eqlKw(lexeme, "join"))
@@ -708,10 +893,12 @@ const Lexer = struct {
                 .@"union"
             else if (eqlKw(lexeme, "values"))
                 .values
-            else if (eqlKw(lexeme, "natural") or eqlKw(lexeme, "using") or eqlKw(lexeme, "cross"))
+            else if (eqlKw(lexeme, "natural") or eqlKw(lexeme, "cross"))
                 return error.UnsupportedJoin
             else if (eqlKw(lexeme, "exists"))
                 .exists
+            else if (eqlKw(lexeme, "for"))
+                .@"for"
             else if (eqlKw(lexeme, "window") or eqlKw(lexeme, "except") or eqlKw(lexeme, "intersect") or
                 eqlKw(lexeme, "recursive"))
                 return error.UnsupportedSql
@@ -1581,7 +1768,8 @@ fn parseU64(tok: Token, sql: []const u8) Error!u64 {
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !Query {
     switch (try parseStmt(allocator, sql)) {
         .query => |q| return q,
-        .copy => return error.InvalidSyntax,
+        .copy, .show, .attach, .describe, .use, .detach,
+        .create_namespace, .create_table, .insert, .delete, .update, .merge, .alter_table, .drop_table => return error.InvalidSyntax,
     }
 }
 
@@ -1590,7 +1778,456 @@ pub fn parseStmt(allocator: std.mem.Allocator, sql: []const u8) !Stmt {
     if ((try lexer.peek()).kind == .copy) {
         return .{ .copy = try parseCopy(allocator, &lexer, sql) };
     }
+    if ((try lexer.peek()).kind == .show) {
+        return .{ .show = try parseShow(&lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .attach) {
+        return .{ .attach = try parseAttach(&lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .describe) {
+        return .{ .describe = try parseDescribe(&lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .use) {
+        return .{ .use = try parseUse(&lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .detach) {
+        return .{ .detach = try parseDetach(&lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .create) {
+        return parseCreate(allocator, &lexer, sql);
+    }
+    if ((try lexer.peek()).kind == .insert) {
+        return .{ .insert = try parseInsert(allocator, &lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .drop) {
+        return .{ .drop_table = try parseDropTable(&lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .delete) {
+        return .{ .delete = try parseDelete(allocator, &lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .update) {
+        return .{ .update = try parseUpdate(allocator, &lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .merge) {
+        return .{ .merge = try parseMerge(allocator, &lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .alter) {
+        return .{ .alter_table = try parseAlterTable(&lexer, sql) };
+    }
     return .{ .query = try parseQuery(allocator, &lexer, sql, .eof) };
+}
+
+fn parseShow(lexer: *Lexer, sql: []const u8) !Show {
+    _ = try expect(lexer, .show);
+    const what = try expect(lexer, .ident);
+    const word = what.slice(sql);
+    if (eqlKw(word, "catalogs")) {
+        if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+        return .catalogs;
+    }
+    if (eqlKw(word, "namespaces")) {
+        var catalog: ?[]const u8 = null;
+        if ((try lexer.peek()).kind == .from) {
+            _ = try lexer.next();
+            catalog = try parseDottedIdent(lexer, sql);
+        }
+        if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+        return .{ .namespaces = .{ .catalog = catalog } };
+    }
+    if (eqlKw(word, "tables")) {
+        var catalog: ?[]const u8 = null;
+        var namespace: ?[]const u8 = null;
+        if ((try lexer.peek()).kind == .from) {
+            _ = try lexer.next();
+            const dotted = try parseDottedIdent(lexer, sql);
+            if (std.mem.indexOfScalar(u8, dotted, '.')) |dot| {
+                catalog = dotted[0..dot];
+                namespace = dotted[dot + 1 ..];
+            } else {
+                catalog = dotted;
+            }
+        }
+        if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+        return .{ .tables = .{ .catalog = catalog, .namespace = namespace } };
+    }
+    return error.InvalidSyntax;
+}
+
+fn parseAttach(lexer: *Lexer, sql: []const u8) !Attach {
+    _ = try expect(lexer, .attach);
+    if ((try lexer.peek()).kind == .ident) {
+        const word = (try lexer.peek()).slice(sql);
+        if (eqlKw(word, "catalog")) _ = try lexer.next();
+    }
+    const src_tok = try lexer.next();
+    const source = switch (src_tok.kind) {
+        .string => unquote(sql, src_tok),
+        .ident => src_tok.slice(sql),
+        else => return error.InvalidSyntax,
+    };
+    _ = try expect(lexer, .as);
+    const name = try expect(lexer, .ident);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .source = source, .name = name.slice(sql) };
+}
+
+fn parseDescribe(lexer: *Lexer, sql: []const u8) !Describe {
+    _ = try expect(lexer, .describe);
+    if ((try lexer.peek()).kind == .ident) {
+        const word = (try lexer.peek()).slice(sql);
+        if (eqlKw(word, "table")) _ = try lexer.next();
+    }
+    const ident = try parseDottedIdent(lexer, sql);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .ident = ident };
+}
+
+fn parseUse(lexer: *Lexer, sql: []const u8) !Use {
+    _ = try expect(lexer, .use);
+    if ((try lexer.peek()).kind == .ident) {
+        const word = (try lexer.peek()).slice(sql);
+        if (eqlKw(word, "catalog")) _ = try lexer.next();
+    }
+    const dotted = try parseDottedIdent(lexer, sql);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    if (std.mem.indexOfScalar(u8, dotted, '.')) |dot| {
+        if (std.mem.indexOfScalar(u8, dotted[dot + 1 ..], '.') != null) return error.InvalidSyntax;
+        return .{ .catalog = dotted[0..dot], .namespace = dotted[dot + 1 ..] };
+    }
+    return .{ .catalog = dotted, .namespace = null };
+}
+
+fn parseDetach(lexer: *Lexer, sql: []const u8) !Detach {
+    _ = try expect(lexer, .detach);
+    if ((try lexer.peek()).kind == .ident) {
+        const word = (try lexer.peek()).slice(sql);
+        if (eqlKw(word, "catalog")) _ = try lexer.next();
+    }
+    const name = try expect(lexer, .ident);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .name = name.slice(sql) };
+}
+
+fn parseCreate(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !Stmt {
+    _ = try expect(lexer, .create);
+    const kind_tok = try lexer.next();
+    const word = kind_tok.slice(sql);
+    if (eqlKw(word, "namespace") or eqlKw(word, "schema")) {
+        const ident = try parseDottedIdent(lexer, sql);
+        if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+        return .{ .create_namespace = .{ .ident = ident } };
+    }
+    if (eqlKw(word, "table")) {
+        return .{ .create_table = try parseCreateTable(allocator, lexer, sql) };
+    }
+    return error.InvalidSyntax;
+}
+
+fn parseCreateTable(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !CreateTable {
+    const ident = try parseDottedIdent(lexer, sql);
+    var partition_by: std.ArrayList([]const u8) = .empty;
+    defer partition_by.deinit(allocator);
+    if (try peekPartitioned(lexer, sql)) {
+        try parsePartitionedBy(allocator, lexer, sql, &partition_by);
+    }
+    if ((try lexer.peek()).kind == .as) {
+        _ = try lexer.next();
+        const q = try parseQuery(allocator, lexer, sql, .eof);
+        if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+        return .{
+            .ident = ident,
+            .as_select = q,
+            .partition_by = try partition_by.toOwnedSlice(allocator),
+        };
+    }
+    _ = try expect(lexer, .lparen);
+    var cols: std.ArrayList(ColDef) = .empty;
+    defer cols.deinit(allocator);
+    while (true) {
+        const name = try expect(lexer, .ident);
+        const ty = try lexer.next();
+        if (ty.kind != .ident) return error.InvalidSyntax;
+        const type_name = icebergTypeName(ty.slice(sql)) orelse return error.UnsupportedSql;
+        try cols.append(allocator, .{ .name = name.slice(sql), .type_name = type_name });
+        if ((try lexer.peek()).kind != .comma) break;
+        _ = try lexer.next();
+    }
+    _ = try expect(lexer, .rparen);
+    if (try peekPartitioned(lexer, sql)) {
+        if (partition_by.items.len != 0) return error.InvalidSyntax;
+        try parsePartitionedBy(allocator, lexer, sql, &partition_by);
+    }
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    if (cols.items.len == 0) return error.InvalidSyntax;
+    return .{
+        .ident = ident,
+        .columns = try cols.toOwnedSlice(allocator),
+        .partition_by = try partition_by.toOwnedSlice(allocator),
+    };
+}
+
+fn peekPartitioned(lexer: *Lexer, sql: []const u8) !bool {
+    const tok = try lexer.peek();
+    if (tok.kind == .partition) return true;
+    return tok.kind == .ident and eqlKw(tok.slice(sql), "partitioned");
+}
+
+fn parsePartitionedBy(
+    allocator: std.mem.Allocator,
+    lexer: *Lexer,
+    sql: []const u8,
+    out: *std.ArrayList([]const u8),
+) !void {
+    const tok = try lexer.next();
+    if (tok.kind == .ident) {
+        if (!eqlKw(tok.slice(sql), "partitioned")) return error.InvalidSyntax;
+    } else if (tok.kind != .partition) return error.InvalidSyntax;
+    _ = try expect(lexer, .by);
+    _ = try expect(lexer, .lparen);
+    while (true) {
+        try out.append(allocator, try parsePartitionCol(lexer, sql));
+        if ((try lexer.peek()).kind != .comma) break;
+        _ = try lexer.next();
+    }
+    _ = try expect(lexer, .rparen);
+    if (out.items.len == 0) return error.InvalidSyntax;
+    for (out.items, 0..) |name, i| {
+        for (out.items[0..i]) |prev| {
+            if (std.ascii.eqlIgnoreCase(prev, name)) return error.InvalidSyntax;
+        }
+    }
+}
+
+fn parsePartitionCol(lexer: *Lexer, sql: []const u8) ![]const u8 {
+    const name = try parseColumnName(lexer, sql);
+    if ((try lexer.peek()).kind != .lparen) return name;
+    if (!eqlKw(name, "identity")) return error.UnsupportedPartitionSpec;
+    _ = try lexer.next();
+    const inner = try parseColumnName(lexer, sql);
+    _ = try expect(lexer, .rparen);
+    return inner;
+}
+
+fn icebergTypeName(name: []const u8) ?[]const u8 {
+    if (eqlKw(name, "int") or eqlKw(name, "integer")) return "int";
+    if (eqlKw(name, "bigint") or eqlKw(name, "long") or eqlKw(name, "int64")) return "long";
+    if (eqlKw(name, "float") or eqlKw(name, "real")) return "float";
+    if (eqlKw(name, "double") or eqlKw(name, "float64")) return "double";
+    if (eqlKw(name, "bool") or eqlKw(name, "boolean")) return "boolean";
+    if (eqlKw(name, "string") or eqlKw(name, "varchar") or eqlKw(name, "text") or eqlKw(name, "utf8"))
+        return "string";
+    return null;
+}
+
+fn parseInsert(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !Insert {
+    _ = try expect(lexer, .insert);
+    _ = try expect(lexer, .into);
+    const ident = try parseDottedIdent(lexer, sql);
+    const q = if ((try lexer.peek()).kind == .values)
+        try parseValues(allocator, lexer, sql, .eof)
+    else
+        try parseQuery(allocator, lexer, sql, .eof);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .ident = ident, .query = q };
+}
+
+fn parseDropTable(lexer: *Lexer, sql: []const u8) !DropTable {
+    _ = try expect(lexer, .drop);
+    const kind_tok = try lexer.next();
+    const word = kind_tok.slice(sql);
+    if (!eqlKw(word, "table")) return error.InvalidSyntax;
+    const ident = try parseDottedIdent(lexer, sql);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .ident = ident };
+}
+
+fn parseDelete(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !Delete {
+    _ = try expect(lexer, .delete);
+    _ = try expect(lexer, .from);
+    const ident = try parseDottedIdent(lexer, sql);
+    var where_expr: ?*BoolExpr = null;
+    if ((try lexer.peek()).kind == .where) {
+        _ = try lexer.next();
+        where_expr = try parseBool(allocator, lexer, sql, false);
+    }
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .ident = ident, .where = where_expr };
+}
+
+fn parseAssignValue(lexer: *Lexer, sql: []const u8, allocator: std.mem.Allocator) !AssignValue {
+    const tok = try lexer.peek();
+    switch (tok.kind) {
+        .number, .string, .null => return .{ .literal = try parseLiteralToken(lexer, sql, allocator) },
+        .ident => return .{ .column = try parseQualName(lexer, sql) },
+        else => return error.InvalidSyntax,
+    }
+}
+
+fn parseAssignments(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) ![]Assignment {
+    var out: std.ArrayList(Assignment) = .empty;
+    defer out.deinit(allocator);
+    while (true) {
+        const column = try parseColumnName(lexer, sql);
+        _ = try expect(lexer, .eq);
+        const value = try parseAssignValue(lexer, sql, allocator);
+        try out.append(allocator, .{ .column = column, .value = value });
+        if ((try lexer.peek()).kind != .comma) break;
+        _ = try lexer.next();
+    }
+    if (out.items.len == 0) return error.InvalidSyntax;
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseUpdate(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !Update {
+    _ = try expect(lexer, .update);
+    const ident = try parseDottedIdent(lexer, sql);
+    _ = try expect(lexer, .set);
+    const assignments = try parseAssignments(allocator, lexer, sql);
+    var where_expr: ?*BoolExpr = null;
+    if ((try lexer.peek()).kind == .where) {
+        _ = try lexer.next();
+        where_expr = try parseBool(allocator, lexer, sql, false);
+    }
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .ident = ident, .assignments = assignments, .where = where_expr };
+}
+
+fn parseJoinEqs(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) ![]JoinEq {
+    var eqs: std.ArrayList(JoinEq) = .empty;
+    defer eqs.deinit(allocator);
+    while (true) {
+        const left = try parseQualName(lexer, sql);
+        if ((try lexer.peek()).kind != .eq) return error.UnsupportedJoin;
+        _ = try lexer.next();
+        const rhs = try lexer.peek();
+        if (rhs.kind == .number or rhs.kind == .string) return error.UnsupportedJoin;
+        const right = try parseQualName(lexer, sql);
+        try eqs.append(allocator, .{ .left = left, .right = right });
+        if ((try lexer.peek()).kind != .@"and") break;
+        _ = try lexer.next();
+    }
+    if (eqs.items.len == 0) return error.InvalidSyntax;
+    return eqs.toOwnedSlice(allocator);
+}
+
+fn parseMergeInsert(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !MergeInsert {
+    _ = try expect(lexer, .insert);
+    var columns: []const []const u8 = &.{};
+    var values: []const AssignValue = &.{};
+    if ((try lexer.peek()).kind == .lparen) {
+        _ = try lexer.next();
+        var cols: std.ArrayList([]const u8) = .empty;
+        defer cols.deinit(allocator);
+        try cols.append(allocator, try parseColumnName(lexer, sql));
+        while ((try lexer.peek()).kind == .comma) {
+            _ = try lexer.next();
+            try cols.append(allocator, try parseColumnName(lexer, sql));
+        }
+        _ = try expect(lexer, .rparen);
+        columns = try cols.toOwnedSlice(allocator);
+    }
+    if ((try lexer.peek()).kind == .values) {
+        _ = try lexer.next();
+        _ = try expect(lexer, .lparen);
+        var vals: std.ArrayList(AssignValue) = .empty;
+        defer vals.deinit(allocator);
+        try vals.append(allocator, try parseAssignValue(lexer, sql, allocator));
+        while ((try lexer.peek()).kind == .comma) {
+            _ = try lexer.next();
+            try vals.append(allocator, try parseAssignValue(lexer, sql, allocator));
+        }
+        _ = try expect(lexer, .rparen);
+        values = try vals.toOwnedSlice(allocator);
+        if (columns.len != 0 and columns.len != values.len) return error.InvalidSyntax;
+    } else if (columns.len != 0) return error.InvalidSyntax;
+    return .{ .columns = columns, .values = values };
+}
+
+fn parseMerge(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !Merge {
+    _ = try expect(lexer, .merge);
+    _ = try expect(lexer, .into);
+    const ident = try parseDottedIdent(lexer, sql);
+    var alias: ?[]const u8 = null;
+    if ((try lexer.peek()).kind == .as) {
+        _ = try lexer.next();
+        alias = (try expect(lexer, .ident)).slice(sql);
+    } else if ((try lexer.peek()).kind == .ident) {
+        alias = (try lexer.next()).slice(sql);
+    }
+    _ = try expect(lexer, .using);
+    var source: []const u8 = undefined;
+    var source_alias: ?[]const u8 = null;
+    var source_sub: ?*Query = null;
+    if ((try lexer.peek()).kind == .lparen) {
+        source_sub = try parseSubquery(allocator, lexer, sql);
+        source_alias = try parseTableAlias(lexer, sql);
+        if (source_alias == null) return error.InvalidSyntax;
+        source = source_alias.?;
+    } else {
+        source = try parseDottedIdent(lexer, sql);
+        if ((try lexer.peek()).kind == .as) {
+            _ = try lexer.next();
+            source_alias = (try expect(lexer, .ident)).slice(sql);
+        } else if ((try lexer.peek()).kind == .ident) {
+            source_alias = (try lexer.next()).slice(sql);
+        }
+    }
+    _ = try expect(lexer, .on);
+    const eqs = try parseJoinEqs(allocator, lexer, sql);
+    var matched: ?MergeMatched = null;
+    var not_matched: ?MergeInsert = null;
+    while ((try lexer.peek()).kind == .when) {
+        _ = try lexer.next();
+        var is_not = false;
+        if ((try lexer.peek()).kind == .not) {
+            _ = try lexer.next();
+            is_not = true;
+        }
+        const matched_tok = try expect(lexer, .ident);
+        if (!eqlKw(matched_tok.slice(sql), "matched")) return error.InvalidSyntax;
+        _ = try expect(lexer, .then);
+        if (is_not) {
+            if (not_matched != null) return error.InvalidSyntax;
+            not_matched = try parseMergeInsert(allocator, lexer, sql);
+        } else if ((try lexer.peek()).kind == .delete) {
+            if (matched != null) return error.InvalidSyntax;
+            _ = try lexer.next();
+            matched = .delete;
+        } else if ((try lexer.peek()).kind == .update) {
+            if (matched != null) return error.InvalidSyntax;
+            _ = try lexer.next();
+            _ = try expect(lexer, .set);
+            matched = .{ .update = try parseAssignments(allocator, lexer, sql) };
+        } else return error.InvalidSyntax;
+    }
+    if (matched == null and not_matched == null) return error.InvalidSyntax;
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{
+        .ident = ident,
+        .alias = alias,
+        .source = source,
+        .source_alias = source_alias,
+        .source_sub = source_sub,
+        .eqs = eqs,
+        .matched = matched,
+        .not_matched = not_matched,
+    };
+}
+
+fn parseAlterTable(lexer: *Lexer, sql: []const u8) !AlterTable {
+    _ = try expect(lexer, .alter);
+    const table_tok = try lexer.next();
+    if (!eqlKw(table_tok.slice(sql), "table")) return error.InvalidSyntax;
+    const ident = try parseDottedIdent(lexer, sql);
+    const add_tok = try expect(lexer, .ident);
+    if (!eqlKw(add_tok.slice(sql), "add")) return error.InvalidSyntax;
+    const col_tok = try expect(lexer, .ident);
+    if (!eqlKw(col_tok.slice(sql), "column")) return error.InvalidSyntax;
+    const name = try parseColumnName(lexer, sql);
+    const type_tok = try expect(lexer, .ident);
+    const type_name = icebergTypeName(type_tok.slice(sql)) orelse return error.InvalidSyntax;
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .ident = ident, .column = .{ .name = name, .type_name = type_name } };
 }
 
 fn parseQuery(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8, stop: Kind) !Query {
@@ -1687,8 +2324,29 @@ fn parseCopy(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !Copy
         _ = try lexer.next();
         query = try parseQuery(allocator, lexer, sql, .rparen);
         _ = try expect(lexer, .rparen);
-    } else if (next.kind == .ident) {
-        const from = try parseFrom(lexer, sql);
+        _ = try expect(lexer, .to);
+        const path_tok = try expect(lexer, .string);
+        const end = try lexer.next();
+        if (end.kind != .eof) return error.InvalidSyntax;
+        return .{ .query = query, .path = unquote(sql, path_tok) };
+    }
+    if (next.kind == .to) {
+        _ = try lexer.next();
+        const path_tok = try expect(lexer, .string);
+        const end = try lexer.next();
+        if (end.kind != .eof) return error.InvalidSyntax;
+        return .{ .path = unquote(sql, path_tok) };
+    }
+    if (next.kind == .ident) {
+        const ident = try parseDottedIdent(lexer, sql);
+        if ((try lexer.peek()).kind == .from) {
+            _ = try lexer.next();
+            const path_tok = try expect(lexer, .string);
+            const end = try lexer.next();
+            if (end.kind != .eof) return error.InvalidSyntax;
+            return .{ .path = unquote(sql, path_tok), .from_table = ident };
+        }
+        const from = ident;
         query = .{
             .items = try allocator.dupe(SelectItem, &.{.star}),
             .from = from,
@@ -1700,12 +2358,13 @@ fn parseCopy(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !Copy
             .limit = null,
             .offset = null,
         };
+        _ = try expect(lexer, .to);
+        const path_tok = try expect(lexer, .string);
+        const end = try lexer.next();
+        if (end.kind != .eof) return error.InvalidSyntax;
+        return .{ .query = query, .path = unquote(sql, path_tok) };
     }
-    _ = try expect(lexer, .to);
-    const path_tok = try expect(lexer, .string);
-    const end = try lexer.next();
-    if (end.kind != .eof) return error.InvalidSyntax;
-    return .{ .query = query, .path = unquote(sql, path_tok) };
+    return error.InvalidSyntax;
 }
 
 fn parseSelect(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8, stop: Kind) !Query {
@@ -1802,6 +2461,7 @@ fn parseSelectArm(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) 
     var from: []const u8 = "";
     var from_alias: ?[]const u8 = null;
     var from_sub: ?*Query = null;
+    var as_of: ?AsOf = null;
     var join: ?Join = null;
     if ((try lexer.peek()).kind == .from) {
         _ = try lexer.next();
@@ -1813,6 +2473,8 @@ fn parseSelectArm(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) 
             from = try parseFrom(lexer, sql);
             from_alias = try parseTableAlias(lexer, sql);
         }
+        as_of = try parseAsOf(lexer, sql);
+        if (as_of != null and from_sub != null) return error.InvalidSyntax;
         join = try parseOptionalJoin(allocator, lexer, sql);
     }
 
@@ -1850,6 +2512,7 @@ fn parseSelectArm(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) 
         .from = from,
         .from_alias = from_alias,
         .from_sub = from_sub,
+        .as_of = as_of,
         .join = join,
         .where = where_expr,
         .group_by = try group_by.toOwnedSlice(allocator),
@@ -1868,18 +2531,61 @@ fn hasAggItems(items: []const SelectItem) bool {
     return false;
 }
 
+fn parseAsOf(lexer: *Lexer, sql: []const u8) Error!?AsOf {
+    if ((try lexer.peek()).kind != .@"for") return null;
+    _ = try lexer.next();
+    const what = try expect(lexer, .ident);
+    const word = what.slice(sql);
+    if (eqlKw(word, "snapshot")) {
+        if ((try lexer.peek()).kind == .as) {
+            _ = try lexer.next();
+            const of = try expect(lexer, .ident);
+            if (!eqlKw(of.slice(sql), "of")) return error.InvalidSyntax;
+        }
+        const n = try parseI64(try expect(lexer, .number), sql);
+        return .{ .snapshot = n };
+    }
+    if (eqlKw(word, "timestamp")) {
+        _ = try expect(lexer, .as);
+        const of = try expect(lexer, .ident);
+        if (!eqlKw(of.slice(sql), "of")) return error.InvalidSyntax;
+        const tok = try lexer.next();
+        const n = switch (tok.kind) {
+            .number => try parseI64(tok, sql),
+            .string => std.fmt.parseInt(i64, unquote(sql, tok), 10) catch return error.InvalidNumber,
+            else => return error.InvalidSyntax,
+        };
+        return .{ .timestamp_ms = n };
+    }
+    return error.InvalidSyntax;
+}
+
+fn parseI64(tok: Token, sql: []const u8) Error!i64 {
+    return std.fmt.parseInt(i64, tok.slice(sql), 10) catch error.InvalidNumber;
+}
+
+fn parseDottedIdent(lexer: *Lexer, sql: []const u8) Error![]const u8 {
+    const first = try expect(lexer, .ident);
+    var end = first.start + first.len;
+    while ((try lexer.peek()).kind == .dot) {
+        _ = try lexer.next();
+        const part = try expect(lexer, .ident);
+        end = part.start + part.len;
+    }
+    return sql[first.start..end];
+}
+
 fn parseFrom(lexer: *Lexer, sql: []const u8) Error![]const u8 {
     const t = try lexer.next();
     if (t.kind == .string) return unquote(sql, t);
     if (t.kind != .ident) return error.InvalidSyntax;
-    const start = t.start;
     var end = t.start + t.len;
-    if ((try lexer.peek()).kind == .dot) {
+    while ((try lexer.peek()).kind == .dot) {
         _ = try lexer.next();
-        const rest = try expect(lexer, .ident);
-        end = rest.start + rest.len;
+        const part = try expect(lexer, .ident);
+        end = part.start + part.len;
     }
-    return sql[start..end];
+    return sql[t.start..end];
 }
 
 fn parseTableAlias(lexer: *Lexer, sql: []const u8) Error!?[]const u8 {
@@ -1895,6 +2601,7 @@ fn parseTableAlias(lexer: *Lexer, sql: []const u8) Error!?[]const u8 {
 
 fn parseOptionalJoin(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) ParseError!?Join {
     if ((try lexer.peek()).kind == .comma) return error.UnsupportedJoin;
+    if ((try lexer.peek()).kind == .using) return error.UnsupportedJoin;
     switch ((try lexer.peek()).kind) {
         .join, .inner, .left, .right, .full => return try parseJoin(allocator, lexer, sql),
         else => return null,
@@ -1937,25 +2644,13 @@ fn parseJoin(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) Parse
     }
     if ((try lexer.peek()).kind != .on) return error.UnsupportedJoin;
     _ = try lexer.next();
-    var eqs: std.ArrayList(JoinEq) = .empty;
-    defer eqs.deinit(allocator);
-    while (true) {
-        const left = try parseQualName(lexer, sql);
-        if ((try lexer.peek()).kind != .eq) return error.UnsupportedJoin;
-        _ = try lexer.next();
-        const rhs = try lexer.peek();
-        if (rhs.kind == .number or rhs.kind == .string) return error.UnsupportedJoin;
-        const right = try parseQualName(lexer, sql);
-        try eqs.append(allocator, .{ .left = left, .right = right });
-        if ((try lexer.peek()).kind != .@"and") break;
-        _ = try lexer.next();
-    }
+    const eqs = try parseJoinEqs(allocator, lexer, sql);
     return .{
         .kind = kind,
         .table = table,
         .alias = alias,
         .sub = sub,
-        .eqs = try eqs.toOwnedSlice(allocator),
+        .eqs = eqs,
     };
 }
 
@@ -2562,7 +3257,211 @@ test "parse COPY to glacier" {
         const s = try parseStmt(a, "COPY sales TO 't.glacier'");
         try std.testing.expectEqualStrings("sales", s.copy.query.?.from);
         try std.testing.expect(s.copy.query.?.isStar());
+        try std.testing.expect(s.copy.from_table == null);
     }
+    {
+        const s = try parseStmt(a, "COPY lake.sales.orders FROM '/tmp/sales.parquet'");
+        try std.testing.expectEqualStrings("lake.sales.orders", s.copy.from_table.?);
+        try std.testing.expectEqualStrings("/tmp/sales.parquet", s.copy.path);
+        try std.testing.expect(s.copy.query == null);
+    }
+    {
+        const s = try parseStmt(a, "COPY t FROM 's3://bucket/data.parquet'");
+        try std.testing.expectEqualStrings("t", s.copy.from_table.?);
+        try std.testing.expectEqualStrings("s3://bucket/data.parquet", s.copy.path);
+    }
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "COPY FROM '/tmp/sales.parquet'"));
+}
+
+test "parse SHOW CATALOGS and SHOW TABLES" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const catalogs = try parseStmt(a, "SHOW CATALOGS");
+    try std.testing.expect(catalogs == .show);
+    try std.testing.expect(catalogs.show == .catalogs);
+
+    const tables = try parseStmt(a, "show tables");
+    try std.testing.expect(tables.show == .tables);
+    try std.testing.expect(tables.show.tables.catalog == null);
+
+    const from_cat = try parseStmt(a, "SHOW TABLES FROM files");
+    try std.testing.expectEqualStrings("files", from_cat.show.tables.catalog.?);
+    try std.testing.expect(from_cat.show.tables.namespace == null);
+
+    const from_ns = try parseStmt(a, "SHOW TABLES FROM lake.default");
+    try std.testing.expectEqualStrings("lake", from_ns.show.tables.catalog.?);
+    try std.testing.expectEqualStrings("default", from_ns.show.tables.namespace.?);
+
+    const nss = try parseStmt(a, "SHOW NAMESPACES FROM rest");
+    try std.testing.expect(nss.show == .namespaces);
+    try std.testing.expectEqualStrings("rest", nss.show.namespaces.catalog.?);
+
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "SHOW VIEWS"));
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "SHOW CATALOGS extra"));
+}
+
+test "parse FROM catalog.namespace.table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const q = try parse(a, "SELECT * FROM lake.default.prune");
+    try std.testing.expectEqualStrings("lake.default.prune", q.from);
+    const j = try parse(a, "SELECT * FROM a.ns.t x JOIN b.ns.u y ON x.id = y.id");
+    try std.testing.expectEqualStrings("a.ns.t", j.from);
+    try std.testing.expectEqualStrings("b.ns.u", j.join.?.table);
+}
+
+test "parse ATTACH catalog as name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const simple = try parseStmt(a, "ATTACH 'other.parquet' AS extra");
+    try std.testing.expectEqualStrings("other.parquet", simple.attach.source);
+    try std.testing.expectEqualStrings("extra", simple.attach.name);
+
+    const with_kw = try parseStmt(a, "ATTACH CATALOG '/tmp/x.parquet' AS lake");
+    try std.testing.expectEqualStrings("/tmp/x.parquet", with_kw.attach.source);
+    try std.testing.expectEqualStrings("lake", with_kw.attach.name);
+
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "ATTACH 'x.parquet'"));
+}
+
+test "parse DESCRIBE USE DETACH" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const d1 = try parseStmt(a, "DESCRIBE extra.attached");
+    try std.testing.expectEqualStrings("extra.attached", d1.describe.ident);
+
+    const d2 = try parseStmt(a, "DESCRIBE TABLE lake.default.prune");
+    try std.testing.expectEqualStrings("lake.default.prune", d2.describe.ident);
+
+    const use_one = try parseStmt(a, "USE extra");
+    try std.testing.expectEqualStrings("extra", use_one.use.catalog);
+    try std.testing.expect(use_one.use.namespace == null);
+
+    const use_two = try parseStmt(a, "USE CATALOG lake.default");
+    try std.testing.expectEqualStrings("lake", use_two.use.catalog);
+    try std.testing.expectEqualStrings("default", use_two.use.namespace.?);
+
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "USE lake.default.prune"));
+
+    const det = try parseStmt(a, "DETACH CATALOG extra");
+    try std.testing.expectEqualStrings("extra", det.detach.name);
+
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "DETACH"));
+}
+
+test "parse CREATE INSERT DROP" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ns = try parseStmt(a, "CREATE NAMESPACE lake.sales");
+    try std.testing.expectEqualStrings("lake.sales", ns.create_namespace.ident);
+
+    const schema = try parseStmt(a, "CREATE SCHEMA sales");
+    try std.testing.expectEqualStrings("sales", schema.create_namespace.ident);
+
+    const ct = try parseStmt(a, "CREATE TABLE lake.sales.orders (id BIGINT, category STRING)");
+    try std.testing.expectEqualStrings("lake.sales.orders", ct.create_table.ident);
+    try std.testing.expectEqual(@as(usize, 2), ct.create_table.columns.len);
+    try std.testing.expectEqualStrings("id", ct.create_table.columns[0].name);
+    try std.testing.expectEqualStrings("long", ct.create_table.columns[0].type_name);
+    try std.testing.expectEqualStrings("string", ct.create_table.columns[1].type_name);
+    try std.testing.expect(ct.create_table.as_select == null);
+    try std.testing.expectEqual(@as(usize, 0), ct.create_table.partition_by.len);
+
+    const part = try parseStmt(a, "CREATE TABLE lake.sales.orders (id BIGINT, category STRING) PARTITIONED BY (category)");
+    try std.testing.expectEqual(@as(usize, 1), part.create_table.partition_by.len);
+    try std.testing.expectEqualStrings("category", part.create_table.partition_by[0]);
+
+    const ident_tf = try parseStmt(a, "CREATE TABLE t (id BIGINT, category STRING) PARTITION BY (identity(category))");
+    try std.testing.expectEqualStrings("category", ident_tf.create_table.partition_by[0]);
+
+    const ctas_part = try parseStmt(a, "CREATE TABLE lake.sales.cats PARTITIONED BY (category) AS SELECT category, COUNT(*) AS n FROM orders GROUP BY category");
+    try std.testing.expectEqualStrings("category", ctas_part.create_table.partition_by[0]);
+    try std.testing.expect(ctas_part.create_table.as_select != null);
+
+    try std.testing.expectError(error.UnsupportedPartitionSpec, parseStmt(a, "CREATE TABLE t (id BIGINT) PARTITIONED BY (bucket(4, id))"));
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "CREATE TABLE t (id BIGINT) PARTITIONED BY ()"));
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "CREATE TABLE t (id BIGINT, category STRING) PARTITIONED BY (category, category)"));
+
+    const ctas = try parseStmt(a, "CREATE TABLE lake.sales.cats AS SELECT category, COUNT(*) AS n FROM orders GROUP BY category");
+    try std.testing.expectEqualStrings("lake.sales.cats", ctas.create_table.ident);
+    try std.testing.expect(ctas.create_table.as_select != null);
+    try std.testing.expectEqualStrings("orders", ctas.create_table.as_select.?.from);
+
+    const ins_v = try parseStmt(a, "INSERT INTO lake.sales.orders VALUES (1, 'fruit'), (2, 'veg')");
+    try std.testing.expectEqualStrings("lake.sales.orders", ins_v.insert.ident);
+    try std.testing.expectEqualStrings("", ins_v.insert.query.from);
+
+    const ins_s = try parseStmt(a, "INSERT INTO dest SELECT id FROM src");
+    try std.testing.expectEqualStrings("dest", ins_s.insert.ident);
+    try std.testing.expectEqualStrings("src", ins_s.insert.query.from);
+
+    const drop = try parseStmt(a, "DROP TABLE lake.sales.orders");
+    try std.testing.expectEqualStrings("lake.sales.orders", drop.drop_table.ident);
+
+    const del = try parseStmt(a, "DELETE FROM lake.sales.orders WHERE category = 'fruit'");
+    try std.testing.expectEqualStrings("lake.sales.orders", del.delete.ident);
+    try std.testing.expect(del.delete.where != null);
+
+    const del_all = try parseStmt(a, "DELETE FROM t");
+    try std.testing.expectEqualStrings("t", del_all.delete.ident);
+    try std.testing.expect(del_all.delete.where == null);
+
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "DELETE lake.sales.orders WHERE id = 1"));
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "CREATE VIEW t AS SELECT 1"));
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "INSERT dest VALUES (1)"));
+
+    const upd = try parseStmt(a, "UPDATE lake.sales.orders SET category = 'x' WHERE id = 1");
+    try std.testing.expectEqualStrings("lake.sales.orders", upd.update.ident);
+    try std.testing.expectEqual(@as(usize, 1), upd.update.assignments.len);
+    try std.testing.expectEqualStrings("category", upd.update.assignments[0].column);
+    try std.testing.expect(upd.update.where != null);
+
+    const mer = try parseStmt(a, "MERGE INTO dest d USING src s ON d.id = s.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT");
+    try std.testing.expectEqualStrings("dest", mer.merge.ident);
+    try std.testing.expectEqualStrings("d", mer.merge.alias.?);
+    try std.testing.expectEqualStrings("src", mer.merge.source);
+    try std.testing.expectEqualStrings("s", mer.merge.source_alias.?);
+    try std.testing.expect(mer.merge.matched.? == .delete);
+    try std.testing.expect(mer.merge.not_matched != null);
+
+    const mer_up = try parseStmt(a, "MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN UPDATE SET category = u.category");
+    try std.testing.expect(mer_up.merge.matched.? == .update);
+
+    const alter = try parseStmt(a, "ALTER TABLE lake.sales.orders ADD COLUMN note STRING");
+    try std.testing.expectEqualStrings("lake.sales.orders", alter.alter_table.ident);
+    try std.testing.expectEqualStrings("note", alter.alter_table.column.name);
+    try std.testing.expectEqualStrings("string", alter.alter_table.column.type_name);
+}
+
+test "parse FOR SNAPSHOT and FOR TIMESTAMP AS OF" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const snap = try parse(a, "SELECT * FROM prune FOR SNAPSHOT 1");
+    try std.testing.expectEqualStrings("prune", snap.from);
+    try std.testing.expectEqual(@as(i64, 1), snap.as_of.?.snapshot);
+
+    const snap_as = try parse(a, "SELECT COUNT(*) FROM lake.sales.prune FOR SNAPSHOT AS OF 2");
+    try std.testing.expectEqualStrings("lake.sales.prune", snap_as.from);
+    try std.testing.expectEqual(@as(i64, 2), snap_as.as_of.?.snapshot);
+
+    const ts = try parse(a, "SELECT * FROM prune FOR TIMESTAMP AS OF 1700000000000");
+    try std.testing.expectEqual(@as(i64, 1700000000000), ts.as_of.?.timestamp_ms);
+
+    const ts_str = try parse(a, "SELECT * FROM prune FOR TIMESTAMP AS OF '1700000001000'");
+    try std.testing.expectEqual(@as(i64, 1700000001000), ts_str.as_of.?.timestamp_ms);
+
+    try std.testing.expectError(error.InvalidSyntax, parse(a, "SELECT * FROM (SELECT 1) FOR SNAPSHOT 1"));
 }
 
 test "parse arithmetic and col vs col" {

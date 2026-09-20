@@ -1,7 +1,10 @@
-//! Iceberg REST Catalog, read-only.
+//! Iceberg REST Catalog.
 //!
-//! `GET /v1/config` then `GET /v1/{prefix}/namespaces/{ns}/tables/{table}`.
-//! After `loadTable`, the existing Iceberg reader scans metadata + manifests.
+//! Read: `GET /v1/config` then `loadTable` / list. After `loadTable`, the
+//! Iceberg reader scans metadata + manifests.
+//! Write: `POST` namespace, `POST` table, `POST` `commitTable` (assert snapshot,
+//! 409 if someone wrote first), `DELETE` table. Data files are written to the
+//! table `location`; the catalog owns `metadata.json`.
 //! Auth: none, bearer, OAuth2 client_credentials, catalog SigV4.
 
 const std = @import("std");
@@ -51,6 +54,11 @@ pub const LoadedTable = struct {
     config: Config,
 };
 
+pub const TableIdent = struct {
+    namespace: []const u8,
+    name: []const u8,
+};
+
 pub const Client = struct {
     endpoint: []const u8,
     warehouse: []const u8,
@@ -64,6 +72,7 @@ pub const Client = struct {
     default_namespace: []const u8,
 
     pub fn connect(allocator: std.mem.Allocator, t: Transport, opts: Options) !Client {
+        if (comptime @import("builtin").cpu.arch == .wasm32) return error.RemoteAttachUnsupported;
         const o = resolveOptions(opts);
         const endpoint = try allocator.dupe(u8, std.mem.trimEnd(u8, o.endpoint, "/"));
         const warehouse = try allocator.dupe(u8, o.warehouse);
@@ -136,6 +145,94 @@ pub const Client = struct {
         return try parseLoadTable(allocator, t, body);
     }
 
+    pub fn listTables(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        t: Transport,
+        namespace: []const u8,
+    ) ![]TableIdent {
+        const url = try self.tablesUrl(allocator, namespace);
+        const body = try self.getJson(allocator, t, url);
+        return parseTableList(allocator, body);
+    }
+
+    pub fn listNamespaces(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        t: Transport,
+    ) ![][]const u8 {
+        const url = try self.namespacesUrl(allocator);
+        const body = try self.getJson(allocator, t, url);
+        return parseNamespaceList(allocator, body);
+    }
+
+    pub fn createNamespace(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        t: Transport,
+        namespace: []const u8,
+    ) !void {
+        const url = try self.namespacesUrl(allocator);
+        const body = try namespaceCreateBody(allocator, namespace);
+        _ = try self.sendJson(allocator, t, .POST, url, body);
+    }
+
+    pub fn createTable(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        t: Transport,
+        namespace: []const u8,
+        name: []const u8,
+        fields: []const iceberg.SchemaField,
+        partition_fields: []const iceberg.PartitionField,
+    ) !LoadedTable {
+        const url = try self.tablesUrl(allocator, namespace);
+        const body = try createTableBody(allocator, name, fields, partition_fields);
+        const resp = try self.sendJson(allocator, t, .POST, url, body);
+        return try parseLoadTable(allocator, t, resp);
+    }
+
+    pub fn dropTable(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        t: Transport,
+        namespace: []const u8,
+        name: []const u8,
+    ) !void {
+        const url = try self.tableUrl(allocator, namespace, name);
+        _ = try self.sendJson(allocator, t, .DELETE, url, null);
+    }
+
+    pub fn commitAppend(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        t: Transport,
+        namespace: []const u8,
+        name: []const u8,
+        metadata: iceberg.TableMetadata,
+        appended: iceberg.AppendResult,
+    ) !LoadedTable {
+        const url = try self.tableUrl(allocator, namespace, name);
+        const body = try commitAppendBody(allocator, namespace, name, metadata, appended);
+        const resp = try self.sendJson(allocator, t, .POST, url, body);
+        return try parseLoadTable(allocator, t, resp);
+    }
+
+    pub fn commitAddColumn(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        t: Transport,
+        namespace: []const u8,
+        name: []const u8,
+        metadata: iceberg.TableMetadata,
+        fields: []const iceberg.SchemaField,
+    ) !LoadedTable {
+        const url = try self.tableUrl(allocator, namespace, name);
+        const body = try commitAddColumnBody(allocator, namespace, name, metadata, fields);
+        const resp = try self.sendJson(allocator, t, .POST, url, body);
+        return try parseLoadTable(allocator, t, resp);
+    }
+
     fn configUrl(self: *Client, allocator: std.mem.Allocator) ![]u8 {
         if (self.warehouse.len == 0)
             return std.fmt.allocPrint(allocator, "{s}/v1/config", .{self.endpoint});
@@ -158,6 +255,32 @@ pub const Client = struct {
         defer allocator.free(prefix);
         return std.fmt.allocPrint(allocator, "{s}/v1/{s}/namespaces/{s}/tables/{s}", .{
             self.endpoint, prefix, ns, tbl,
+        });
+    }
+
+    fn tablesUrl(self: *Client, allocator: std.mem.Allocator, namespace: []const u8) ![]u8 {
+        const ns = try encodeNamespace(allocator, namespace);
+        defer allocator.free(ns);
+        if (self.prefix.len == 0) {
+            return std.fmt.allocPrint(allocator, "{s}/v1/namespaces/{s}/tables", .{
+                self.endpoint, ns,
+            });
+        }
+        const prefix = try aws.uriEncode(allocator, self.prefix, false);
+        defer allocator.free(prefix);
+        return std.fmt.allocPrint(allocator, "{s}/v1/{s}/namespaces/{s}/tables", .{
+            self.endpoint, prefix, ns,
+        });
+    }
+
+    fn namespacesUrl(self: *Client, allocator: std.mem.Allocator) ![]u8 {
+        if (self.prefix.len == 0) {
+            return std.fmt.allocPrint(allocator, "{s}/v1/namespaces", .{self.endpoint});
+        }
+        const prefix = try aws.uriEncode(allocator, self.prefix, false);
+        defer allocator.free(prefix);
+        return std.fmt.allocPrint(allocator, "{s}/v1/{s}/namespaces", .{
+            self.endpoint, prefix,
         });
     }
 
@@ -210,6 +333,17 @@ pub const Client = struct {
     }
 
     fn getJson(self: *Client, allocator: std.mem.Allocator, t: Transport, url: []const u8) ![]u8 {
+        return self.sendJson(allocator, t, .GET, url, null);
+    }
+
+    fn sendJson(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        t: Transport,
+        method: std.http.Method,
+        url: []const u8,
+        payload: ?[]const u8,
+    ) ![]u8 {
         var hdrs: [16]std.http.Header = undefined;
         var n: usize = 0;
         var auth_owned: ?[]u8 = null;
@@ -217,11 +351,16 @@ pub const Client = struct {
         var date_buf: [16]u8 = undefined;
         var sig_owned: ?[]u8 = null;
         defer if (sig_owned) |p| allocator.free(p);
+        var hash_buf: [64]u8 = undefined;
 
         hdrs[n] = .{ .name = "accept", .value = "application/json" };
         n += 1;
         hdrs[n] = .{ .name = "X-Iceberg-Access-Delegation", .value = "vended-credentials" };
         n += 1;
+        if (payload != null) {
+            hdrs[n] = .{ .name = "content-type", .value = "application/json" };
+            n += 1;
+        }
         for (self.extra_headers) |h| {
             hdrs[n] = .{ .name = h.name, .value = h.value };
             n += 1;
@@ -237,13 +376,23 @@ pub const Client = struct {
             const creds = self.sigv4_creds orelse return error.AwsCredentialsMissing;
             const amz_date = aws.nowAmzDate(t.io, &date_buf);
             const unsigned_extras = hdrs[0..n];
+            const payload_hash: []const u8 = if (payload) |p| blk: {
+                hash_buf = aws.sha256Hex(p);
+                break :blk &hash_buf;
+            } else aws.empty_payload_hash;
+            const method_s: []const u8 = switch (method) {
+                .GET => "GET",
+                .POST => "POST",
+                .DELETE => "DELETE",
+                else => "GET",
+            };
             const auth = try aws.authorization(allocator, .{
-                .method = "GET",
+                .method = method_s,
                 .host = urlHost(url),
                 .path = urlPath(url),
                 .query = urlQuery(url),
                 .extra_headers = unsigned_extras,
-                .payload_hash = aws.empty_payload_hash,
+                .payload_hash = payload_hash,
                 .amz_date = amz_date,
                 .region = creds.region,
                 .service = self.sigv4_service,
@@ -252,7 +401,7 @@ pub const Client = struct {
             sig_owned = auth;
             hdrs[n] = .{ .name = "x-amz-date", .value = amz_date };
             n += 1;
-            hdrs[n] = .{ .name = "x-amz-content-sha256", .value = aws.empty_payload_hash };
+            hdrs[n] = .{ .name = "x-amz-content-sha256", .value = payload_hash };
             n += 1;
             hdrs[n] = .{ .name = "authorization", .value = auth };
             n += 1;
@@ -262,7 +411,7 @@ pub const Client = struct {
             }
         }
 
-        return fetch(allocator, t, .GET, url, hdrs[0..n], null);
+        return fetch(allocator, t, method, url, hdrs[0..n], payload);
     }
 };
 
@@ -313,6 +462,161 @@ pub fn encodeNamespace(allocator: std.mem.Allocator, ns: []const u8) ![]u8 {
         try out.appendSlice(allocator, enc);
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn jsonEscapeAppend(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            else => try buf.append(allocator, c),
+        }
+    }
+    try buf.append(allocator, '"');
+}
+
+fn appendNamespaceArray(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, namespace: []const u8) !void {
+    try buf.append(allocator, '[');
+    var it = std.mem.splitScalar(u8, namespace, '.');
+    var first = true;
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try jsonEscapeAppend(buf, allocator, part);
+    }
+    try buf.append(allocator, ']');
+}
+
+fn namespaceCreateBody(allocator: std.mem.Allocator, namespace: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"namespace\":");
+    try appendNamespaceArray(&buf, allocator, namespace);
+    try buf.appendSlice(allocator, "}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn createTableBody(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    fields: []const iceberg.SchemaField,
+    partition_fields: []const iceberg.PartitionField,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"name\":");
+    try jsonEscapeAppend(&buf, allocator, name);
+    try buf.appendSlice(allocator, ",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[");
+    for (fields, 0..) |f, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"id\":");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{f.id}));
+        try buf.appendSlice(allocator, ",\"name\":");
+        try jsonEscapeAppend(&buf, allocator, f.name);
+        try buf.appendSlice(allocator, if (f.required) ",\"required\":true,\"type\":" else ",\"required\":false,\"type\":");
+        try jsonEscapeAppend(&buf, allocator, f.type_name);
+        try buf.append(allocator, '}');
+    }
+    try buf.appendSlice(allocator, "]},\"partition-spec\":{\"spec-id\":0,\"fields\":[");
+    for (partition_fields, 0..) |pf, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"source-id\":");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{pf.source_id}));
+        try buf.appendSlice(allocator, ",\"field-id\":");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{pf.field_id}));
+        try buf.appendSlice(allocator, ",\"name\":");
+        try jsonEscapeAppend(&buf, allocator, pf.name);
+        try buf.appendSlice(allocator, ",\"transform\":");
+        try jsonEscapeAppend(&buf, allocator, pf.transform);
+        try buf.append(allocator, '}');
+    }
+    try buf.appendSlice(allocator, "]}}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn commitAppendBody(
+    allocator: std.mem.Allocator,
+    namespace: []const u8,
+    name: []const u8,
+    metadata: iceberg.TableMetadata,
+    appended: iceberg.AppendResult,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"identifier\":{\"namespace\":");
+    try appendNamespaceArray(&buf, allocator, namespace);
+    try buf.appendSlice(allocator, ",\"name\":");
+    try jsonEscapeAppend(&buf, allocator, name);
+    try buf.appendSlice(allocator, "},\"requirements\":[{\"type\":\"assert-table-uuid\",\"uuid\":");
+    try jsonEscapeAppend(&buf, allocator, metadata.table_uuid);
+    try buf.appendSlice(allocator, "},{\"type\":\"assert-ref-snapshot-id\",\"ref\":\"main\",\"snapshot-id\":");
+    if (metadata.current_snapshot_id) |sid| {
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{sid}));
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    const snap = appended.snapshot;
+    try buf.appendSlice(allocator, "}],\"updates\":[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":");
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{snap.snapshot_id}));
+    try buf.appendSlice(allocator, ",\"timestamp-ms\":");
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{snap.timestamp_ms}));
+    try buf.appendSlice(allocator, ",\"sequence-number\":");
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{snap.sequence_number}));
+    try buf.appendSlice(allocator, ",\"schema-id\":");
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{snap.schema_id orelse 0}));
+    try buf.appendSlice(allocator, ",\"manifest-list\":");
+    try jsonEscapeAppend(&buf, allocator, snap.manifest_list);
+    try buf.appendSlice(allocator, ",\"summary\":{\"operation\":");
+    try jsonEscapeAppend(&buf, allocator, appended.operation);
+    try buf.appendSlice(allocator, ",\"added-records\":");
+    try jsonEscapeAppend(&buf, allocator, try std.fmt.allocPrint(allocator, "{d}", .{appended.record_count}));
+    try buf.appendSlice(allocator, "}}},{\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",\"type\":\"branch\",\"snapshot-id\":");
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{snap.snapshot_id}));
+    try buf.appendSlice(allocator, "}]}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn commitAddColumnBody(
+    allocator: std.mem.Allocator,
+    namespace: []const u8,
+    name: []const u8,
+    metadata: iceberg.TableMetadata,
+    fields: []const iceberg.SchemaField,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"identifier\":{\"namespace\":");
+    try appendNamespaceArray(&buf, allocator, namespace);
+    try buf.appendSlice(allocator, ",\"name\":");
+    try jsonEscapeAppend(&buf, allocator, name);
+    try buf.appendSlice(allocator, "},\"requirements\":[{\"type\":\"assert-table-uuid\",\"uuid\":");
+    try jsonEscapeAppend(&buf, allocator, metadata.table_uuid);
+    try buf.appendSlice(allocator, "},{\"type\":\"assert-ref-snapshot-id\",\"ref\":\"main\",\"snapshot-id\":");
+    if (metadata.current_snapshot_id) |sid| {
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{sid}));
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    const schema_id = metadata.current_schema_id + 1;
+    try buf.appendSlice(allocator, "}],\"updates\":[{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"schema-id\":");
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{schema_id}));
+    try buf.appendSlice(allocator, ",\"fields\":[");
+    for (fields, 0..) |f, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"id\":");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{f.id}));
+        try buf.appendSlice(allocator, ",\"name\":");
+        try jsonEscapeAppend(&buf, allocator, f.name);
+        try buf.appendSlice(allocator, if (f.required) ",\"required\":true,\"type\":" else ",\"required\":false,\"type\":");
+        try jsonEscapeAppend(&buf, allocator, f.type_name);
+        try buf.append(allocator, '}');
+    }
+    try buf.appendSlice(allocator, "]}},{\"action\":\"set-current-schema\",\"schema-id\":");
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{schema_id}));
+    try buf.appendSlice(allocator, "}]}");
+    return buf.toOwnedSlice(allocator);
 }
 
 pub fn fileBase(loaded: LoadedTable) []const u8 {
@@ -416,6 +720,81 @@ fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+fn jsonNamespace(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    switch (value) {
+        .string => |s| return allocator.dupe(u8, s),
+        .array => |arr| {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            for (arr.items) |item| {
+                const part = switch (item) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                if (out.items.len > 0) try out.append(allocator, '.');
+                try out.appendSlice(allocator, part);
+            }
+            return out.toOwnedSlice(allocator);
+        },
+        else => return allocator.dupe(u8, ""),
+    }
+}
+
+fn parseTableList(allocator: std.mem.Allocator, body: []const u8) ![]TableIdent {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return &.{},
+    };
+    const ids = root.get("identifiers") orelse return &.{};
+    const arr = switch (ids) {
+        .array => |a| a,
+        else => return &.{},
+    };
+    const out = try allocator.alloc(TableIdent, arr.items.len);
+    var n: usize = 0;
+    for (arr.items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const name = jsonString(obj, "name") orelse continue;
+        const namespace = if (obj.get("namespace")) |v|
+            try jsonNamespace(allocator, v)
+        else
+            try allocator.dupe(u8, "");
+        out[n] = .{
+            .namespace = namespace,
+            .name = try allocator.dupe(u8, name),
+        };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn parseNamespaceList(allocator: std.mem.Allocator, body: []const u8) ![][]const u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return &.{},
+    };
+    const nss = root.get("namespaces") orelse return &.{};
+    const arr = switch (nss) {
+        .array => |a| a,
+        else => return &.{},
+    };
+    const out = try allocator.alloc([]const u8, arr.items.len);
+    var n: usize = 0;
+    for (arr.items) |item| {
+        out[n] = try jsonNamespace(allocator, item);
+        if (out[n].len == 0) continue;
+        n += 1;
+    }
+    return out[0..n];
+}
+
 fn dupeHeaders(allocator: std.mem.Allocator, src: []const Header) ![]Header {
     const out = try allocator.alloc(Header, src.len);
     for (src, 0..) |h, i| {
@@ -458,9 +837,10 @@ fn fetch(
     const body = try aw.toOwnedSlice();
     errdefer allocator.free(body);
     return switch (result.status) {
-        .ok => body,
+        .ok, .created, .no_content => body,
         .unauthorized, .forbidden => error.AccessDenied,
         .not_found => error.TableNotFound,
+        .conflict => error.CommitConflict,
         else => error.RestCatalogFailed,
     };
 }
@@ -509,6 +889,32 @@ test "parseHeaderLine" {
     try std.testing.expectError(error.InvalidHeader, parseHeaderLine("nope"));
 }
 
+test "parseTableList reads identifiers" {
+    const json =
+        \\{"identifiers":[{"namespace":["nyc"],"name":"trips"},{"namespace":["nyc","taxi"],"name":"fares"}]}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ids = try parseTableList(arena.allocator(), json);
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqualStrings("nyc", ids[0].namespace);
+    try std.testing.expectEqualStrings("trips", ids[0].name);
+    try std.testing.expectEqualStrings("nyc.taxi", ids[1].namespace);
+    try std.testing.expectEqualStrings("fares", ids[1].name);
+}
+
+test "parseNamespaceList joins nested namespaces" {
+    const json =
+        \\{"namespaces":[["default"],["nyc","taxi"]]}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nss = try parseNamespaceList(arena.allocator(), json);
+    try std.testing.expectEqual(@as(usize, 2), nss.len);
+    try std.testing.expectEqualStrings("default", nss[0]);
+    try std.testing.expectEqualStrings("nyc.taxi", nss[1]);
+}
+
 test "parseConfig reads vended s3 and gcs keys" {
     const json =
         \\{"s3.access-key-id":"AKIA","s3.secret-access-key":"s","gcs.oauth2.token":"ya29","prefix":"cat"}
@@ -521,4 +927,20 @@ test "parseConfig reads vended s3 and gcs keys" {
     try std.testing.expectEqualStrings("AKIA", cfg.s3_access_key_id.?);
     try std.testing.expectEqualStrings("ya29", cfg.gcs_token.?);
     try std.testing.expectEqualStrings("cat", cfg.prefix);
+}
+
+test "Client.connect refuses remote ATTACH on wasm32" {
+    if (@import("builtin").cpu.arch != .wasm32) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var http: std.http.Client = undefined;
+    const t = Transport{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .http = &http,
+    };
+    try std.testing.expectError(
+        error.RemoteAttachUnsupported,
+        Client.connect(arena.allocator(), t, .{ .endpoint = "http://127.0.0.1" }),
+    );
 }

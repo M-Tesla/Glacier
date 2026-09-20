@@ -118,4 +118,80 @@ pub const Batch = struct {
         for (copy.columns) |*col| col.len = keep;
         return copy;
     }
+
+    pub fn gather(self: Batch, allocator: std.mem.Allocator, idx: []const usize) !Batch {
+        const columns = try allocator.alloc(Column, self.columns.len);
+        for (self.columns, 0..) |src, ci| {
+            columns[ci] = try gatherColumn(allocator, src, idx);
+        }
+        return .{ .columns = columns, .len = idx.len };
+    }
 };
+
+fn gatherColumn(allocator: std.mem.Allocator, src: Column, idx: []const usize) !Column {
+    var dst: Column = .{
+        .name = src.name,
+        .data_type = src.data_type,
+        .len = idx.len,
+        .decimal_precision = src.decimal_precision,
+        .decimal_scale = src.decimal_scale,
+    };
+    switch (src.data_type) {
+        .boolean => {
+            dst.bools = try allocator.alloc(u8, idx.len);
+            for (idx, 0..) |row, i| dst.bools[i] = src.bools[row];
+        },
+        .int32 => {
+            dst.i32s = try allocator.alloc(i32, idx.len);
+            for (idx, 0..) |row, i| dst.i32s[i] = src.i32s[row];
+        },
+        .int64, .timestamp, .timestamptz => {
+            dst.i64s = try allocator.alloc(i64, idx.len);
+            for (idx, 0..) |row, i| dst.i64s[i] = src.i64s[row];
+        },
+        .float32 => {
+            dst.f32s = try allocator.alloc(f32, idx.len);
+            for (idx, 0..) |row, i| dst.f32s[i] = src.f32s[row];
+        },
+        .float64 => {
+            dst.f64s = try allocator.alloc(f64, idx.len);
+            for (idx, 0..) |row, i| dst.f64s[i] = src.f64s[row];
+        },
+        .utf8 => {
+            var nbytes: usize = 0;
+            for (idx) |row| nbytes += src.strAt(row).len;
+            const bytes = try allocator.alloc(u8, nbytes);
+            const offsets = try allocator.alloc(u32, idx.len + 1);
+            var off: u32 = 0;
+            for (idx, 0..) |row, i| {
+                offsets[i] = off;
+                const s = src.strAt(row);
+                if (s.len > 0) @memcpy(bytes[off..][0..s.len], s);
+                off += @intCast(s.len);
+            }
+            offsets[idx.len] = off;
+            dst.utf8 = .{ .offsets = offsets, .bytes = bytes };
+        },
+        .uuid => {
+            dst.uuids = try allocator.alloc([16]u8, idx.len);
+            for (idx, 0..) |row, i| dst.uuids[i] = src.uuids[row];
+        },
+        .decimal128 => {
+            dst.i128s = try allocator.alloc(i128, idx.len);
+            for (idx, 0..) |row, i| dst.i128s[i] = src.i128s[row];
+        },
+    }
+    if (src.valid.len > 0) {
+        const valid = try allocator.alloc(u8, idx.len);
+        var any_null = false;
+        for (idx, 0..) |row, i| {
+            valid[i] = src.valid[row];
+            if (valid[i] == 0) any_null = true;
+        }
+        dst.valid = if (any_null) valid else blk: {
+            allocator.free(valid);
+            break :blk &.{};
+        };
+    }
+    return dst;
+}

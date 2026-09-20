@@ -55,13 +55,25 @@ typedef struct GlacierResult GlacierResult;
  * glacier_open / glacier_connect: on failure return NULL and set *err (caller glacier_free).
  * glacier_query: NULL only for missing args / OOM (then *err is set). SQL and engine errors
  * return a Result; check glacier_result_error (owned by the Result, do not glacier_free).
+ *
+ * A database is a catalog session. glacier_open(path) is the shortcut:
+ * NULL = empty session (SELECT 1; ATTACH more catalogs with SQL);
+ * a parquet / avro / .glacier / Iceberg dir / Hadoop warehouse = one default catalog;
+ * http(s):// that is not a data file = Iceberg REST Catalog (token from ICEBERG_TOKEN).
+ * glacier_open_catalog sets URI / warehouse / token without env.
  */
-/* path NULL = empty session (SELECT 1; attach bytes with glacier_open_buffer). */
 GlacierDatabase *glacier_open(const char *path, char **err);
 void glacier_close(GlacierDatabase *db);
 
 /* Copy `n` bytes and open as a parquet table. */
 GlacierDatabase *glacier_open_buffer(const void *buf, size_t n, char **err);
+
+/* Iceberg REST Catalog. uri is required. warehouse and token may be NULL or "". */
+GlacierDatabase *glacier_open_catalog(
+    const char *uri,
+    const char *warehouse,
+    const char *token,
+    char **err);
 
 /* Sized heap for WASM (JS copies a Uint8Array into linear memory). */
 void *glacier_malloc(size_t n);

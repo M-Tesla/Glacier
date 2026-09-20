@@ -25,13 +25,41 @@ def api_version() -> int:
 
 
 def connect(path: Union[str, Path, None] = None) -> "Connection":
-    """Open a parquet / avro / Iceberg path, or an empty session (`SELECT 1`)."""
+    """Open a catalog session.
+
+    ``None`` is empty (``SELECT 1``, then ``ATTACH``). A parquet / avro /
+    ``.glacier`` / Iceberg dir / Hadoop warehouse is the default catalog.
+    An ``http(s)://`` URI that is not a data file is an Iceberg REST Catalog
+    (bearer from ``ICEBERG_TOKEN``). Token and warehouse without env:
+    :func:`connect_catalog`.
+    """
     lib = _native.load()
     err = ctypes.c_char_p()
     if path is None:
         db = lib.glacier_open(None, ctypes.byref(err))
     else:
         db = lib.glacier_open(str(path).encode("utf-8"), ctypes.byref(err))
+    return _finish_open(lib, db, err)
+
+
+def connect_catalog(
+    uri: str,
+    warehouse: str = "",
+    token: Optional[str] = None,
+) -> "Connection":
+    """Open an Iceberg REST Catalog (URI, optional warehouse, optional bearer)."""
+    lib = _native.load()
+    err = ctypes.c_char_p()
+    db = lib.glacier_open_catalog(
+        uri.encode("utf-8"),
+        warehouse.encode("utf-8") if warehouse else None,
+        token.encode("utf-8") if token else None,
+        ctypes.byref(err),
+    )
+    return _finish_open(lib, db, err)
+
+
+def _finish_open(lib, db, err: ctypes.c_char_p) -> "Connection":
     if not db:
         msg = err.value.decode("utf-8") if err.value else "open failed"
         if err:

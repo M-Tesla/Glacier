@@ -1,16 +1,18 @@
-//! Glacier CLI — Session client. No Parquet/Iceberg decode here.
+//! Glacier CLI. Session client. No Parquet/Iceberg decode here.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const glacier = @import("glacier");
+const flight_server = @import("flight_server");
 
 const usage_text =
     \\usage: glacier [options] [path]
     \\
-    \\  path              parquet, avro, .glacier, iceberg dir, s3://, gs://, or http(s)://
+    \\  path              parquet, avro, .glacier, iceberg dir, Hadoop warehouse,
+    \\                    s3://, gs://, http(s):// file, or Iceberg REST URI
     \\                    with --catalog: default table (namespace.table)
     \\                    omitted: TUI source picker (local / S3 / HTTP / empty)
-    \\  --catalog URL     Iceberg REST Catalog (read-only)
+    \\  --catalog URL     Iceberg REST Catalog
     \\  --warehouse NAME  warehouse query for GET /v1/config
     \\  --token TOKEN     bearer token (or ICEBERG_TOKEN)
     \\  --header 'N: v'   extra catalog header (repeatable)
@@ -19,9 +21,17 @@ const usage_text =
     \\  --sigv4-service   glue (default) or s3tables
     \\  --namespace NS    default namespace (default)
     \\  -c, --command SQL run SQL and exit (repeatable)
+    \\                    SHOW / ATTACH / DESCRIBE / USE / DETACH work as catalog SQL
+    \\                    CREATE / INSERT / COPY FROM / DELETE / UPDATE / MERGE / ALTER ADD COLUMN / DROP / PARTITIONED BY identity on glacier, Hadoop, REST
+    \\                    FROM glacier.catalogs / glacier.tables / glacier.snapshots / glacier.files
     \\  --timer           print wall time + peak RSS after each query (default)
     \\  --no-timer        hide stats
     \\  --no-tui          line REPL instead of full-screen TUI
+    \\  serve [warehouse] Iceberg REST Catalog on 127.0.0.1:8181 and Arrow Flight SQL
+    \\                    on 127.0.0.1:8815 (native catalog; not in WASM or the wheel)
+    \\  --listen HOST:PORT  REST bind (localhost only without TLS)
+    \\  --flight HOST:PORT  Flight SQL bind, grpc:// (localhost only without TLS)
+
     \\  -h, --help        this help
     \\  -v, --version     print version
     \\
@@ -49,6 +59,9 @@ const Args = struct {
     tui: bool = true,
     help: bool = false,
     version: bool = false,
+    serve: bool = false,
+    listen: []const u8 = "127.0.0.1:8181",
+    flight: []const u8 = "127.0.0.1:8815",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -88,6 +101,18 @@ pub fn main(init: std.process.Init) !void {
     if (args.version) {
         try out.print("glacier {s}\n", .{glacier.version});
         try out.flush();
+        return;
+    }
+    if (args.serve) {
+        const warehouse = args.path orelse ".";
+        flight_server.run(gpa, io, warehouse, args.listen, args.flight, out) catch |err| {
+            switch (err) {
+                error.TlsRequired => try out.print("glacier serve: bind outside localhost needs TLS\n", .{}),
+                error.InvalidAddress => try out.print("glacier serve: invalid --listen / --flight\n", .{}),
+                else => try out.print("glacier serve failed: {s}\n", .{glacier.err.staticMessage(err)}),
+            }
+            die(out);
+        };
         return;
     }
 
@@ -208,6 +233,10 @@ fn runLineRepl(session: *glacier.Session, ctx: *RunCtx) !void {
 const welcome_text =
     \\
     \\  Type SQL and press Enter.
+    \\
+    \\  SHOW / ATTACH / glacier.catalogs / glacier.tables
+    \\  CREATE / INSERT / COPY FROM / DELETE / DROP / PARTITIONED BY on glacier, Hadoop, or REST
+    \\  Iceberg: glacier.snapshots / glacier.files / t.snapshots
     \\
     \\  Tab            expand / fold the selected cell
     \\  ↑↓ ←→          pick row / column (scroll when expanded)
@@ -1904,8 +1933,18 @@ fn parseArgs(
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
             out.namespace = argv[i];
+        } else if (eql(a, "--listen")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.listen = argv[i];
+        } else if (eql(a, "--flight")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.flight = argv[i];
         } else if (a.len > 0 and a[0] == '-' and !std.mem.eql(u8, a, "-")) {
             return error.UnknownOption;
+        } else if (eql(a, "serve") and !out.serve and out.path == null) {
+            out.serve = true;
         } else {
             if (out.path != null) return error.ExtraPath;
             out.path = a;
@@ -2156,13 +2195,13 @@ test "parseArgs REST catalog flags" {
     var hdrs: std.ArrayList([]const u8) = .empty;
     defer hdrs.deinit(gpa);
     const a = try parseArgs(&.{
-        "--catalog", "http://127.0.0.1:8181",
-        "--warehouse", "s3://wh",
-        "--token", "t",
-        "--header", "X-Goog-User-Project: p",
-        "--auth", "bearer",
-        "default.prune",
-        "-c", "SELECT COUNT(*)",
+        "--catalog",       "http://127.0.0.1:8181",
+        "--warehouse",     "s3://wh",
+        "--token",         "t",
+        "--header",        "X-Goog-User-Project: p",
+        "--auth",          "bearer",
+        "default.prune",   "-c",
+        "SELECT COUNT(*)",
     }, &cmds, &hdrs, gpa);
     try std.testing.expectEqualStrings("http://127.0.0.1:8181", a.catalog.?);
     try std.testing.expectEqualStrings("s3://wh", a.warehouse);
@@ -2170,6 +2209,19 @@ test "parseArgs REST catalog flags" {
     try std.testing.expectEqual(@as(usize, 1), a.headers.len);
     try std.testing.expectEqual(glacier.rest_catalog.Auth.bearer, a.auth);
     try std.testing.expectEqualStrings("default.prune", a.path.?);
+}
+
+test "parseArgs serve warehouse and listen" {
+    const gpa = std.testing.allocator;
+    var cmds: std.ArrayList([]const u8) = .empty;
+    defer cmds.deinit(gpa);
+    var hdrs: std.ArrayList([]const u8) = .empty;
+    defer hdrs.deinit(gpa);
+    const a = try parseArgs(&.{ "serve", "/tmp/wh", "--listen", "127.0.0.1:0", "--flight", "127.0.0.1:0" }, &cmds, &hdrs, gpa);
+    try std.testing.expect(a.serve);
+    try std.testing.expectEqualStrings("/tmp/wh", a.path.?);
+    try std.testing.expectEqualStrings("127.0.0.1:0", a.listen);
+    try std.testing.expectEqualStrings("127.0.0.1:0", a.flight);
 }
 
 test "splitStatements trims and skips empty" {

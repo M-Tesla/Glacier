@@ -25,6 +25,12 @@ con.execute("select 1").fetchall()  # [(1,)]
 
 con = glacier.connect("tests/formats/sales.parquet")
 con.execute("SELECT category, COUNT(*) AS n GROUP BY category").fetchall()
+con.execute("SELECT * FROM glacier.catalogs").fetchall()
+# glacier.connect("http://127.0.0.1:8181")  # Iceberg REST; CREATE/INSERT (commitTable; PUT to s3:// or gs://)
+# glacier.connect_catalog(uri, warehouse="lake", token="…")
+# ATTACH an empty dir, then CREATE TABLE / INSERT / COPY FROM / DELETE / UPDATE / MERGE / ALTER (Iceberg commit)
+# CLI: glacier serve /warehouse --listen 127.0.0.1:8181 --flight 127.0.0.1:8815
+# Iceberg REST catalog + Arrow Flight SQL query port; not in the wheel
 
 con.read_parquet(Path("tests/formats/sales.parquet").read_bytes()).fetchall()
 table = con.execute("SELECT *").arrow()  # pyarrow

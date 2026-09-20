@@ -49,7 +49,11 @@ pub fn codeOf(err: anyerror) Code {
         error.AvroOpenFailed, error.AvroWriteFailed => .avro,
         error.InvalidNativeFile => .io,
         error.InvalidMetadata, error.SnapshotNotFound, error.SchemaNotFound, error.ManifestsNeedAvro => .iceberg,
-        error.RestCatalogFailed, error.OauthFailed, error.InvalidHeader => .iceberg,
+        error.RestCatalogFailed, error.OauthFailed, error.InvalidHeader, error.CommitConflict => .iceberg,
+        error.RemoteAttachUnsupported => .unsupported_sql,
+        error.WriteUnsupported => .unsupported_sql,
+        error.TlsRequired => .unsupported_sql,
+        error.ObjectPutFailed => .io,
         error.AwsCredentialsMissing, error.InvalidGsUrl => .io,
         else => .io,
     };
@@ -87,6 +91,11 @@ pub fn staticMessage(err: anyerror) []const u8 {
         error.AwsCredentialsMissing => "AWS credentials not found",
         error.InvalidGsUrl => "invalid gs:// URL",
         error.RestCatalogFailed => "Iceberg REST catalog request failed",
+        error.CommitConflict => "Iceberg REST catalog rejected the commit (conflict)",
+        error.RemoteAttachUnsupported => "remote ATTACH is not supported in WASM",
+        error.WriteUnsupported => "this catalog does not support writes",
+        error.TlsRequired => "public Iceberg REST bind needs TLS",
+        error.ObjectPutFailed => "failed to PUT object",
         error.OauthFailed => "OAuth token request failed",
         error.InvalidHeader => "invalid HTTP header",
         error.HttpRedirectLocationOversize => "HTTP redirect URL is too long",
@@ -125,5 +134,9 @@ test "Iceberg unsupported features map to messages" {
     try std.testing.expectEqualStrings(
         "nested Parquet types are not supported",
         GlacierError.fromZig(error.UnsupportedNested).message,
+    );
+    try std.testing.expectEqualStrings(
+        "remote ATTACH is not supported in WASM",
+        GlacierError.fromZig(error.RemoteAttachUnsupported).message,
     );
 }

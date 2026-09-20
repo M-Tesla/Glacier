@@ -202,6 +202,45 @@ GLACIER_INTERNAL int glacier_carquet_column_logical(void *reader, int32_t index,
     return 0;
 }
 
+typedef struct glacier_col_stats {
+    int32_t has_min_max;
+    int32_t has_null_count;
+    int64_t null_count;
+    int64_t num_values;
+    int32_t min_len;
+    int32_t max_len;
+    uint8_t min_bytes[32];
+    uint8_t max_bytes[32];
+} glacier_col_stats_t;
+
+GLACIER_INTERNAL int glacier_carquet_column_stats(
+    void *reader,
+    int32_t row_group,
+    int32_t column,
+    glacier_col_stats_t *out
+) {
+    if (!reader || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    carquet_column_statistics_t st;
+    if (carquet_reader_column_statistics((carquet_reader_t *)reader, row_group, column, &st) != CARQUET_OK)
+        return -1;
+    out->has_min_max = st.has_min_max ? 1 : 0;
+    out->has_null_count = st.has_null_count ? 1 : 0;
+    out->null_count = st.null_count;
+    out->num_values = st.num_values;
+    if (st.has_min_max && st.min_value && st.min_value_size > 0) {
+        const int32_t n = st.min_value_size < 32 ? st.min_value_size : 32;
+        memcpy(out->min_bytes, st.min_value, (size_t)n);
+        out->min_len = n;
+    }
+    if (st.has_min_max && st.max_value && st.max_value_size > 0) {
+        const int32_t n = st.max_value_size < 32 ? st.max_value_size : 32;
+        memcpy(out->max_bytes, st.max_value, (size_t)n);
+        out->max_len = n;
+    }
+    return 0;
+}
+
 GLACIER_INTERNAL int glacier_carquet_write_i64_fixture(const char *path, int compression) {
     carquet_error_t err = CARQUET_ERROR_INIT;
     carquet_schema_t *schema = carquet_schema_create(&err);
@@ -824,6 +863,105 @@ GLACIER_INTERNAL int glacier_carquet_write_struct_fixture(const char *path) {
         carquet_writer_write_batch(writer, 1, city_ba, 2, NULL, NULL) != CARQUET_OK) {
         (void)carquet_writer_close(writer);
         return -1;
+    }
+    return carquet_writer_close(writer) == CARQUET_OK ? 0 : -1;
+}
+
+typedef struct glacier_write_col {
+    const char *name;
+    int32_t physical;
+    int32_t logical;
+    const void *values;
+    const uint32_t *utf8_offsets;
+    const uint8_t *utf8_bytes;
+    int64_t n_rows;
+} glacier_write_col_t;
+
+GLACIER_INTERNAL int glacier_carquet_write_columns(
+    const char *path,
+    const glacier_write_col_t *cols,
+    int32_t n_cols
+) {
+    if (!path || !cols || n_cols <= 0) return -1;
+    const int64_t n = cols[0].n_rows;
+    if (n <= 0) return -1;
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t *schema = carquet_schema_create(&err);
+    if (!schema) return -1;
+
+    for (int32_t i = 0; i < n_cols; i++) {
+        if (!cols[i].name || cols[i].n_rows != n) {
+            carquet_schema_free(schema);
+            return -1;
+        }
+        carquet_logical_type_t lt = {0};
+        const carquet_logical_type_t *ltp = NULL;
+        if (cols[i].logical == CARQUET_LOGICAL_STRING) {
+            lt.id = CARQUET_LOGICAL_STRING;
+            ltp = &lt;
+        }
+        if (carquet_schema_add_column(
+                schema,
+                cols[i].name,
+                (carquet_physical_type_t)cols[i].physical,
+                ltp,
+                CARQUET_REPETITION_REQUIRED,
+                0,
+                0) != CARQUET_OK) {
+            carquet_schema_free(schema);
+            return -1;
+        }
+    }
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_SNAPPY;
+    opts.write_crc = false;
+    opts.write_page_index = false;
+    opts.write_bloom_filters = false;
+    opts.write_statistics = true;
+
+    carquet_writer_t *writer = carquet_writer_create(path, schema, &opts, &err);
+    carquet_schema_free(schema);
+    if (!writer) return -1;
+
+    for (int32_t i = 0; i < n_cols; i++) {
+        const glacier_write_col_t *col = &cols[i];
+        carquet_byte_array_t *bas = NULL;
+        const void *values = col->values;
+        if (col->physical == CARQUET_PHYSICAL_BYTE_ARRAY) {
+            if (!col->utf8_offsets) {
+                (void)carquet_writer_close(writer);
+                return -1;
+            }
+            bas = malloc((size_t)n * sizeof(*bas));
+            if (!bas) {
+                (void)carquet_writer_close(writer);
+                return -1;
+            }
+            for (int64_t r = 0; r < n; r++) {
+                const uint32_t start = col->utf8_offsets[r];
+                const uint32_t end = col->utf8_offsets[r + 1];
+                bas[r].length = (int32_t)(end - start);
+                if (bas[r].length > 0 && col->utf8_bytes) {
+                    bas[r].data = (uint8_t *)(col->utf8_bytes + start);
+                } else {
+                    bas[r].data = (uint8_t *)"";
+                    bas[r].length = 0;
+                }
+            }
+            values = bas;
+        } else if (!values) {
+            (void)carquet_writer_close(writer);
+            return -1;
+        }
+        const carquet_status_t st = carquet_writer_write_batch(writer, i, values, n, NULL, NULL);
+        free(bas);
+        if (st != CARQUET_OK) {
+            (void)carquet_writer_close(writer);
+            return -1;
+        }
     }
     return carquet_writer_close(writer) == CARQUET_OK ? 0 : -1;
 }

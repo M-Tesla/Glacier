@@ -1,4 +1,4 @@
-//! FileSource — the only I/O type format readers talk to.
+//! FileSource: the only I/O type format readers talk to.
 //!
 //! Backends: `Io.File`, `File.MemoryMap`, borrowed memory, HTTP Range
 //! (`std.http.Client`). S3 is HTTP + SigV4. GCS `gs://` is HTTPS + Bearer.
@@ -575,6 +575,143 @@ pub fn joinLocation(allocator: std.mem.Allocator, base: []const u8, rel: []const
     return std.fs.path.join(allocator, &.{ base, rest });
 }
 
+fn stripFileScheme(path: []const u8) []const u8 {
+    if (std.ascii.startsWithIgnoreCase(path, "file://")) return path["file://".len..];
+    return path;
+}
+
+/// Local `createFile`, or a single HTTP PUT for `s3://` (SigV4) / `gs://` (Bearer).
+/// No multipart. `http(s)://` destinations are refused.
+pub fn putLocation(t: Transport, path: []const u8, bytes: []const u8) !void {
+    const loc = stripFileScheme(path);
+    if (aws.isS3(loc)) return putS3(t, loc, bytes);
+    if (aws.isGs(loc)) return putGs(t, loc, bytes);
+    if (aws.isHttp(loc)) return error.WriteUnsupported;
+    try putLocal(t.io, loc, bytes);
+}
+
+fn putLocal(io: Io, path: []const u8, bytes: []const u8) !void {
+    if (std.fs.path.dirname(path)) |d| {
+        if (d.len > 0) try Io.Dir.cwd().createDirPath(io, d);
+    }
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+}
+
+fn putS3(t: Transport, path: []const u8, bytes: []const u8) !void {
+    if (t.s3_creds) |creds| {
+        const resolved = aws.Credentials{
+            .access_key = creds.access_key,
+            .secret_key = creds.secret_key,
+            .session_token = creds.session_token,
+            .region = t.s3_region orelse creds.region,
+        };
+        return putS3Resolved(t, path, resolved, t.s3_endpoint, bytes);
+    }
+    const creds = try aws.loadCredentials(t.allocator, t.io);
+    defer {
+        t.allocator.free(creds.access_key);
+        t.allocator.free(creds.secret_key);
+        if (creds.session_token) |tok| t.allocator.free(tok);
+        t.allocator.free(creds.region);
+    }
+    var env_ep: ?[]u8 = null;
+    defer if (env_ep) |e| t.allocator.free(e);
+    const endpoint: ?[]const u8 = if (t.s3_endpoint) |e| e else blk: {
+        env_ep = aws.endpointFromEnv(t.allocator);
+        break :blk env_ep;
+    };
+    const resolved = aws.Credentials{
+        .access_key = creds.access_key,
+        .secret_key = creds.secret_key,
+        .session_token = creds.session_token,
+        .region = t.s3_region orelse creds.region,
+    };
+    return putS3Resolved(t, path, resolved, endpoint, bytes);
+}
+
+fn putS3Resolved(
+    t: Transport,
+    path: []const u8,
+    creds: aws.Credentials,
+    endpoint: ?[]const u8,
+    bytes: []const u8,
+) !void {
+    const loc = try aws.parseS3(path);
+    const url = try aws.httpUrlForS3(t.allocator, loc, creds.region, endpoint);
+    defer t.allocator.free(url);
+    var hash_buf = aws.sha256Hex(bytes);
+    var date_buf: [16]u8 = undefined;
+    const amz_date = aws.nowAmzDate(t.io, &date_buf);
+    const auth = try aws.authorization(t.allocator, .{
+        .method = "PUT",
+        .host = urlHost(url),
+        .path = urlPath(url),
+        .query = urlQuery(url),
+        .payload_hash = &hash_buf,
+        .amz_date = amz_date,
+        .region = creds.region,
+        .creds = creds,
+    });
+    defer t.allocator.free(auth);
+    var hdrs: [8]std.http.Header = undefined;
+    var n: usize = 0;
+    hdrs[n] = .{ .name = "x-amz-date", .value = amz_date };
+    n += 1;
+    hdrs[n] = .{ .name = "x-amz-content-sha256", .value = &hash_buf };
+    n += 1;
+    hdrs[n] = .{ .name = "authorization", .value = auth };
+    n += 1;
+    if (creds.session_token) |tok| {
+        hdrs[n] = .{ .name = "x-amz-security-token", .value = tok };
+        n += 1;
+    }
+    try putHttp(t, url, hdrs[0..n], bytes);
+}
+
+fn putGs(t: Transport, path: []const u8, bytes: []const u8) !void {
+    const token = gcsToken(t) orelse return error.AccessDenied;
+    const loc = try aws.parseGs(path);
+    const url = try aws.httpUrlForGs(t.allocator, loc);
+    defer t.allocator.free(url);
+    const auth = try std.fmt.allocPrint(t.allocator, "Bearer {s}", .{token});
+    defer t.allocator.free(auth);
+    var hdrs: [4]std.http.Header = undefined;
+    var n: usize = 0;
+    hdrs[n] = .{ .name = "authorization", .value = auth };
+    n += 1;
+    if (t.gcs_user_project) |proj| {
+        if (proj.len > 0) {
+            hdrs[n] = .{ .name = "x-goog-user-project", .value = proj };
+            n += 1;
+        }
+    }
+    try putHttp(t, url, hdrs[0..n], bytes);
+}
+
+fn putHttp(
+    t: Transport,
+    url: []const u8,
+    extra_headers: []const std.http.Header,
+    bytes: []const u8,
+) !void {
+    var aw: std.Io.Writer.Allocating = .init(t.allocator);
+    defer aw.deinit();
+    const result = t.http.fetch(.{
+        .location = .{ .url = url },
+        .method = .PUT,
+        .payload = bytes,
+        .extra_headers = extra_headers,
+        .response_writer = &aw.writer,
+        .keep_alive = false,
+        .headers = .{ .accept_encoding = .omit },
+    }) catch return error.ObjectPutFailed;
+    switch (result.status) {
+        .ok, .created, .no_content => {},
+        .unauthorized, .forbidden => return error.AccessDenied,
+        else => return error.ObjectPutFailed,
+    }
+}
+
 test "fromMemory round-trips bytes" {
     const bytes = "hello glacier";
     var src = FileSource.fromMemory(bytes);
@@ -758,6 +895,27 @@ test "joinLocation keeps s3 and http schemes" {
     const gs = try joinLocation(a, "gs://lake/table", "data/part.parquet");
     defer a.free(gs);
     try std.testing.expectEqualStrings("gs://lake/table/data/part.parquet", gs);
+}
+
+test "putLocation writes a local file" {
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    const t = Transport{ .allocator = gpa, .io = io, .http = &client };
+    const path = "/tmp/glacier_put_local/dir/obj.bin";
+    std.Io.Dir.cwd().deleteTree(io, "/tmp/glacier_put_local") catch {};
+    try putLocation(t, path, "hello-put");
+    var src = try FileSource.openPath(io, path);
+    defer src.close();
+    const got = try src.readAll(gpa);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("hello-put", got);
 }
 
 test "S3 SigV4 Range GET against path-style mock" {
