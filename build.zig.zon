@@ -1,6 +1,6 @@
 .{
     .name = .glacier,
-    .version = "0.2.1",
+    .version = "0.6.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xc00d1b7971b42ef4,
     // Compile source is vendor/ (jansson config headers are hand-filled; nanoarrow
@@ -26,6 +26,11 @@
         .zstd = .{
             .url = "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz",
             .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
+        },
+        .dvui = .{
+            .url = "git+https://github.com/david-vanderson/dvui?ref=main#e5718eb8ecf5babc5311d7494f1cb2de1457ac2f",
+            .hash = "dvui-0.5.0-dev-AQFJmXOKAwHIwYXUv3KNj6Q3hqJUb3v5gLfdhQDXriru",
+            .lazy = true,
         },
     },
     .paths = .{

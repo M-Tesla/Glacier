@@ -53,7 +53,7 @@ jobs:
 
       - name: fmt
         if: runner.os == 'Linux'
-        run: zig fmt --check build.zig glacier_repl.zig src tools
+        run: zig fmt --check build.zig glacier_repl.zig glacier_ui.zig src tools
 
   wasm:
     runs-on: ubuntu-latest

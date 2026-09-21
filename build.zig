@@ -51,6 +51,35 @@ pub fn build(b: *std.Build) void {
     });
     if (!lib_only) b.installArtifact(repl);
 
+    const with_ui = b.option(bool, "ui", "Build glacier-ui (dvui + SDL3 Linux prototype)") orelse false;
+    if (with_ui and !lib_only and target.result.cpu.arch != .wasm32) {
+        if (b.lazyDependency("dvui", .{
+            .target = target,
+            .optimize = optimize,
+            .backend = .sdl3,
+            .@"tree-sitter" = false,
+        })) |dvui_dep| {
+            const ui = b.addExecutable(.{
+                .name = "glacier-ui",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("glacier_ui.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                    .imports = &.{
+                        .{ .name = "glacier", .module = glacier_mod },
+                        .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
+                    },
+                }),
+            });
+            if (optimize != .Debug) ui.root_module.strip = true;
+            b.installArtifact(ui);
+            const run_ui = b.addRunArtifact(ui);
+            if (b.args) |args| run_ui.addArgs(args);
+            b.step("run-ui", "Run glacier-ui (needs -Dui)").dependOn(&run_ui.step);
+        }
+    }
+
     const info = b.addExecutable(.{
         .name = "parquet-info",
         .root_module = b.createModule(.{

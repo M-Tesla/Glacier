@@ -243,7 +243,7 @@ pub export fn glacier_free(p: ?*anyopaque) callconv(.c) void {
 }
 
 pub export fn glacier_version() callconv(.c) [*:0]const u8 {
-    return "0.2.1";
+    return "0.6.0";
 }
 
 pub export fn glacier_api_version() callconv(.c) c_int {
@@ -306,7 +306,7 @@ test "C ABI executes arbitrary SQL not a hardcoded select" {
     defer glacier_close(db);
     _ = glacier_connect(db, &err) orelse return error.ConnectFailed;
 
-    try std.testing.expectEqualStrings("0.2.1", std.mem.span(glacier_version()));
+    try std.testing.expectEqualStrings("0.6.0", std.mem.span(glacier_version()));
     try std.testing.expectEqual(@as(c_int, 1), glacier_api_version());
 
     {

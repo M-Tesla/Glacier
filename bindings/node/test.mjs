@@ -9,7 +9,7 @@ const glacier = require("./index.js");
 const here = dirname(fileURLToPath(import.meta.url));
 const sales = join(here, "../../tests/formats/sales.parquet");
 
-assert.equal(glacier.version(), "0.2.1");
+assert.equal(glacier.version(), "0.6.0");
 assert.equal(glacier.apiVersion(), 1);
 
 const empty = glacier.connect();

@@ -7,8 +7,8 @@
 [![Zig Version](https://img.shields.io/badge/zig-0.16.0-orange.svg)](https://ziglang.org/)
 [![CI](https://github.com/M-Tesla/Glacier/actions/workflows/ci.yml/badge.svg)](https://github.com/M-Tesla/Glacier/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/status-0.2-blue.svg)]()
-[![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)]()
+[![Status](https://img.shields.io/badge/status-0.6-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)]()
 
 </div>
 
@@ -16,7 +16,7 @@ Glacier is an OLAP engine. A connection is a session of named catalogs (a Parque
 
 The query engine is Zig 0.16. Parquet, Avro, and in-memory Arrow are small C libraries (carquet, libavro, nanoarrow), not a from-scratch codec stack.
 
-`glacier.version()` is still **0.2.1**. That is the engine/wheel number so `glacier.api_version()` can stay `1` and a file path remains a one-catalog shortcut. This tree also has the 0.3, 0.4, and 0.5 product slices (catalog session, writes through the catalog, `glacier serve`). It was built and tested on **Linux**. The commands in this README are bash (`export`, `$ZIG`, `./zig-out/bin/glacier`, `libglacier.so`). They are not a Windows playbook; cmd/PowerShell, `.exe` / `.dll`, and paths will differ, and that path was not used here.
+`glacier.version()` is **0.6.0**. That is the product number. `glacier.api_version()` stays `1` and a file path remains a one-catalog shortcut. 0.3 catalog session, 0.4 writes through the catalog, 0.5 `glacier serve`, and 0.6 streaming are this release. Linux `glacier-ui` is the same number. It was built and tested on **Linux**. The commands in this README are bash (`export`, `$ZIG`, `./zig-out/bin/glacier`, `libglacier.so`). They are not a Windows playbook; cmd/PowerShell, `.exe` / `.dll`, and paths will differ, and that path was not used here.
 
 CI in this repo: `zig build test` on Linux and macOS; on Windows only `zig build` (compile, no test suite). Python tests and manylinux wheels (`manylinux_2_28` x86_64 and aarch64) run on Ubuntu. WASM on Ubuntu.
 
@@ -26,11 +26,11 @@ CI in this repo: `zig build test` on Linux and macOS; on Windows only `zig build
 
 | Number | Name | What is true |
 | --- | --- | --- |
-| **0.2.1** | Engine | Path to SQL to Arrow. Analysis SQL on Iceberg, Parquet, Avro. Linux wheel and Kof. `glacier.version()` prints this. |
+| **0.2.1** | Engine | Path to SQL to Arrow. Analysis SQL on Iceberg, Parquet, Avro. Linux wheel and Kof. |
 | **0.3.x** | Catalog session | Named catalogs. `ATTACH` / `SHOW` / `USE` / `DETACH`. `catalog.namespace.table`. JOIN across catalogs. Iceberg is the table format, not the catalog. |
 | **0.4.x** | Writes through the catalog | `CREATE` / `INSERT` / `CTAS` / `COPY FROM` / `DELETE` / `UPDATE` / `MERGE` / `ALTER ADD COLUMN` / `DROP`. Iceberg snapshots. Native `glacier` registry, Hadoop, REST `commitTable`. |
 | **0.5.x** | Process | `glacier serve`: Iceberg REST (catalog port) and Arrow Flight SQL (query port). Two clients, same warehouse. Not in WASM or the wheel. |
-| **0.6.x** | Streaming | Record batches on Flight `DoGet` and `Result.nextBatch`. `GLACIER_BATCH_ROWS` (default 65536). `glacier_result_arrow` still exports every row. Temp tables and cancel still next. |
+| **0.6.x** | Streaming | Record batches on Flight `DoGet` and `Result.nextBatch`. `GLACIER_BATCH_ROWS` (default 65536). `glacier_result_arrow` still exports every row. Temp tables and cancel still next. `glacier.version()` prints **0.6.0**. Linux `glacier-ui` is this number. |
 
 ---
 
@@ -87,7 +87,7 @@ Writes go through the catalog adapter. Iceberg is the default table format when 
 Flight `DoGet` and `Session` results stream more than one record batch.
 
 - **Chunks.** Default 65536 rows (`GLACIER_BATCH_ROWS`). `Result.nextBatch` / `glacier_result_next_arrow` / Python `next_batch()` yield each chunk. Values across chunks match the full scan.
-- **ABI v1.** `glacier_result_arrow` / `fetchall()` / `.arrow()` still export every row. `glacier.version()` stays 0.2.1. Temp tables and query cancel are not this slice.
+- **ABI v1.** `glacier_result_arrow` / `fetchall()` / `.arrow()` still export every row. `glacier.version()` is 0.6.0. Temp tables and query cancel are not this slice.
 
 ---
 
@@ -106,7 +106,7 @@ Flight `DoGet` and `Session` results stream more than one record batch.
 - **Access.** Local path, `http(s)://` Range GET, `s3://` (SigV4; `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or `~/.aws/credentials`; `AWS_ENDPOINT_URL` for path-style), `gs://` (HTTPS + Bearer; `GOOGLE_OAUTH_ACCESS_TOKEN` / `GCS_OAUTH_TOKEN`, or a vended `gcs.oauth2.token`). Iceberg Hadoop-style directories open as a path. A warehouse root (`namespace/table/metadata`) is the `iceberg_hadoop` catalog (`SHOW NAMESPACES` / `FROM cat.ns.table`). If the table was copied, file URIs that still start with `metadata.location` are rewritten to the opened directory.
 - **Catalog session.** A connection holds named catalogs. `open(path)` / `glacier_open(path)` registers `files` (one file or one Iceberg table), `hadoop` (a warehouse root), or `glacier` (an empty directory or `_glacier_catalog.json`). An `http(s)://` URI that is not a data file is an Iceberg REST Catalog (`rest`). `--catalog` / `glacier_open_catalog` / `ATTACH 'http://…' AS name` also register `iceberg_rest` (token in the C call, or `ICEBERG_TOKEN`). `ATTACH '/warehouse' AS name` registers `iceberg_hadoop` or, if the directory is empty or missing, the native `glacier` catalog. `SHOW CATALOGS`, `SHOW NAMESPACES`, `SHOW TABLES [FROM cat.ns]`, `DESCRIBE [TABLE] t`, `USE cat[.ns]`, `DETACH [CATALOG] name`. Writes on `glacier`, `iceberg_hadoop`, and `iceberg_rest`: `CREATE NAMESPACE`, `CREATE TABLE` (columns or `AS SELECT`, optional `PARTITIONED BY` identity), `INSERT INTO … VALUES` / `SELECT`, `COPY t FROM 'file.parquet'`, `DELETE FROM t [WHERE …]` (Iceberg equality deletes), `UPDATE t SET … [WHERE …]`, `MERGE INTO t USING u ON … WHEN MATCHED THEN DELETE | UPDATE SET … WHEN NOT MATCHED THEN INSERT`, `ALTER TABLE t ADD COLUMN` (optional), `DROP TABLE`. Native and Hadoop commit Iceberg on the warehouse (`metadata.json`). REST writes data files to the table location (local path, or a single PUT to `s3://` / `gs://`) and commits with `commitTable` (assert snapshot; HTTP 409 if someone wrote first). The `files` catalog stays read-only. `FROM catalog.namespace.table` and `JOIN` across catalogs. System tables: `glacier.catalogs`, `glacier.tables`, and (Iceberg only) `glacier.snapshots` / `glacier.files`, also as `t.snapshots` / `t.files`. Iceberg is the table format, not the catalog. Remote `ATTACH` and `CREATE` / `INSERT` are refused in WASM. Hadoop listing is local (no S3 ListBucket).
 - **Memory.** Large scans stream. `ORDER BY` / `GROUP BY` / `DISTINCT` can spill under `GLACIER_MEM` (default 256 MiB) into `$GLACIER_TEMP`. `COUNT(*)` of a JOIN does not allocate the match rows. Query results split into record batches of `GLACIER_BATCH_ROWS` (default 65536).
-- **How you call it.** CLI `glacier` (TUI on a Linux terminal, or `-c SQL`). `glacier serve [warehouse] [--listen 127.0.0.1:8181] [--flight 127.0.0.1:8815]` is the process: Iceberg REST Catalog on HTTP, Arrow Flight SQL on `grpc://` (native binary; not in WASM or the wheel). Handshake, `CommandStatementQuery`, `GetFlightInfo`, `DoGet` (one FlightData record batch after the schema, repeated), `GetCatalogs`, and `GetTables` talk to a `Session` in that process. Bind is localhost without TLS; a public bind without TLS is refused. Shared library `libglacier.so` on Linux + [`include/glacier.h`](include/glacier.h): `glacier_open` (file, warehouse, or REST URI), `glacier_open_catalog` (REST URI + warehouse + token), `glacier_query` (SQL, including `SHOW CATALOGS` / `ATTACH`), `glacier_result_arrow` (every row), `glacier_result_next_arrow` (next batch). Bindings on that header: Python (`pip install glacier-olap`, or `bindings/python` after a local `$ZIG build`), Kof JVM (`bindings/kof`), WASM (`$ZIG build wasm`), Node, Go, Rust. Remote Python over Flight is `adbc_driver_flightsql` later, not this wheel. `glacier.api_version()` is still `1`: a file path remains a one-catalog shortcut.
+- **How you call it.** CLI `glacier` (TUI on a Linux terminal, or `-c SQL`). `glacier-ui` is a Linux session workspace (catalog tree, SQL editor, result grid; `$ZIG build -Dui`; not in WASM or the wheel). `glacier serve [warehouse] [--listen 127.0.0.1:8181] [--flight 127.0.0.1:8815]` is the process: Iceberg REST Catalog on HTTP, Arrow Flight SQL on `grpc://` (native binary; not in WASM or the wheel). Handshake, `CommandStatementQuery`, `GetFlightInfo`, `DoGet` (one FlightData record batch after the schema, repeated), `GetCatalogs`, and `GetTables` talk to a `Session` in that process. Bind is localhost without TLS; a public bind without TLS is refused. Shared library `libglacier.so` on Linux + [`include/glacier.h`](include/glacier.h): `glacier_open` (file, warehouse, or REST URI), `glacier_open_catalog` (REST URI + warehouse + token), `glacier_query` (SQL, including `SHOW CATALOGS` / `ATTACH`), `glacier_result_arrow` (every row), `glacier_result_next_arrow` (next batch). Bindings on that header: Python (`pip install glacier-olap`, or `bindings/python` after a local `$ZIG build`), Kof JVM (`bindings/kof`), WASM (`$ZIG build wasm`), Node, Go, Rust. Remote Python over Flight is `adbc_driver_flightsql` later, not this wheel. `glacier.api_version()` is still `1`: a file path remains a one-catalog shortcut.
 
 ---
 
@@ -126,9 +126,10 @@ $ZIG build
 $ZIG build test
 $ZIG build fixtures                  # tests/formats + tests/iceberg_prune
 $ZIG build wasm                      # zig-out/bin/glacier.wasm
+$ZIG build -Dui                      # glacier-ui (Linux session workspace; dvui + SDL3)
 ```
 
-Output on Linux: `zig-out/bin/glacier`, `zig-out/lib/libglacier.so`, `zig-out/bin/glacier.wasm`.
+Output on Linux: `zig-out/bin/glacier`, `zig-out/lib/libglacier.so`, `zig-out/bin/glacier.wasm`. With `-Dui`: `zig-out/bin/glacier-ui`.
 
 ```bash
 ./zig-out/bin/glacier                              # TUI: pick a source, then SQL
@@ -156,6 +157,8 @@ Output on Linux: `zig-out/bin/glacier`, `zig-out/lib/libglacier.so`, `zig-out/bi
   -c "UPDATE lake.sales.orders SET category = 'x' WHERE id = 1" \
   -c "ALTER TABLE lake.sales.orders ADD COLUMN note STRING" \
   -c "SELECT COUNT(*) FROM lake.sales.orders"
+./zig-out/bin/glacier-ui                               # catalog tree + SQL + results
+./zig-out/bin/glacier-ui tests/formats/sales.parquet   # open that file, SELECT * LIMIT 50
 ./zig-out/bin/glacier serve /tmp/mylake --listen 127.0.0.1:8181 --flight 127.0.0.1:8815
 # catalog: --catalog http://127.0.0.1:8181
 # query:   grpc://127.0.0.1:8815  (Flight SQL; two clients share the warehouse)
@@ -241,9 +244,9 @@ cd bindings/rust && cargo test
 
 ## What to expect next
 
-**0.6.x:** streaming record batches on Flight `DoGet` and `Result.nextBatch` (this tree). Next on that number: `CREATE TEMP TABLE`, query cancel. Then `api_version` 2 when a connection is a database session. The Windows test suite, Azure Blob, and parallel scan are not on that board.
+**Rest of 0.6:** `CREATE TEMP TABLE`, query cancel. Then `api_version` 2 when a connection is a database session. The Windows test suite, Azure Blob, and parallel scan are not on that board.
 
-Issues and CI live in this repo. `glacier.version()` is `0.2.1`; `glacier.api_version()` is `1`. A file path remains the one-catalog shortcut so the 0.2.1 wheel keeps working.
+Issues and CI live in this repo. `glacier.version()` is `0.6.0`; `glacier.api_version()` is `1`. A file path remains the one-catalog shortcut so ABI v1 clients keep working.
 
 ---
 

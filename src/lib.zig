@@ -1,4 +1,4 @@
-//! Glacier 0.2. Zig query engine. Format codecs are C (carquet, libavro).
+//! Glacier 0.6. Zig query engine. Format codecs are C (carquet, libavro).
 
 pub const FileSource = @import("vfs/source.zig").FileSource;
 pub const Transport = @import("vfs/source.zig").Transport;
@@ -29,7 +29,7 @@ pub const Batch = batch.Batch;
 pub const Column = batch.Column;
 pub const GlacierError = err.GlacierError;
 
-pub const version = "0.2.1";
+pub const version = "0.6.0";
 
 comptime {
     _ = &c_api.glacier_open;
