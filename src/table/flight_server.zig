@@ -13,6 +13,7 @@ pub const bind = impl.bind;
 pub const serveLoop = impl.serveLoop;
 pub const runSql = impl.runSql;
 pub const queryI64 = impl.queryI64;
+pub const queryI64Stream = impl.queryI64Stream;
 
 test {
     _ = impl;

@@ -292,6 +292,37 @@ class TestQuery(unittest.TestCase):
             with self.assertRaises(glacier.GlacierError):
                 con.execute("SELECT (SELECT id FROM sales)")
 
+    def test_stream_batches(self):
+        if not SALES.is_file():
+            self.skipTest("run `$ZIG build fixtures`")
+        import os
+
+        old = os.environ.get("GLACIER_BATCH_ROWS")
+        os.environ["GLACIER_BATCH_ROWS"] = "3"
+        try:
+            with glacier.connect(SALES) as con:
+                all_rows = con.execute("SELECT id FROM sales ORDER BY id").fetchall()
+                self.assertEqual(all_rows, [(i,) for i in range(1, 11)])
+                streamed = con.execute("SELECT id FROM sales ORDER BY id")
+                parts: list[tuple] = []
+                n_batches = 0
+                while True:
+                    chunk = streamed.next_batch()
+                    if chunk is None:
+                        break
+                    self.assertGreater(len(chunk), 0)
+                    self.assertLessEqual(len(chunk), 3)
+                    parts.extend(chunk)
+                    n_batches += 1
+                self.assertGreaterEqual(n_batches, 2)
+                self.assertEqual(parts, [(i,) for i in range(1, 11)])
+                self.assertIsNone(streamed.next_batch())
+        finally:
+            if old is None:
+                os.environ.pop("GLACIER_BATCH_ROWS", None)
+            else:
+                os.environ["GLACIER_BATCH_ROWS"] = old
+
 
     def test_arrow_optional(self):
         try:

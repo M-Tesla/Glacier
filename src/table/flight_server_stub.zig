@@ -51,3 +51,17 @@ pub fn queryI64(
 ) ![]i64 {
     return error.WriteUnsupported;
 }
+
+pub const I64Stream = struct {
+    values: []i64,
+    n_batches: usize,
+};
+
+pub fn queryI64Stream(
+    _: std.mem.Allocator,
+    _: std.Io,
+    _: u16,
+    _: []const u8,
+) !I64Stream {
+    return error.WriteUnsupported;
+}

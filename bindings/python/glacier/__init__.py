@@ -208,6 +208,25 @@ class Result:
         self._cursor += 1
         return row
 
+    def next_batch(self) -> Optional[list[tuple]]:
+        """Next record batch as rows, or None at the end. Independent of fetchall()."""
+        self._check()
+        array = _native.ArrowArray()
+        schema = _native.ArrowSchema()
+        rc = self._lib.glacier_result_next_arrow(
+            self._handle, ctypes.byref(array), ctypes.byref(schema)
+        )
+        if rc == 0:
+            return None
+        if rc < 0:
+            raise GlacierError("failed to export Arrow batch")
+        try:
+            _, rows = _native.rows_from_arrow(schema, array)
+            return rows
+        finally:
+            _native._release_array(array)
+            _native._release_schema(schema)
+
     def arrow(self):
         try:
             import pyarrow as pa

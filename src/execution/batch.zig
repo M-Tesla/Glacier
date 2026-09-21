@@ -126,7 +126,70 @@ pub const Batch = struct {
         }
         return .{ .columns = columns, .len = idx.len };
     }
+
+    /// Row window that shares backing arrays. Utf8 offsets are rebased.
+    pub fn slice(self: Batch, allocator: std.mem.Allocator, start: usize, n: usize) !Batch {
+        if (start > self.len) return error.InvalidRange;
+        const keep = @min(n, self.len - start);
+        if (start == 0 and keep == self.len) return self;
+        const columns = try allocator.alloc(Column, self.columns.len);
+        for (self.columns, 0..) |src, i| {
+            columns[i] = try sliceColumn(allocator, src, start, keep);
+        }
+        return .{ .columns = columns, .len = keep };
+    }
+
+    /// Consecutive row windows of at most `chunk` rows. One batch when `chunk` is 0 or covers all rows.
+    pub fn split(self: Batch, allocator: std.mem.Allocator, chunk: usize) ![]Batch {
+        const size = if (chunk == 0) self.len else chunk;
+        if (self.len <= size) {
+            const out = try allocator.alloc(Batch, 1);
+            out[0] = self;
+            return out;
+        }
+        const n = (self.len + size - 1) / size;
+        const out = try allocator.alloc(Batch, n);
+        var i: usize = 0;
+        var start: usize = 0;
+        while (start < self.len) : (start += size) {
+            const keep = @min(size, self.len - start);
+            out[i] = try self.slice(allocator, start, keep);
+            i += 1;
+        }
+        return out;
+    }
 };
+
+fn sliceColumn(allocator: std.mem.Allocator, src: Column, start: usize, n: usize) !Column {
+    var dst = src;
+    dst.len = n;
+    if (src.valid.len > start) dst.valid = src.valid[start..][0..n];
+    if (src.bools.len > start) dst.bools = src.bools[start..][0..n];
+    if (src.i32s.len > start) dst.i32s = src.i32s[start..][0..n];
+    if (src.i64s.len > start) dst.i64s = src.i64s[start..][0..n];
+    if (src.f32s.len > start) dst.f32s = src.f32s[start..][0..n];
+    if (src.f64s.len > start) dst.f64s = src.f64s[start..][0..n];
+    if (src.uuids.len > start) dst.uuids = src.uuids[start..][0..n];
+    if (src.i128s.len > start) dst.i128s = src.i128s[start..][0..n];
+    if (src.data_type == .utf8) {
+        if (n == 0 or src.utf8.offsets.len <= start) {
+            dst.utf8 = .{ .offsets = &.{}, .bytes = &.{} };
+        } else {
+            const byte_start: usize = @intCast(src.utf8.offsets[start]);
+            const byte_end: usize = @intCast(src.utf8.offsets[start + n]);
+            const offs = try allocator.alloc(u32, n + 1);
+            var i: usize = 0;
+            while (i <= n) : (i += 1) {
+                offs[i] = src.utf8.offsets[start + i] - @as(u32, @intCast(byte_start));
+            }
+            dst.utf8 = .{
+                .offsets = offs,
+                .bytes = src.utf8.bytes[byte_start..byte_end],
+            };
+        }
+    }
+    return dst;
+}
 
 fn gatherColumn(allocator: std.mem.Allocator, src: Column, idx: []const usize) !Column {
     var dst: Column = .{
@@ -194,4 +257,39 @@ fn gatherColumn(allocator: std.mem.Allocator, src: Column, idx: []const usize) !
         };
     }
     return dst;
+}
+
+test "slice and split share int64 and rebase utf8" {
+    const gpa = std.testing.allocator;
+    const ids = try gpa.dupe(i64, &.{ 1, 2, 3, 4 });
+    defer gpa.free(ids);
+    const offs = try gpa.dupe(u32, &.{ 0, 1, 2, 3, 4 });
+    defer gpa.free(offs);
+    const bytes = try gpa.dupe(u8, "abcd");
+    defer gpa.free(bytes);
+    var cols = [_]Column{
+        .{ .name = "id", .data_type = .int64, .len = 4, .i64s = ids },
+        .{ .name = "s", .data_type = .utf8, .len = 4, .utf8 = .{ .offsets = offs, .bytes = bytes } },
+    };
+    const batch: Batch = .{ .columns = &cols, .len = 4 };
+    const parts = try batch.split(gpa, 2);
+    defer {
+        for (parts) |p| {
+            for (p.columns) |c| {
+                if (c.data_type == .utf8) gpa.free(c.utf8.offsets);
+            }
+            gpa.free(p.columns);
+        }
+        gpa.free(parts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqual(@as(i64, 1), parts[0].columns[0].i64s[0]);
+    try std.testing.expectEqual(@as(i64, 2), parts[0].columns[0].i64s[1]);
+    try std.testing.expectEqual(@as(i64, 3), parts[1].columns[0].i64s[0]);
+    try std.testing.expectEqual(@as(i64, 4), parts[1].columns[0].i64s[1]);
+    try std.testing.expectEqualStrings("a", parts[0].columns[1].strAt(0));
+    try std.testing.expectEqualStrings("b", parts[0].columns[1].strAt(1));
+    try std.testing.expectEqualStrings("c", parts[1].columns[1].strAt(0));
+    try std.testing.expectEqualStrings("d", parts[1].columns[1].strAt(1));
+    try std.testing.expectEqual(@as(u32, 0), parts[1].columns[1].utf8.offsets[0]);
 }

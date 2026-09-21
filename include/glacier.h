@@ -86,8 +86,11 @@ GlacierResult *glacier_query(GlacierConn *conn, const char *sql, char **err);
 void glacier_result_destroy(GlacierResult *result);
 const char *glacier_result_error(GlacierResult *result);
 
-/* Fills Arrow C Data. Caller must ArrowArray.release / ArrowSchema.release when non-NULL. */
+/* glacier_result_arrow fills every row (one array). glacier_result_next_arrow
+ * yields the next record batch: 1 = batch, 0 = end, -1 = error.
+ * Caller must ArrowArray.release / ArrowSchema.release when non-NULL. */
 int glacier_result_arrow(GlacierResult *result, struct ArrowArray *array, struct ArrowSchema *schema);
+int glacier_result_next_arrow(GlacierResult *result, struct ArrowArray *array, struct ArrowSchema *schema);
 
 const char *glacier_version(void);
 int glacier_api_version(void);

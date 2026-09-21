@@ -143,6 +143,8 @@ pub const Session = struct {
     default_namespace: []const u8 = "default",
     error_buf: [512]u8 = undefined,
     last_error: ?GlacierError = null,
+    /// Rows per `nextBatch`. 0 reads `GLACIER_BATCH_ROWS` (default 65536).
+    stream_rows: usize = 0,
 
     pub fn lastError(self: *const Session) ?GlacierError {
         return self.last_error;
@@ -304,141 +306,82 @@ pub const Session = struct {
         switch (stmt) {
             .copy => |c| {
                 const batch = try self.executeCopy(a, c);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .query => |query| {
                 var stats: ScanStats = .{};
                 const batch = try self.runQuery(a, query, &stats);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = stats,
-                };
+                return try self.wrapResult(&arena, batch, stats);
             },
             .show => |s| {
                 const batch = try self.executeShow(a, s);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .attach => |att| {
                 const batch = try self.executeAttach(a, att);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .describe => |d| {
                 const batch = try self.executeDescribe(a, d);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .use => |u| {
                 const batch = try self.executeUse(a, u);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .detach => |d| {
                 const batch = try self.executeDetach(a, d);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .create_namespace => |n| {
                 const batch = try self.executeCreateNamespace(a, n);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .create_table => |ct| {
                 const batch = try self.executeCreateTable(a, ct);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .insert => |ins| {
                 const batch = try self.executeInsert(a, ins);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .delete => |d| {
                 const batch = try self.executeDelete(a, d);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .update => |u| {
                 const batch = try self.executeUpdate(a, u);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .merge => |m| {
                 const batch = try self.executeMerge(a, m);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .alter_table => |alt| {
                 const batch = try self.executeAlterTable(a, alt);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
             .drop_table => |d| {
                 const batch = try self.executeDropTable(a, d);
-                return .{
-                    .arena = arena,
-                    .batch = batch,
-                    .yielded = false,
-                    .scan_stats = .{},
-                };
+                return try self.wrapResult(&arena, batch, .{});
             },
         }
+    }
+
+    fn wrapResult(self: *Session, arena: *std.heap.ArenaAllocator, batch: Batch, stats: ScanStats) !Result {
+        const batches = try batch.split(arena.allocator(), self.effectiveStreamRows());
+        return .{
+            .arena = arena.*,
+            .batch = batch,
+            .batches = batches,
+            .next_i = 0,
+            .scan_stats = stats,
+        };
+    }
+
+    fn effectiveStreamRows(self: *const Session) usize {
+        if (self.stream_rows != 0) return self.stream_rows;
+        return streamRowsFromEnv();
     }
 
     fn executeCopy(self: *Session, a: std.mem.Allocator, c: sql.Copy) !Batch {
@@ -2744,8 +2687,10 @@ fn isRestCatalogUri(path: []const u8) bool {
 
 pub const Result = struct {
     arena: std.heap.ArenaAllocator,
+    /// Every row. `glacier_result_arrow` and the CLI print this.
     batch: Batch,
-    yielded: bool,
+    batches: []Batch = &.{},
+    next_i: usize = 0,
     scan_stats: ScanStats = .{},
 
     pub fn deinit(self: *Result) void {
@@ -2758,11 +2703,18 @@ pub const Result = struct {
     }
 
     pub fn nextBatch(self: *Result) ?Batch {
-        if (self.yielded) return null;
-        self.yielded = true;
-        return self.batch;
+        if (self.next_i >= self.batches.len) return null;
+        const b = self.batches[self.next_i];
+        self.next_i += 1;
+        return b;
     }
 };
+
+fn streamRowsFromEnv() usize {
+    const p = std.c.getenv("GLACIER_BATCH_ROWS") orelse return 65536;
+    const n = std.fmt.parseInt(usize, std.mem.span(p), 10) catch return 65536;
+    return if (n == 0) 65536 else n;
+}
 
 pub fn writeSalesFixture(path: [:0]const u8) !void {
     try parquet.writeSalesFixture(path);
@@ -2814,6 +2766,31 @@ test "SELECT * WHERE LIMIT projection" {
         try std.testing.expectEqual(@as(usize, 2), b.len);
         try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
         try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[1]);
+    }
+
+    {
+        session.stream_rows = 3;
+        defer session.stream_rows = 0;
+        var result = try session.execute("SELECT id FROM sales ORDER BY id");
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 10), result.batch.len);
+        var n_batches: usize = 0;
+        var n_rows: usize = 0;
+        var ids: [10]i64 = undefined;
+        while (result.nextBatch()) |chunk| {
+            try std.testing.expect(chunk.len > 0);
+            try std.testing.expect(chunk.len <= 3);
+            for (chunk.columns[0].i64s[0..chunk.len]) |id| {
+                ids[n_rows] = id;
+                n_rows += 1;
+            }
+            n_batches += 1;
+        }
+        try std.testing.expect(n_batches >= 2);
+        try std.testing.expectEqual(@as(usize, 10), n_rows);
+        try std.testing.expectEqual(@as(i64, 1), ids[0]);
+        try std.testing.expectEqual(@as(i64, 10), ids[9]);
+        try std.testing.expect(result.nextBatch() == null);
     }
 
     {

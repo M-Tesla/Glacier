@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ZIG="${ZIG:-$HOME/opt/zig-0.16/zig}"
-KOF_HOME="${KOF_HOME:-/tmp/kof-dist/kof-0.3.23-beta-linux-x86_64}"
+KOF_HOME="${KOF_HOME:-/tmp/kof-dist/kof-0.4.9-beta-linux-x86_64}"
 HD="${GLACIER_KOF_HD:-/run/media/honinbou/MeusArquivos/glacier-kof/work}"
 export GLACIER_TEMP="${GLACIER_TEMP:-$HD/temp}"
 
@@ -20,6 +20,7 @@ mkdir -p "$GLACIER_TEMP" "$HD/out" "$HD/suite"
 rm -f "$HD/suite"/*.kf
 
 export PATH="$KOF_HOME/bin:$PATH"
+"$KOF_HOME/bin/kof" version
 JAVA="$KOF_HOME/jdk/bin/java"
 JAVAC="$KOF_HOME/jdk/bin/javac"
 
@@ -55,5 +56,6 @@ sed "s|__GLACIER_KOF_PARQUET__|$HD/sales.parquet|" \
 kof build "$HD/suite" --target jvm --output "$HD/out"
 "$JAVAC" -d "$HD/out" "$ROOT/bindings/kof/java/Conn.java"
 
-"$JAVA" -Djava.library.path="$(dirname "$JNI_SO"):$ROOT/zig-out/lib" \
+"$JAVA" --enable-native-access=ALL-UNNAMED \
+  -Djava.library.path="$(dirname "$JNI_SO"):$ROOT/zig-out/lib" \
   -cp "$HD/out" Default.Main

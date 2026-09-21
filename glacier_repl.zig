@@ -908,8 +908,8 @@ fn runTuiCooked(session: *glacier.Session, ctx: *RunCtx) !void {
         defer result.deinit();
         const elapsed = t0.durationTo(std.Io.Clock.Timestamp.now(ctx.io, .awake));
         const max_rows = @max(@as(usize, 5), @as(usize, size.rows) -| 8);
-        if (result.nextBatch()) |batch| {
-            try printBatchBoxed(&view.writer, batch, max_rows, size.cols);
+        if (result.batch.len > 0 or result.batch.columns.len > 0) {
+            try printBatchBoxed(&view.writer, result.batch, max_rows, size.cols);
         } else {
             try view.writer.writeAll("(no rows)\n");
         }
@@ -1814,11 +1814,12 @@ fn handleLine(session: *glacier.Session, ctx: *RunCtx, line: []const u8) !LineRe
     defer result.deinit();
     const elapsed = t0.durationTo(std.Io.Clock.Timestamp.now(ctx.io, .awake));
 
-    const batch = result.nextBatch() orelse {
+    const batch = result.batch;
+    if (batch.len == 0 and batch.columns.len == 0) {
         try ctx.out.print("(no rows)\n", .{});
         if (ctx.timer.*) try printStats(ctx.out, elapsed, result.scan_stats);
         return .ok;
-    };
+    }
     try printResult(ctx, batch);
     if (ctx.timer.*) try printStats(ctx.out, elapsed, result.scan_stats);
     return .ok;

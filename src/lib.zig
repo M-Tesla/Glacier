@@ -44,6 +44,7 @@ comptime {
     _ = &c_api.glacier_result_destroy;
     _ = &c_api.glacier_result_error;
     _ = &c_api.glacier_result_arrow;
+    _ = &c_api.glacier_result_next_arrow;
     _ = &c_api.glacier_free;
     _ = &c_api.glacier_version;
     _ = &c_api.glacier_api_version;

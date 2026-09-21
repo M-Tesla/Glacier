@@ -131,6 +131,13 @@ def _bind(lib) -> None:
     ]
     lib.glacier_result_arrow.restype = ctypes.c_int
 
+    lib.glacier_result_next_arrow.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ArrowArray),
+        ctypes.POINTER(ArrowSchema),
+    ]
+    lib.glacier_result_next_arrow.restype = ctypes.c_int
+
     lib.glacier_free.argtypes = [ctypes.c_void_p]
     lib.glacier_free.restype = None
 

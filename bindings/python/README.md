@@ -31,6 +31,7 @@ con.execute("SELECT * FROM glacier.catalogs").fetchall()
 # ATTACH an empty dir, then CREATE TABLE / INSERT / COPY FROM / DELETE / UPDATE / MERGE / ALTER (0.4 Iceberg commit)
 # CLI 0.5: glacier serve /warehouse --listen 127.0.0.1:8181 --flight 127.0.0.1:8815
 # Iceberg REST catalog + Arrow Flight SQL query port; not in the wheel
+# 0.6: GLACIER_BATCH_ROWS=N then result.next_batch(); fetchall() is still every row
 
 con.read_parquet(Path("tests/formats/sales.parquet").read_bytes()).fetchall()
 table = con.execute("SELECT *").arrow()  # pyarrow

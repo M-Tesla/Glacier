@@ -2,7 +2,7 @@ import java.util.ArrayList;
 
 /**
  * JVM face of libglacier. Default package so Kof {@code class Conn} matches.
- * No overloads (Kof resolves the wrong one).
+ * Overloads {@code connect()} / {@code connect(path)} need Kof 0.4.
  */
 public final class Conn {
     private long db;
@@ -30,6 +30,14 @@ public final class Conn {
 
     public static int apiVersion() {
         return nativeApiVersion();
+    }
+
+    public static Conn connect() {
+        return connectEmpty();
+    }
+
+    public static Conn connect(String path) {
+        return connectPath(path);
     }
 
     public static Conn connectEmpty() {

@@ -212,6 +212,17 @@ pub export fn glacier_result_arrow(result: ?*ResultHandle, array: ?*ArrowArray, 
     return arrow.exportBatch(h.gpa, batch, out_array, out_schema);
 }
 
+pub export fn glacier_result_next_arrow(result: ?*ResultHandle, array: ?*ArrowArray, schema: ?*ArrowSchema) callconv(.c) c_int {
+    const h = result orelse return -1;
+    const out_array = array orelse return -1;
+    const out_schema = schema orelse return -1;
+    if (h.err != null) return -1;
+    const r = &(h.result orelse return -1);
+    const batch = r.nextBatch() orelse return 0;
+    const rc = arrow.exportBatch(h.gpa, batch, out_array, out_schema);
+    return if (rc == 0) 1 else -1;
+}
+
 pub export fn glacier_malloc(n: usize) callconv(.c) ?*anyopaque {
     if (n == 0) return null;
     const s = heap().alloc(u8, n) catch return null;
@@ -359,6 +370,54 @@ test "C ABI executes arbitrary SQL not a hardcoded select" {
         var arr: ArrowArray = .{};
         var sch: ArrowSchema = .{};
         try std.testing.expectEqual(@as(c_int, -1), glacier_result_arrow(bad, &arr, &sch));
+    }
+}
+
+test "C ABI next_arrow streams batches" {
+    try parquet.writeSalesFixture("/tmp/sales.parquet");
+
+    var err: ?[*:0]u8 = null;
+    const db = glacier_open("/tmp/sales.parquet", &err) orelse return error.OpenFailed;
+    defer glacier_close(db);
+    _ = glacier_connect(db, &err) orelse return error.ConnectFailed;
+    db.session.stream_rows = 3;
+
+    const q = glacier_query(db, "SELECT id ORDER BY id", &err) orelse return error.QueryFailed;
+    defer glacier_result_destroy(q);
+    if (glacier_result_error(q) != null) return error.QueryFailed;
+
+    var n_batches: usize = 0;
+    var n_rows: usize = 0;
+    var ids: [10]i64 = undefined;
+    while (true) {
+        var arr: ArrowArray = .{};
+        var sch: ArrowSchema = .{};
+        const rc = glacier_result_next_arrow(q, &arr, &sch);
+        if (rc == 0) break;
+        try std.testing.expectEqual(@as(c_int, 1), rc);
+        defer {
+            if (arr.release) |rel| rel(&arr);
+            if (sch.release) |rel| rel(&sch);
+        }
+        try std.testing.expect(arr.length > 0);
+        try std.testing.expect(arr.length <= 3);
+        const cld = arr.children.?[0].?;
+        const ptr: [*]const i64 = @ptrCast(@alignCast(cld.buffers.?[1].?));
+        const chunk = ptr[0..@intCast(cld.length)];
+        for (chunk) |id| {
+            ids[n_rows] = id;
+            n_rows += 1;
+        }
+        n_batches += 1;
+    }
+    try std.testing.expect(n_batches >= 2);
+    try std.testing.expectEqual(@as(usize, 10), n_rows);
+    try std.testing.expectEqual(@as(i64, 1), ids[0]);
+    try std.testing.expectEqual(@as(i64, 10), ids[9]);
+    {
+        var arr: ArrowArray = .{};
+        var sch: ArrowSchema = .{};
+        try std.testing.expectEqual(@as(c_int, 0), glacier_result_next_arrow(q, &arr, &sch));
     }
 }
 

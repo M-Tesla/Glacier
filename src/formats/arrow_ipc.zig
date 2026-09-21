@@ -173,7 +173,9 @@ fn pushBuf(
 
 /// Decode the first int64 column of a Flight record batch (tests / CLI).
 pub fn firstI64s(allocator: std.mem.Allocator, header: []const u8, body: []const u8) ![]i64 {
-    const rec = try parseRecordBatch(header);
+    const rec = try parseRecordBatch(allocator, header);
+    defer allocator.free(rec.nodes);
+    defer allocator.free(rec.buffers);
     if (rec.nodes.len < 2 or rec.buffers.len < 3) return error.InvalidIpc;
     const len: usize = @intCast(rec.nodes[1].length);
     const buf = rec.buffers[2];
@@ -188,17 +190,18 @@ pub fn firstI64s(allocator: std.mem.Allocator, header: []const u8, body: []const
 }
 
 const ParsedBatch = struct {
-    nodes: []const FieldNode,
-    buffers: []const IpcBuffer,
+    nodes: []FieldNode,
+    buffers: []IpcBuffer,
 };
 
-fn parseRecordBatch(header: []const u8) !ParsedBatch {
+fn parseRecordBatch(allocator: std.mem.Allocator, header: []const u8) !ParsedBatch {
     if (header.len < 8) return error.InvalidIpc;
     const root_off = std.mem.readInt(u32, header[0..4], .little);
     if (root_off >= header.len) return error.InvalidIpc;
     const rec_pos = try unionTable(header, root_off, 2);
-    const nodes = try readStructVec(header, try offsetTable(header, rec_pos, 1), FieldNode);
-    const buffers = try readStructVec(header, try offsetTable(header, rec_pos, 2), IpcBuffer);
+    const nodes = try readStructVec(allocator, header, try offsetTable(header, rec_pos, 1), FieldNode);
+    errdefer allocator.free(nodes);
+    const buffers = try readStructVec(allocator, header, try offsetTable(header, rec_pos, 2), IpcBuffer);
     return .{ .nodes = nodes, .buffers = buffers };
 }
 
@@ -228,13 +231,14 @@ fn offsetTable(buf: []const u8, table: u32, slot: u16) !u32 {
     return unionTable(buf, table, slot);
 }
 
-fn readStructVec(buf: []const u8, pos: u32, comptime T: type) ![]const T {
+fn readStructVec(allocator: std.mem.Allocator, buf: []const u8, pos: u32, comptime T: type) ![]T {
     if (pos + 4 > buf.len) return error.InvalidIpc;
     const len = std.mem.readInt(u32, buf[pos..][0..4], .little);
-    const bytes = @sizeOf(T) * len;
+    const bytes = @sizeOf(T) * @as(usize, len);
     if (pos + 4 + bytes > buf.len) return error.InvalidIpc;
-    const ptr: [*]const T = @ptrCast(@alignCast(buf[pos + 4 ..].ptr));
-    return ptr[0..len];
+    const out = try allocator.alloc(T, len);
+    if (bytes > 0) @memcpy(std.mem.sliceAsBytes(out), buf[pos + 4 ..][0..bytes]);
+    return out;
 }
 
 /// FlatBuffers builder: write from the end of a buffer (Apache algorithm).

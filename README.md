@@ -12,7 +12,7 @@
 
 </div>
 
-Glacier is an OLAP engine. A connection is a session of named catalogs (a Parquet/Avro file, an Iceberg Hadoop directory, a native Glacier warehouse, or an Iceberg REST Catalog). SQL talks `catalog.namespace.table`. You can run locally, over `https://`, on `s3://`, or on `gs://`. `glacier serve` is the process: Iceberg REST for other engines, Arrow Flight SQL for query. Results come back as a columnar batch (Arrow C Data on the public ABI).
+Glacier is an OLAP engine. A connection is a session of named catalogs (a Parquet/Avro file, an Iceberg Hadoop directory, a native Glacier warehouse, or an Iceberg REST Catalog). SQL talks `catalog.namespace.table`. You can run locally, over `https://`, on `s3://`, or on `gs://`. `glacier serve` is the process: Iceberg REST for other engines, Arrow Flight SQL for query. Results stream as record batches (Arrow C Data on the public ABI; Flight `DoGet` sends one FlightData per batch).
 
 The query engine is Zig 0.16. Parquet, Avro, and in-memory Arrow are small C libraries (carquet, libavro, nanoarrow), not a from-scratch codec stack.
 
@@ -30,7 +30,7 @@ CI in this repo: `zig build test` on Linux and macOS; on Windows only `zig build
 | **0.3.x** | Catalog session | Named catalogs. `ATTACH` / `SHOW` / `USE` / `DETACH`. `catalog.namespace.table`. JOIN across catalogs. Iceberg is the table format, not the catalog. |
 | **0.4.x** | Writes through the catalog | `CREATE` / `INSERT` / `CTAS` / `COPY FROM` / `DELETE` / `UPDATE` / `MERGE` / `ALTER ADD COLUMN` / `DROP`. Iceberg snapshots. Native `glacier` registry, Hadoop, REST `commitTable`. |
 | **0.5.x** | Process | `glacier serve`: Iceberg REST (catalog port) and Arrow Flight SQL (query port). Two clients, same warehouse. Not in WASM or the wheel. |
-| **0.6.x** | Next | Temp tables, streaming batches, query cancel. `api_version` 2 when the connection is a database session. |
+| **0.6.x** | Streaming | Record batches on Flight `DoGet` and `Result.nextBatch`. `GLACIER_BATCH_ROWS` (default 65536). `glacier_result_arrow` still exports every row. Temp tables and cancel still next. |
 
 ---
 
@@ -45,7 +45,7 @@ What 0.2 adds on top of 0.1 (the SQL surface that 0.1 froze and refused):
 - **Iceberg scan.** Position and equality deletes. Partition prune for `bucket[N]` / `year` / `month` / `day` / `hour` / `truncate[W]` / `void`, not only file bounds. Snapshot `schema-id` may differ from `current-schema-id` (promote int32→int64 / float32→float64; incompatible types error; new optional columns are null).
 - **Parquet nested.** A LIST of primitives is utf8 (`[1, 2, 3]`). Flat STRUCT leaves are columns. Maps and nested lists stay rejected.
 - **Python wheel.** `pip install glacier-olap` (`import glacier`). The wheel ships `libglacier.so` with zlib and zstd compiled in (no host `libz` / `libzstd`). CI builds `manylinux_2_28` for x86_64 and aarch64.
-- **Kof JVM.** [`bindings/kof`](bindings/kof): `.kf` API plus Java/JNI on `glacier.h`. `SELECT 1` and parquet `COUNT(*)` were tested on Linux.
+- **Kof JVM.** [`bindings/kof`](bindings/kof): `.kf` API plus Java/JNI on `glacier.h`, tested with Kof 0.4.9-beta. `SELECT 1` and parquet `COUNT(*)` on Linux.
 - **SQL scalars and VALUES.** `lower` / `upper` (ASCII), `length` / `char_length`, `trim` / `ltrim` / `rtrim`, `replace`, `substr` / `substring`, `concat`, `left` / `right`, `starts_with` / `ends_with` / `contains`, `strpos`, `date_trunc`, `extract` / `year` / `month` / `day` / `hour` / `minute` / `second` (timestamp as epoch microseconds), `ceil` / `floor` / `sign`, `greatest` / `least`, `COUNT` / `SUM` / `AVG` / `MIN` / `MAX(DISTINCT col)`, `VALUES (…), (…)`, `GROUP BY` expressions.
 - **Iceberg REST client.** `--catalog` loads tables through `GET /v1/config` and `loadTable`. Auth: none, bearer, OAuth2 client credentials, catalog SigV4. Vended S3/GCS keys from the table `config` map. `gs://` is HTTPS + Bearer.
 
@@ -82,6 +82,13 @@ Writes go through the catalog adapter. Iceberg is the default table format when 
 - **Arrow Flight SQL** on `grpc://127.0.0.1:8815`: Handshake, `CommandStatementQuery`, `GetFlightInfo`, `DoGet`, `GetCatalogs`, `GetTables`. Each connection opens its own `Session` on the warehouse. Two Flight clients share snapshots: an `INSERT` is visible on the next connection.
 - **Bind.** Localhost without TLS. A public bind without TLS is refused. `--listen` and `--flight` change the two ports. WASM and the Python wheel do not include `serve`. Remote Python over Flight is `adbc_driver_flightsql` later, not this wheel.
 
+## Update v0.6
+
+Flight `DoGet` and `Session` results stream more than one record batch.
+
+- **Chunks.** Default 65536 rows (`GLACIER_BATCH_ROWS`). `Result.nextBatch` / `glacier_result_next_arrow` / Python `next_batch()` yield each chunk. Values across chunks match the full scan.
+- **ABI v1.** `glacier_result_arrow` / `fetchall()` / `.arrow()` still export every row. `glacier.version()` stays 0.2.1. Temp tables and query cancel are not this slice.
+
 ---
 
 ## What this tree does
@@ -98,14 +105,14 @@ Writes go through the catalog adapter. Iceberg is the default table format when 
 - **Iceberg scan.** Prune uses column bounds and partition values (`identity`, `bucket[N]`, `year` / `month` / `day` / `hour`, `truncate[W]`, `void`; unknown transform is still rejected). Position and equality deletes (`content` 1 / 2) are applied on scan. `DELETE FROM t WHERE …` writes equality deletes through the catalog. `UPDATE` and `MERGE` commit one snapshot with equality deletes and new data files. Snapshot `schema-id` may differ from `current-schema-id` (promote int32 to int64 and float32 to float64; incompatible types error; new optional columns are null). Time travel: `FROM t FOR SNAPSHOT id` / `FOR SNAPSHOT AS OF id` / `FOR TIMESTAMP AS OF epoch_ms` (latest snapshot with `timestamp-ms <=` that value).
 - **Access.** Local path, `http(s)://` Range GET, `s3://` (SigV4; `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or `~/.aws/credentials`; `AWS_ENDPOINT_URL` for path-style), `gs://` (HTTPS + Bearer; `GOOGLE_OAUTH_ACCESS_TOKEN` / `GCS_OAUTH_TOKEN`, or a vended `gcs.oauth2.token`). Iceberg Hadoop-style directories open as a path. A warehouse root (`namespace/table/metadata`) is the `iceberg_hadoop` catalog (`SHOW NAMESPACES` / `FROM cat.ns.table`). If the table was copied, file URIs that still start with `metadata.location` are rewritten to the opened directory.
 - **Catalog session.** A connection holds named catalogs. `open(path)` / `glacier_open(path)` registers `files` (one file or one Iceberg table), `hadoop` (a warehouse root), or `glacier` (an empty directory or `_glacier_catalog.json`). An `http(s)://` URI that is not a data file is an Iceberg REST Catalog (`rest`). `--catalog` / `glacier_open_catalog` / `ATTACH 'http://…' AS name` also register `iceberg_rest` (token in the C call, or `ICEBERG_TOKEN`). `ATTACH '/warehouse' AS name` registers `iceberg_hadoop` or, if the directory is empty or missing, the native `glacier` catalog. `SHOW CATALOGS`, `SHOW NAMESPACES`, `SHOW TABLES [FROM cat.ns]`, `DESCRIBE [TABLE] t`, `USE cat[.ns]`, `DETACH [CATALOG] name`. Writes on `glacier`, `iceberg_hadoop`, and `iceberg_rest`: `CREATE NAMESPACE`, `CREATE TABLE` (columns or `AS SELECT`, optional `PARTITIONED BY` identity), `INSERT INTO … VALUES` / `SELECT`, `COPY t FROM 'file.parquet'`, `DELETE FROM t [WHERE …]` (Iceberg equality deletes), `UPDATE t SET … [WHERE …]`, `MERGE INTO t USING u ON … WHEN MATCHED THEN DELETE | UPDATE SET … WHEN NOT MATCHED THEN INSERT`, `ALTER TABLE t ADD COLUMN` (optional), `DROP TABLE`. Native and Hadoop commit Iceberg on the warehouse (`metadata.json`). REST writes data files to the table location (local path, or a single PUT to `s3://` / `gs://`) and commits with `commitTable` (assert snapshot; HTTP 409 if someone wrote first). The `files` catalog stays read-only. `FROM catalog.namespace.table` and `JOIN` across catalogs. System tables: `glacier.catalogs`, `glacier.tables`, and (Iceberg only) `glacier.snapshots` / `glacier.files`, also as `t.snapshots` / `t.files`. Iceberg is the table format, not the catalog. Remote `ATTACH` and `CREATE` / `INSERT` are refused in WASM. Hadoop listing is local (no S3 ListBucket).
-- **Memory.** Large scans stream. `ORDER BY` / `GROUP BY` / `DISTINCT` can spill under `GLACIER_MEM` (default 256 MiB) into `$GLACIER_TEMP`. `COUNT(*)` of a JOIN does not allocate the match rows.
-- **How you call it.** CLI `glacier` (TUI on a Linux terminal, or `-c SQL`). `glacier serve [warehouse] [--listen 127.0.0.1:8181] [--flight 127.0.0.1:8815]` is the process: Iceberg REST Catalog on HTTP, Arrow Flight SQL on `grpc://` (native binary; not in WASM or the wheel). Handshake, `CommandStatementQuery`, `GetFlightInfo`, `DoGet`, `GetCatalogs`, and `GetTables` talk to a `Session` in that process. Bind is localhost without TLS; a public bind without TLS is refused. Shared library `libglacier.so` on Linux + [`include/glacier.h`](include/glacier.h): `glacier_open` (file, warehouse, or REST URI), `glacier_open_catalog` (REST URI + warehouse + token), `glacier_query` (SQL, including `SHOW CATALOGS` / `ATTACH`). Bindings on that header: Python (`pip install glacier-olap`, or `bindings/python` after a local `$ZIG build`), Kof JVM (`bindings/kof`), WASM (`$ZIG build wasm`), Node, Go, Rust. Remote Python over Flight is `adbc_driver_flightsql` later, not this wheel. `glacier.api_version()` is still `1`: a file path remains a one-catalog shortcut.
+- **Memory.** Large scans stream. `ORDER BY` / `GROUP BY` / `DISTINCT` can spill under `GLACIER_MEM` (default 256 MiB) into `$GLACIER_TEMP`. `COUNT(*)` of a JOIN does not allocate the match rows. Query results split into record batches of `GLACIER_BATCH_ROWS` (default 65536).
+- **How you call it.** CLI `glacier` (TUI on a Linux terminal, or `-c SQL`). `glacier serve [warehouse] [--listen 127.0.0.1:8181] [--flight 127.0.0.1:8815]` is the process: Iceberg REST Catalog on HTTP, Arrow Flight SQL on `grpc://` (native binary; not in WASM or the wheel). Handshake, `CommandStatementQuery`, `GetFlightInfo`, `DoGet` (one FlightData record batch after the schema, repeated), `GetCatalogs`, and `GetTables` talk to a `Session` in that process. Bind is localhost without TLS; a public bind without TLS is refused. Shared library `libglacier.so` on Linux + [`include/glacier.h`](include/glacier.h): `glacier_open` (file, warehouse, or REST URI), `glacier_open_catalog` (REST URI + warehouse + token), `glacier_query` (SQL, including `SHOW CATALOGS` / `ATTACH`), `glacier_result_arrow` (every row), `glacier_result_next_arrow` (next batch). Bindings on that header: Python (`pip install glacier-olap`, or `bindings/python` after a local `$ZIG build`), Kof JVM (`bindings/kof`), WASM (`$ZIG build wasm`), Node, Go, Rust. Remote Python over Flight is `adbc_driver_flightsql` later, not this wheel. `glacier.api_version()` is still `1`: a file path remains a one-catalog shortcut.
 
 ---
 
 ## What this tree does not do
 
-`JOIN … USING` / `NATURAL` / comma-join, correlated subqueries, recursive `WITH`, named `WINDOW` clause, `GROUPS` frames. Azure Blob. ZSTD inside the WASM build (Snappy / GZIP / LZ4 work). A tested Windows (or native cmd) flow. Multipart object upload. Iceberg write transforms other than identity (`bucket` / `year` / `month` / `day` still prune on scan). Flight SQL prepared statements, JDBC metadata, SSO, or TLS. Temp tables, streaming `DoGet` batches, and query cancel (0.6).
+`JOIN … USING` / `NATURAL` / comma-join, correlated subqueries, recursive `WITH`, named `WINDOW` clause, `GROUPS` frames. Azure Blob. ZSTD inside the WASM build (Snappy / GZIP / LZ4 work). A tested Windows (or native cmd) flow. Multipart object upload. Iceberg write transforms other than identity (`bucket` / `year` / `month` / `day` still prune on scan). Flight SQL prepared statements, JDBC metadata, SSO, or TLS. Temp tables and query cancel (rest of 0.6).
 
 ---
 
@@ -197,25 +204,25 @@ n.execute("SELECT id WHERE qty IS NULL").fetchall()
 
 ## Kof (Linux)
 
-Kof 0.3 has no FFI, so this binding is JVM: `Conn.kf` is what the compiler sees, and at run time that class is Java JNI on `libglacier.so`. Full notes: [`bindings/kof`](bindings/kof).
+Tested on **Kof 0.4.9-beta**. The binding is still JVM JNI on `libglacier.so`: Kof `extern` binds scalar C symbols, not Arrow C Data. `Conn.kf` is what the compiler sees; at run time that class is Java JNI. Full notes: [`bindings/kof`](bindings/kof).
 
 ```kof
-var c = Conn.connectEmpty()
+var c = Conn.connect()
 assert(c.firstInt("SELECT 1") == 1)
 c.close()
 
-var sales = Conn.connectPath("tests/formats/sales.parquet")
+var sales = Conn.connect("tests/formats/sales.parquet")
 assert(sales.firstInt("SELECT COUNT(*)") == 10)
 sales.close()
 ```
 
 ```bash
 export ZIG="$HOME/opt/zig-0.16/zig"
-export KOF_HOME=/path/to/kof-*-linux-x86_64
+export KOF_HOME=/path/to/kof-0.4.9-beta-linux-x86_64
 bindings/kof/run_tests.sh
 ```
 
-`connectEmpty` / `connectPath` are separate names because Kof mis-resolves overloads. Do not use `kof run` / `kof test` on this tree: they recompile the stub and drop the JNI class.
+`connect()` / `connect(path)` are overloads. `connectEmpty` / `connectPath` remain. Do not use `kof run` / `kof test` on this tree: they recompile the stub and drop the JNI class.
 
 ---
 
@@ -234,7 +241,7 @@ cd bindings/rust && cargo test
 
 ## What to expect next
 
-**0.6.x:** streaming record batches on Flight `DoGet`, `CREATE TEMP TABLE`, query cancel. Then `api_version` 2 when a connection is a database session. The Windows test suite, Azure Blob, and parallel scan are not on that board.
+**0.6.x:** streaming record batches on Flight `DoGet` and `Result.nextBatch` (this tree). Next on that number: `CREATE TEMP TABLE`, query cancel. Then `api_version` 2 when a connection is a database session. The Windows test suite, Azure Blob, and parallel scan are not on that board.
 
 Issues and CI live in this repo. `glacier.version()` is `0.2.1`; `glacier.api_version()` is `1`. A file path remains the one-catalog shortcut so the 0.2.1 wheel keeps working.
 

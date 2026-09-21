@@ -9,6 +9,14 @@ class Conn {
         return 0
     }
 
+    static Conn connect() {
+        return Conn()
+    }
+
+    static Conn connect(String path) {
+        return Conn()
+    }
+
     static Conn connectEmpty() {
         return Conn()
     }

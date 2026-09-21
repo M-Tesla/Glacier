@@ -12,6 +12,7 @@ GLACIER_1 {
         glacier_result_destroy;
         glacier_result_error;
         glacier_result_arrow;
+        glacier_result_next_arrow;
         glacier_free;
         glacier_version;
         glacier_api_version;

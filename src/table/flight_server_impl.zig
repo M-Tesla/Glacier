@@ -217,19 +217,31 @@ fn doGet(gpa: std.mem.Allocator, conn: *h2.Conn, sess: *Session, stream: u32, sq
         return;
     };
     defer result.deinit();
-    const batch = result.nextBatch() orelse {
-        try conn.writeGrpcError(stream, "2", "empty result");
-        return;
-    };
-    const schema_hdr = try arrow_ipc.encodeSchemaHeader(gpa, batch);
+    const schema_hdr = try arrow_ipc.encodeSchemaHeader(gpa, result.batch);
     defer gpa.free(schema_hdr);
     const schema_msg = try encodeFlightData(gpa, schema_hdr, &.{});
     defer gpa.free(schema_msg);
-    const enc = try arrow_ipc.encodeBatch(gpa, batch);
-    defer enc.deinit(gpa);
-    const batch_msg = try encodeFlightData(gpa, enc.header, enc.body);
-    defer gpa.free(batch_msg);
-    try conn.writeGrpcMessages(stream, &.{ schema_msg, batch_msg }, true);
+    try conn.writeHeaders(stream, &.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    }, false);
+    {
+        const framed = try h2.grpcFrame(gpa, schema_msg);
+        defer gpa.free(framed);
+        try conn.writeData(stream, framed, false);
+    }
+    while (result.nextBatch()) |batch| {
+        const enc = try arrow_ipc.encodeBatch(gpa, batch);
+        defer enc.deinit(gpa);
+        const batch_msg = try encodeFlightData(gpa, enc.header, enc.body);
+        defer gpa.free(batch_msg);
+        const framed = try h2.grpcFrame(gpa, batch_msg);
+        defer gpa.free(framed);
+        try conn.writeData(stream, framed, false);
+    }
+    try conn.writeHeaders(stream, &.{
+        .{ .name = "grpc-status", .value = "0" },
+    }, true);
 }
 
 fn schemaForSql(a: std.mem.Allocator, sess: *Session, sql: []const u8) ![]u8 {
@@ -240,8 +252,7 @@ fn schemaForSql(a: std.mem.Allocator, sess: *Session, sql: []const u8) ![]u8 {
     }
     var result = try sess.execute(sql);
     defer result.deinit();
-    const batch = result.nextBatch() orelse return error.EmptyResult;
-    return arrow_ipc.encodeSchema(a, batch);
+    return arrow_ipc.encodeSchema(a, result.batch);
 }
 
 fn looksLikeWrite(sql: []const u8) bool {
@@ -446,6 +457,17 @@ pub fn queryI64(gpa: std.mem.Allocator, io: std.Io, port: u16, sql: []const u8) 
     return client.queryI64(sql);
 }
 
+pub const I64Stream = struct {
+    values: []i64,
+    n_batches: usize,
+};
+
+pub fn queryI64Stream(gpa: std.mem.Allocator, io: std.Io, port: u16, sql: []const u8) !I64Stream {
+    const client = try Client.connect(gpa, io, port);
+    defer client.deinit();
+    return client.collectI64(sql);
+}
+
 const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -510,12 +532,40 @@ const Client = struct {
     }
 
     fn queryI64(self: *Client, sql: []const u8) ![]i64 {
-        const got = try self.doQuery(sql);
-        defer {
-            self.gpa.free(got.header);
-            self.gpa.free(got.body);
+        const got = try self.collectI64(sql);
+        return got.values;
+    }
+
+    fn collectI64(self: *Client, sql: []const u8) !I64Stream {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const desc = try encodeDescriptor(a, sql);
+        const info_stream = self.conn.allocStream();
+        const info_path = svc ++ "GetFlightInfo";
+        try self.unary(info_stream, info_path, desc);
+        const info_msgs = try self.readUnary(a, info_stream);
+        if (info_msgs.len == 0) return error.InvalidFlight;
+        const ticket_sql = ticketFromInfo(a, info_msgs[0]) orelse sql;
+
+        const ticket = try encodeTicket(a, ticket_sql);
+        const get_stream = self.conn.allocStream();
+        try self.unary(get_stream, svc ++ "DoGet", ticket);
+        const data_msgs = try self.readUnary(a, get_stream);
+
+        var acc: std.ArrayList(i64) = .empty;
+        errdefer acc.deinit(self.gpa);
+        var n_batches: usize = 0;
+        for (data_msgs) |m| {
+            const h = pbBytes(m, 2) orelse continue;
+            const b = pbBytes(m, 1000) orelse continue;
+            const part = try arrow_ipc.firstI64s(self.gpa, h, b);
+            defer self.gpa.free(part);
+            try acc.appendSlice(self.gpa, part);
+            n_batches += 1;
         }
-        return arrow_ipc.firstI64s(self.gpa, got.header, got.body);
+        return .{ .values = try acc.toOwnedSlice(self.gpa), .n_batches = n_batches };
     }
 
     const Got = struct { header: []u8, body: []u8 };
@@ -656,4 +706,48 @@ test "Flight SQL SELECT 1 and INSERT visible on second connection" {
         try std.testing.expectEqual(@as(usize, 1), got.len);
         try std.testing.expectEqual(@as(i64, 2), got[0]);
     }
+}
+
+test "Flight SQL DoGet streams multiple record batches" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const posix_env = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    _ = posix_env.setenv("GLACIER_BATCH_ROWS", "2", 1);
+    defer _ = posix_env.unsetenv("GLACIER_BATCH_ROWS");
+
+    const root = "/tmp/glacier_flight_stream";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    var h = try bind(gpa, io, root, "127.0.0.1:0");
+    var fut = try io.concurrent(serveLoop, .{&h});
+    defer {
+        h.stop();
+        _ = fut.cancel(io) catch {};
+        h.deinit();
+    }
+
+    const port = h.port();
+    try runSql(gpa, io, port, "CREATE NAMESPACE sales");
+    try runSql(gpa, io, port, "CREATE TABLE sales.orders (id BIGINT, category STRING)");
+    try runSql(gpa, io, port, "INSERT INTO sales.orders VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')");
+    const got = try queryI64Stream(gpa, io, port, "SELECT id FROM sales.orders ORDER BY id");
+    defer gpa.free(got.values);
+    try std.testing.expect(got.n_batches >= 2);
+    try std.testing.expectEqual(@as(usize, 5), got.values.len);
+    try std.testing.expectEqual(@as(i64, 1), got.values[0]);
+    try std.testing.expectEqual(@as(i64, 2), got.values[1]);
+    try std.testing.expectEqual(@as(i64, 3), got.values[2]);
+    try std.testing.expectEqual(@as(i64, 4), got.values[3]);
+    try std.testing.expectEqual(@as(i64, 5), got.values[4]);
 }
