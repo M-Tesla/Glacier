@@ -15,3 +15,7 @@ pub const bindTls = impl.bindTls;
 pub const serveLoop = impl.serveLoop;
 pub const parseListen = impl.parseListen;
 pub const parseListenPort = impl.parseListenPort;
+
+test {
+    _ = impl;
+}

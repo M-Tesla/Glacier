@@ -2515,6 +2515,33 @@ fn findPicked(reader: parquet.Reader, picked: []const i32, name: []const u8) ?us
     return null;
 }
 
+fn aggNoExtreme(query: sql.Query) bool {
+    for (query.items) |item| {
+        if (item != .agg) continue;
+        if (item.agg.kind == .min or item.agg.kind == .max) return false;
+    }
+    return true;
+}
+
+fn dictIntAt(col: NumCol, ix: u32) ?i64 {
+    return switch (col.kind) {
+        .i32 => if (ix >= col.i32s.len) null else col.i32s[ix],
+        .i64 => if (ix >= col.i64s.len) null else col.i64s[ix],
+        else => null,
+    };
+}
+
+fn intLit(lit: sql.Literal) ?i64 {
+    return switch (lit) {
+        .int => |n| n,
+        .float => |f| blk: {
+            if (f < -(1 << 53) or f > (1 << 53)) return null;
+            break :blk @as(i64, @intFromFloat(f));
+        },
+        else => null,
+    };
+}
+
 fn applyPartial(states: []AggState, query: sql.Query, n: u64, sum_f: f64, sum_i: i64, is_float: bool) void {
     var si: usize = 0;
     for (query.items) |item| {
@@ -2640,6 +2667,71 @@ fn feedGlobalFast(
             matched += 1;
         }
         applyPartial(states, query, matched, s, 0, true);
+        return true;
+    }
+
+    if (!nullable and pred == null and value_i != null and aggNoExtreme(query) and (val_col.kind == .i32 or val_col.kind == .i64)) {
+        var s: i64 = 0;
+        if (val_col.dict and val_col.kind == .i64) {
+            const dict: [*]const i64 = val_col.i64s.ptr;
+            for (val_col.idx) |ix| {
+                if (builtin.mode == .Debug and ix >= val_col.i64s.len) return error.ParquetOpenFailed;
+                s += dict[ix];
+            }
+        } else if (val_col.dict and val_col.kind == .i32) {
+            const dict: [*]const i32 = val_col.i32s.ptr;
+            for (val_col.idx) |ix| {
+                if (builtin.mode == .Debug and ix >= val_col.i32s.len) return error.ParquetOpenFailed;
+                s += dict[ix];
+            }
+        } else if (val_col.kind == .i64) {
+            for (val_col.i64s[0..val_col.n]) |v| s += v;
+        } else {
+            for (val_col.i32s[0..val_col.n]) |v| s += v;
+        }
+        applyPartial(states, query, @intCast(val_col.n), 0, s, false);
+        return true;
+    }
+
+    if (!nullable and pred != null and value_i != null and val_col.dict and pred_col.dict and aggNoExtreme(query) and (val_col.kind == .i32 or val_col.kind == .i64) and (pred_col.kind == .i32 or pred_col.kind == .i64)) {
+        const p = pred.?;
+        const lit = intLit(p.lit) orelse return false;
+        if (pred_col.idx.len != val_col.idx.len) return false;
+        var s: i64 = 0;
+        var matched: u64 = 0;
+        for (pred_col.idx, val_col.idx) |ki, vi| {
+            const kv = dictIntAt(pred_col, ki) orelse return error.ParquetOpenFailed;
+            if (!cmpI64(p.op, kv, lit)) continue;
+            const vv = dictIntAt(val_col, vi) orelse return error.ParquetOpenFailed;
+            s += vv;
+            matched += 1;
+        }
+        applyPartial(states, query, matched, 0, s, false);
+        return true;
+    }
+
+    if (!nullable and pred != null and value_i != null and !val_col.dict and val_col.kind == .i64 and pred_col.dict and (pred_col.kind == .i32 or pred_col.kind == .i64) and aggNoExtreme(query)) {
+        const p = pred.?;
+        const lit = intLit(p.lit) orelse return false;
+        if (pred_col.idx.len != val_col.n) return false;
+        const vals = val_col.i64s;
+        const p64: ?[*]const i64 = if (pred_col.kind == .i64) pred_col.i64s.ptr else null;
+        const p32: ?[*]const i32 = if (pred_col.kind == .i32) pred_col.i32s.ptr else null;
+        var s: i64 = 0;
+        var matched: u64 = 0;
+        for (pred_col.idx, 0..) |ki, row| {
+            const kv: i64 = if (p64) |d| blk: {
+                if (builtin.mode == .Debug and ki >= pred_col.i64s.len) return error.ParquetOpenFailed;
+                break :blk d[ki];
+            } else blk: {
+                if (builtin.mode == .Debug and ki >= pred_col.i32s.len) return error.ParquetOpenFailed;
+                break :blk p32.?[ki];
+            };
+            if (!cmpI64(p.op, kv, lit)) continue;
+            s += vals[row];
+            matched += 1;
+        }
+        applyPartial(states, query, matched, 0, s, false);
         return true;
     }
 
@@ -3329,28 +3421,56 @@ fn foldGroupBatch(
 
     const key_null = bitmapHasNull(key.nulls, key.n);
     const val_null = if (val) |v| bitmapHasNull(v.nulls, v.n) else false;
-    const scatter = !has_extreme and !key_null and !val_null and key.dict and key.kind == .i32 and val != null and val.?.dict and val.?.kind == .f64 and (pred == null or colSame(pred.?.name, gname));
+    const key_int_dict = key.dict and (key.kind == .i32 or key.kind == .i64);
+    const val_dict_num = if (val) |v| v.dict and (v.kind == .i32 or v.kind == .i64 or v.kind == .f32 or v.kind == .f64) else false;
+    const scatter = !has_extreme and !key_null and !val_null and key_int_dict and val_dict_num and (pred == null or colSame(pred.?.name, gname));
     if (scatter) {
-        const kd = key.i32s;
-        const vd = val.?.f64s;
-        const counts = try alloc.alloc(u64, kd.len);
-        const sums = try alloc.alloc(f64, kd.len);
+        const vc = val.?;
+        const nkeys: usize = if (key.kind == .i32) key.i32s.len else key.i64s.len;
+        const counts = try alloc.alloc(u64, nkeys);
         @memset(counts, 0);
-        @memset(sums, 0);
-        const lit_i: i32 = if (pred) |p| switch (p.lit) {
-            .int => |n| if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return false else @intCast(n),
-            else => return false,
-        } else 0;
-        for (key.idx, val.?.idx) |ki, vi| {
-            if (ki >= kd.len or vi >= vd.len) return error.ParquetOpenFailed;
-            if (pred) |p| if (!cmpI64(p.op, kd[ki], lit_i)) continue;
-            counts[ki] += 1;
-            sums[ki] += vd[vi];
+        const as_float = vc.kind == .f32 or vc.kind == .f64;
+        const sums_f: ?[]f64 = if (as_float) try alloc.alloc(f64, nkeys) else null;
+        const sums_i: ?[]i64 = if (as_float) null else try alloc.alloc(i64, nkeys);
+        if (sums_f) |buf| @memset(buf, 0);
+        if (sums_i) |buf| @memset(buf, 0);
+        const lit_i: i64 = if (pred) |p| intLit(p.lit) orelse return false else 0;
+        if (!as_float and key.kind == .i64 and vc.kind == .i64 and pred == null) {
+            const vals: [*]const i64 = vc.i64s.ptr;
+            for (key.idx, vc.idx) |ki, vi| {
+                if (ki >= nkeys) return error.ParquetOpenFailed;
+                if (builtin.mode == .Debug and vi >= vc.i64s.len) return error.ParquetOpenFailed;
+                counts[ki] += 1;
+                sums_i.?[ki] += vals[vi];
+            }
+        } else {
+            for (key.idx, vc.idx) |ki, vi| {
+                if (ki >= nkeys) return error.ParquetOpenFailed;
+                if (pred) |p| {
+                    const kv = dictIntAt(key, ki) orelse return error.ParquetOpenFailed;
+                    if (!cmpI64(p.op, kv, lit_i)) continue;
+                }
+                if (as_float) {
+                    const fv: f64 = switch (vc.kind) {
+                        .f64 => if (vi >= vc.f64s.len) return error.ParquetOpenFailed else vc.f64s[vi],
+                        .f32 => if (vi >= vc.f32s.len) return error.ParquetOpenFailed else vc.f32s[vi],
+                        else => return error.ParquetOpenFailed,
+                    };
+                    counts[ki] += 1;
+                    sums_f.?[ki] += fv;
+                } else {
+                    const iv = dictIntAt(vc, vi) orelse return error.ParquetOpenFailed;
+                    counts[ki] += 1;
+                    sums_i.?[ki] += iv;
+                }
+            }
         }
-        for (kd, counts, sums) |k, c, s| {
-            if (c == 0) continue;
+        var i: usize = 0;
+        while (i < nkeys) : (i += 1) {
+            if (counts[i] == 0) continue;
+            const k = dictIntAt(key, @intCast(i)) orelse return error.ParquetOpenFailed;
             const sts = try acc.touchInt(k, query);
-            applyPartial(sts, query, c, s, 0, true);
+            if (as_float) applyPartial(sts, query, counts[i], sums_f.?[i], 0, true) else applyPartial(sts, query, counts[i], 0, sums_i.?[i], false);
         }
         return true;
     }

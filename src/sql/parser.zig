@@ -591,6 +591,15 @@ pub const AlterTable = struct {
     column: ColDef,
 };
 
+pub const GrantPrivilege = enum { select, all };
+
+pub const Grant = struct {
+    privilege: GrantPrivilege,
+    ident: []const u8,
+    principal: []const u8,
+    revoke: bool = false,
+};
+
 pub const Stmt = union(enum) {
     query: Query,
     copy: Copy,
@@ -611,6 +620,7 @@ pub const Stmt = union(enum) {
     expire_snapshots: ExpireSnapshots,
     remove_orphans: RemoveOrphans,
     explain: Explain,
+    grant: Grant,
 };
 
 pub fn aggArgsEqual(a: ?[]const u8, b: ?[]const u8) bool {
@@ -1925,7 +1935,7 @@ fn blankSql(s: []const u8) bool {
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !Query {
     switch (try parseStmt(allocator, sql)) {
         .query => |q| return q,
-        .copy, .show, .attach, .describe, .use, .detach, .create_namespace, .create_table, .insert, .delete, .update, .merge, .alter_table, .drop_table, .compact_table, .expire_snapshots, .remove_orphans, .explain => return error.InvalidSyntax,
+        .copy, .show, .attach, .describe, .use, .detach, .create_namespace, .create_table, .insert, .delete, .update, .merge, .alter_table, .drop_table, .compact_table, .expire_snapshots, .remove_orphans, .explain, .grant => return error.InvalidSyntax,
     }
 }
 
@@ -1983,7 +1993,39 @@ pub fn parseStmt(allocator: std.mem.Allocator, sql: []const u8) !Stmt {
         _ = try lexer.next();
         return .{ .explain = .{ .query = try parseQuery(allocator, &lexer, sql, .eof) } };
     }
+    if ((try lexer.peek()).kind == .ident and eqlKw((try lexer.peek()).slice(sql), "grant")) {
+        return .{ .grant = try parseGrant(&lexer, sql, false) };
+    }
+    if ((try lexer.peek()).kind == .ident and eqlKw((try lexer.peek()).slice(sql), "revoke")) {
+        return .{ .grant = try parseGrant(&lexer, sql, true) };
+    }
     return .{ .query = try parseQuery(allocator, &lexer, sql, .eof) };
+}
+
+fn parseGrant(lexer: *Lexer, sql: []const u8, revoke: bool) !Grant {
+    _ = try lexer.next();
+    const priv_tok = try lexer.next();
+    const privilege: GrantPrivilege = switch (priv_tok.kind) {
+        .select => .select,
+        .all => .all,
+        else => return error.InvalidSyntax,
+    };
+    if ((try lexer.next()).kind != .on) return error.InvalidSyntax;
+    const table = try expect(lexer, .ident);
+    if (!eqlKw(table.slice(sql), "table")) return error.InvalidSyntax;
+    const ident = try parseDottedIdent(lexer, sql);
+    const dir = try lexer.next();
+    if (revoke) {
+        if (dir.kind != .from) return error.InvalidSyntax;
+    } else if (dir.kind != .to) return error.InvalidSyntax;
+    const who = try expect(lexer, .ident);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{
+        .privilege = privilege,
+        .ident = ident,
+        .principal = who.slice(sql),
+        .revoke = revoke,
+    };
 }
 
 fn parseCompact(lexer: *Lexer, sql: []const u8) !CompactTable {
@@ -4102,6 +4144,22 @@ test "parse CREATE INSERT DROP" {
     try std.testing.expectEqualStrings("lake.sales.orders", alter.alter_table.ident);
     try std.testing.expectEqualStrings("note", alter.alter_table.column.name);
     try std.testing.expectEqualStrings("string", alter.alter_table.column.type_name);
+}
+
+test "parse GRANT and REVOKE" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g = try parseStmt(a, "GRANT SELECT ON TABLE sales.orders TO bearer");
+    try std.testing.expectEqual(GrantPrivilege.select, g.grant.privilege);
+    try std.testing.expectEqualStrings("sales.orders", g.grant.ident);
+    try std.testing.expectEqualStrings("bearer", g.grant.principal);
+    try std.testing.expect(!g.grant.revoke);
+    const r = try parseStmt(a, "REVOKE ALL ON TABLE lake.sales.orders FROM bearer");
+    try std.testing.expectEqual(GrantPrivilege.all, r.grant.privilege);
+    try std.testing.expectEqualStrings("lake.sales.orders", r.grant.ident);
+    try std.testing.expect(r.grant.revoke);
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "GRANT SELECT ON sales.orders TO bearer"));
 }
 
 test "parse FOR SNAPSHOT and FOR TIMESTAMP AS OF" {

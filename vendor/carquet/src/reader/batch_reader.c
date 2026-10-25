@@ -785,6 +785,37 @@ static void read_nested_list_column(
  * ============================================================================
  */
 
+/* Dictionary data pages only. PLAIN in the same list means a data page may
+ * fall back to raw values, and preserving indices would then write past the
+ * index buffer. Writers that omit dictionary_page_offset still list
+ * PLAIN_DICTIONARY or RLE_DICTIONARY when every data page is dictionary. */
+static bool column_metadata_dictionary_only(const parquet_column_metadata_t* meta) {
+    bool dict = false;
+    bool plain = false;
+    int32_t i;
+    if (!meta || !meta->encodings || meta->num_encodings <= 0) return false;
+    for (i = 0; i < meta->num_encodings; i++) {
+        carquet_encoding_t enc = meta->encodings[i];
+        if (enc == CARQUET_ENCODING_PLAIN_DICTIONARY ||
+            enc == CARQUET_ENCODING_RLE_DICTIONARY) {
+            dict = true;
+        } else if (enc == CARQUET_ENCODING_PLAIN) {
+            plain = true;
+        }
+    }
+    return dict && !plain;
+}
+
+static bool want_preserve_dictionary(
+    bool requested,
+    const parquet_column_metadata_t* meta,
+    int16_t max_rep) {
+
+    if (!requested || !meta || max_rep != 0) return false;
+    if (meta->has_dictionary_page_offset) return true;
+    return column_metadata_dictionary_only(meta);
+}
+
 static void reset_column_reader_for_row_group(
     carquet_column_reader_t* col_reader,
     carquet_reader_t* file_reader,
@@ -825,9 +856,8 @@ static void reset_column_reader_for_row_group(
      * stream. Leaving it on would make that path read 16-byte carquet_byte_array_t
      * structs out of a buffer holding uint32_t indices — wild pointers and an
      * out-of-bounds read on export. */
-    col_reader->preserve_dictionary =
-        preserve_dictionaries && col_reader->col_meta->has_dictionary_page_offset &&
-        col_reader->max_rep_level == 0;
+    col_reader->preserve_dictionary = want_preserve_dictionary(
+        preserve_dictionaries, col_reader->col_meta, col_reader->max_rep_level);
 
     /* Reset reading state */
     col_reader->values_remaining = col_reader->col_meta->num_values;
@@ -1252,9 +1282,8 @@ static carquet_status_t open_row_group_readers(
          * pages are pre-loaded ahead of the read phase, so it must be fixed
          * now rather than at read time. */
         carquet_column_reader_t* cr = batch_reader->col_readers[i];
-        cr->preserve_dictionary = batch_reader->config.preserve_dictionaries &&
-            cr->col_meta && cr->col_meta->has_dictionary_page_offset &&
-            cr->max_rep_level == 0;  /* nested columns can't expose preserved indices */
+        cr->preserve_dictionary = want_preserve_dictionary(
+            batch_reader->config.preserve_dictionaries, cr->col_meta, cr->max_rep_level);
     }
 
     batch_reader->current_row_group = row_group_index;

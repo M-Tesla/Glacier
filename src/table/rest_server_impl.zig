@@ -3,6 +3,7 @@
 const std = @import("std");
 const iceberg = @import("iceberg.zig");
 const glacier_catalog = @import("glacier_catalog.zig");
+const grants = @import("grants.zig");
 const vfs = @import("../vfs/source.zig");
 
 const net = std.Io.net;
@@ -19,6 +20,8 @@ pub const Handle = struct {
     warehouse: []u8,
     server: net.Server,
     tls: ?*anyopaque = null,
+    /// When set, every REST call needs `Authorization: Bearer <token>`.
+    token: ?[]u8 = null,
     closed: bool = false,
 
     pub fn port(self: Handle) u16 {
@@ -34,7 +37,13 @@ pub const Handle = struct {
     pub fn deinit(self: *Handle) void {
         self.stop();
         if (self.tls) |ctx| glacier_tls_free(ctx);
+        if (self.token) |tok| self.gpa.free(tok);
         self.gpa.free(self.warehouse);
+    }
+
+    pub fn setBearer(self: *Handle, token: []const u8) !void {
+        if (self.token) |old| self.gpa.free(old);
+        self.token = try self.gpa.dupe(u8, token);
     }
 };
 
@@ -252,6 +261,9 @@ fn handleRequest(self: *Handle, request: *http.Server.Request) !void {
     const q = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
     const path = std.mem.trimEnd(u8, target[0..q], "/");
     const method = request.head.method;
+    if (!bearerOk(self, request)) {
+        return sendErrA(a, request, .unauthorized, "NotAuthorizedException", "missing or invalid bearer token");
+    }
     const body = try readBody(request, a);
 
     var parts: std.ArrayList([]const u8) = .empty;
@@ -281,6 +293,26 @@ fn handleRequest(self: *Handle, request: *http.Server.Request) !void {
         if (method == .DELETE) return deleteTable(self, a, request, ns, name);
     }
     return sendErrA(a, request, .not_found, "NoSuchTableException", "not found");
+}
+
+fn bearerOk(self: *const Handle, request: *http.Server.Request) bool {
+    const expect = self.token orelse return true;
+    var it = request.iterateHeaders();
+    while (it.next()) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "authorization")) continue;
+        const prefix = "Bearer ";
+        if (h.value.len <= prefix.len) return false;
+        if (!std.ascii.eqlIgnoreCase(h.value[0..prefix.len], prefix)) return false;
+        return tokenMatch(h.value[prefix.len..], expect);
+    }
+    return false;
+}
+
+fn tokenMatch(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
 }
 
 fn readBody(request: *http.Server.Request, allocator: std.mem.Allocator) ![]const u8 {
@@ -325,15 +357,31 @@ fn configJson(allocator: std.mem.Allocator, warehouse: []const u8) ![]u8 {
     }, .{});
 }
 
+fn bearerGrants(self: *Handle, a: std.mem.Allocator) ![]const grants.Grant {
+    if (self.token == null) return &.{};
+    var http_client: std.http.Client = .{ .allocator = self.gpa, .io = self.io };
+    defer http_client.deinit();
+    const t = vfs.Transport{ .allocator = self.gpa, .io = self.io, .http = &http_client };
+    return grants.load(a, t, self.warehouse);
+}
+
+fn forbid(a: std.mem.Allocator, request: *http.Server.Request) !void {
+    return sendErrA(a, request, .forbidden, "ForbiddenException", "not granted");
+}
+
 fn listNamespacesJson(self: *Handle, a: std.mem.Allocator) ![]u8 {
     var http_client: std.http.Client = .{ .allocator = self.gpa, .io = self.io };
     defer http_client.deinit();
     const t = vfs.Transport{ .allocator = self.gpa, .io = self.io, .http = &http_client };
     const nss = try glacier_catalog.listNamespaces(a, t, self.warehouse);
+    const gs = try bearerGrants(self, a);
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(a, "{\"namespaces\":[");
-    for (nss, 0..) |ns, i| {
-        if (i > 0) try buf.append(a, ',');
+    var n: usize = 0;
+    for (nss) |ns| {
+        if (self.token != null and !grants.namespaceVisible(gs, ns)) continue;
+        if (n > 0) try buf.append(a, ',');
+        n += 1;
         try appendNsArray(&buf, a, ns);
     }
     try buf.appendSlice(a, "]}");
@@ -345,10 +393,14 @@ fn listTablesJson(self: *Handle, a: std.mem.Allocator, ns: []const u8) ![]u8 {
     defer http_client.deinit();
     const t = vfs.Transport{ .allocator = self.gpa, .io = self.io, .http = &http_client };
     const tables = try glacier_catalog.listTables(a, t, self.warehouse, ns);
+    const gs = try bearerGrants(self, a);
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(a, "{\"identifiers\":[");
-    for (tables, 0..) |tbl, i| {
-        if (i > 0) try buf.append(a, ',');
+    var n: usize = 0;
+    for (tables) |tbl| {
+        if (self.token != null and !grants.allows(gs, tbl.namespace, tbl.name, false)) continue;
+        if (n > 0) try buf.append(a, ',');
+        n += 1;
         try buf.appendSlice(a, "{\"namespace\":");
         try appendNsArray(&buf, a, tbl.namespace);
         try buf.appendSlice(a, ",\"name\":");
@@ -372,6 +424,7 @@ fn postNamespace(
         else => "",
     };
     if (ns.len == 0) return sendErrA(a, request, .bad_request, "BadRequestException", "namespace");
+    if (self.token != null) return forbid(a, request);
     try glacier_catalog.addNamespace(a, self.io, self.warehouse, ns);
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(a, "{\"namespace\":");
@@ -398,6 +451,7 @@ fn postTable(
         else => "",
     };
     if (name.len == 0) return sendErrA(a, request, .bad_request, "BadRequestException", "name");
+    if (self.token != null) return forbid(a, request);
 
     var http_client: std.http.Client = .{ .allocator = self.gpa, .io = self.io };
     defer http_client.deinit();
@@ -431,6 +485,10 @@ fn getTable(
     ns: []const u8,
     name: []const u8,
 ) !void {
+    if (self.token != null) {
+        const gs = try bearerGrants(self, a);
+        if (!grants.allows(gs, ns, name, false)) return forbid(a, request);
+    }
     const load = try loadTableJson(self, a, ns, name) orelse
         return sendErrA(a, request, .not_found, "NoSuchTableException", "no such table");
     try sendJson(request, .ok, load);
@@ -443,6 +501,10 @@ fn deleteTable(
     ns: []const u8,
     name: []const u8,
 ) !void {
+    if (self.token != null) {
+        const gs = try bearerGrants(self, a);
+        if (!grants.allows(gs, ns, name, true)) return forbid(a, request);
+    }
     _ = glacier_catalog.dropTable(a, self.io, self.warehouse, ns, name) catch |err| switch (err) {
         error.TableNotFound => return sendErrA(a, request, .not_found, "NoSuchTableException", "no such table"),
         else => return err,
@@ -461,6 +523,10 @@ fn commitTable(
     name: []const u8,
     body: []const u8,
 ) !void {
+    if (self.token != null) {
+        const gs = try bearerGrants(self, a);
+        if (!grants.allows(gs, ns, name, true)) return forbid(a, request);
+    }
     var http_client: std.http.Client = .{ .allocator = self.gpa, .io = self.io };
     defer http_client.deinit();
     const t = vfs.Transport{ .allocator = self.gpa, .io = self.io, .http = &http_client };
@@ -922,6 +988,53 @@ test "tls rest answers https config" {
     var stdout_reader = py.stdout.?.readerStreaming(io, &line_buf);
     const line = try stdout_reader.interface.takeDelimiterExclusive('\n');
     try std.testing.expect(std.mem.indexOf(u8, line, "glacier_tls_wh") != null);
+}
+
+fn httpStatus(gpa: std.mem.Allocator, io: std.Io, url: []const u8, headers: []const http.Header) !http.Status {
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .extra_headers = headers,
+        .response_writer = &aw.writer,
+        .keep_alive = false,
+        .headers = .{ .accept_encoding = .omit },
+    });
+    return result.status;
+}
+
+test "bearer token gates REST" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_bearer_wh";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var h = try bind(gpa, io, root, "127.0.0.1:0");
+    try h.setBearer("s3cret");
+    var fut = try io.concurrent(serveLoop, .{&h});
+    defer {
+        h.stop();
+        _ = fut.cancel(io) catch {};
+        h.deinit();
+    }
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1/config", .{h.port()});
+    defer gpa.free(url);
+    try std.testing.expectEqual(http.Status.unauthorized, try httpStatus(gpa, io, url, &.{}));
+    try std.testing.expectEqual(http.Status.unauthorized, try httpStatus(gpa, io, url, &.{
+        .{ .name = "Authorization", .value = "Bearer nope" },
+    }));
+    try std.testing.expectEqual(http.Status.ok, try httpStatus(gpa, io, url, &.{
+        .{ .name = "Authorization", .value = "Bearer s3cret" },
+    }));
 }
 
 test "decodeNs unit separator" {

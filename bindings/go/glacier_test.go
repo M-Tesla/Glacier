@@ -19,7 +19,7 @@ func repoRoot(t *testing.T) string {
 }
 
 func TestSelect1(t *testing.T) {
-	if glacier.Version() != "0.6.2" {
+	if glacier.Version() != "0.6.3" {
 		t.Fatalf("version %s", glacier.Version())
 	}
 	if glacier.APIVersion() != 1 {

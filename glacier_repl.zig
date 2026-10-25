@@ -14,7 +14,8 @@ const usage_text =
     \\                    omitted: TUI source picker (local / S3 / HTTP / empty)
     \\  --catalog URL     Iceberg REST Catalog
     \\  --warehouse NAME  warehouse query for GET /v1/config
-    \\  --token TOKEN     bearer token (or ICEBERG_TOKEN)
+    \\  --token TOKEN     bearer token (or ICEBERG_TOKEN). With serve, REST
+    \\                    requires Authorization: Bearer TOKEN
     \\  --header 'N: v'   extra catalog header (repeatable)
     \\  --auth MODE       auto, none, bearer, oauth2, sigv4 (default auto)
     \\  --oauth-client-id / --oauth-client-secret / --oauth-server / --oauth-scope
@@ -25,6 +26,7 @@ const usage_text =
     \\  -f, --file FILE   run that SQL script the same way
     \\                    SHOW / ATTACH / DESCRIBE / USE / DETACH work as catalog SQL
     \\                    CREATE / INSERT / COPY FROM / DELETE / UPDATE / MERGE / ALTER ADD COLUMN / DROP / PARTITIONED BY identity on glacier, Hadoop, REST
+    \\                    GRANT SELECT|ALL ON TABLE t TO bearer on the glacier catalog (REVOKE FROM bearer)
     \\                    FROM glacier.catalogs / glacier.tables / glacier.snapshots / glacier.files
     \\  --timer           print wall time + peak RSS after each query (default)
     \\  --no-timer        hide stats
@@ -146,7 +148,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.serve) {
         const warehouse = args.path orelse ".";
-        flight_server.run(gpa, io, warehouse, args.listen, args.flight, out, args.tls_cert, args.tls_key) catch |err| {
+        flight_server.run(gpa, io, warehouse, args.listen, args.flight, out, args.tls_cert, args.tls_key, args.token) catch |err| {
             switch (err) {
                 error.TlsRequired => try out.print("glacier serve: bind outside localhost needs TLS\n", .{}),
                 error.InvalidAddress => try out.print("glacier serve: invalid --listen / --flight\n", .{}),

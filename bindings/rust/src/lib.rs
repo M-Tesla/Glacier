@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn select_1() {
-        assert_eq!(version(), "0.6.2");
+        assert_eq!(version(), "0.6.3");
         assert_eq!(api_version(), 2);
         let con = Conn::connect(None).unwrap();
         let rows = con.execute("select 1").unwrap();

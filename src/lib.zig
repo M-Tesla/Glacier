@@ -19,6 +19,7 @@ pub const catalog = @import("table/catalog.zig");
 pub const rest_catalog = @import("table/rest_catalog.zig");
 pub const hadoop_catalog = @import("table/hadoop_catalog.zig");
 pub const glacier_catalog = @import("table/glacier_catalog.zig");
+pub const grants = @import("table/grants.zig");
 pub const rest_server = @import("table/rest_server.zig");
 pub const err = @import("error.zig");
 pub const c_api = @import("c_api.zig");
@@ -29,7 +30,7 @@ pub const Batch = batch.Batch;
 pub const Column = batch.Column;
 pub const GlacierError = err.GlacierError;
 
-pub const version = "0.6.2";
+pub const version = "0.6.3";
 
 comptime {
     _ = &c_api.glacier_open;
@@ -65,6 +66,7 @@ test {
     _ = rest_catalog;
     _ = hadoop_catalog;
     _ = glacier_catalog;
+    _ = grants;
     _ = rest_server;
     _ = err;
     _ = c_api;

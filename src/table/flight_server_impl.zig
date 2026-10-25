@@ -65,8 +65,10 @@ pub fn run(
     out: *std.Io.Writer,
     tls_cert: ?[]const u8,
     tls_key: ?[]const u8,
+    bearer: ?[]const u8,
 ) !void {
     var rest = try rest_server.bindTls(gpa, io, warehouse, listen, tls_cert, tls_key);
+    if (bearer) |tok| try rest.setBearer(tok);
     defer rest.deinit();
     var fl = try bind(gpa, io, warehouse, flight);
     defer fl.deinit();
@@ -74,6 +76,7 @@ pub fn run(
     try out.print("Iceberg REST  {s}://{f}\n", .{ scheme, rest.server.socket.address });
     try out.print("Arrow Flight  grpc://{f}\n", .{fl.server.socket.address});
     try out.print("warehouse     {s}\n", .{warehouse});
+    if (bearer != null) try out.print("REST auth     bearer\n", .{});
     try out.flush();
     var rest_fut = try io.concurrent(rest_server.serveLoop, .{&rest});
     defer _ = rest_fut.cancel(io) catch {};

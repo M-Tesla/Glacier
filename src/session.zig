@@ -11,6 +11,7 @@ const catalog = @import("table/catalog.zig");
 const rest_catalog = @import("table/rest_catalog.zig");
 const hadoop_catalog = @import("table/hadoop_catalog.zig");
 const glacier_catalog = @import("table/glacier_catalog.zig");
+const grants = @import("table/grants.zig");
 const errmod = @import("error.zig");
 const vfs = @import("vfs/source.zig");
 const cache = @import("vfs/cache.zig");
@@ -447,6 +448,10 @@ pub const Session = struct {
             },
             .explain => |ex| {
                 const batch = try self.executeExplain(a, ex);
+                return try self.wrapResult(&arena, batch, .{});
+            },
+            .grant => |g| {
+                const batch = try self.executeGrant(a, g);
                 return try self.wrapResult(&arena, batch, .{});
             },
         }
@@ -1494,7 +1499,9 @@ pub const Session = struct {
                             try names.append(a, ns);
                             try cats.append(a, entry.name);
                         }
-                    } else |_| {}
+                    } else |err| {
+                        if (err == error.AccessDenied) return err;
+                    }
                 }
             },
             .iceberg_hadoop => {
@@ -1541,7 +1548,9 @@ pub const Session = struct {
                             try cats.append(a, entry.name);
                             try nss.append(a, id.namespace);
                         }
-                    } else |_| {}
+                    } else |err| {
+                        if (err == error.AccessDenied) return err;
+                    }
                 }
                 if (!listed) {
                     var it = self.table_cache.iterator();
@@ -1848,6 +1857,32 @@ pub const Session = struct {
             .files => return error.WriteUnsupported,
         }
         return .{ .entry = entry, .ns = ns };
+    }
+
+    fn executeGrant(self: *Session, a: std.mem.Allocator, g: sql.Grant) !Batch {
+        try refuseWrite();
+        if (!std.ascii.eqlIgnoreCase(g.principal, grants.principal)) return error.GrantPrincipal;
+        const target = try self.resolveWrite(a, g.ident);
+        if (target.entry.kind != .glacier) return error.ForeignGrant;
+        const tables = try glacier_catalog.listTables(a, self.transport(), target.entry.warehouse, target.ns);
+        var found = false;
+        for (tables) |tbl| {
+            if (std.ascii.eqlIgnoreCase(tbl.name, target.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.TableNotFound;
+        const privilege: grants.Privilege = if (g.privilege == .all) .all else .select;
+        if (g.revoke) {
+            try grants.revoke(a, self.io, target.entry.warehouse, target.ns, target.name, privilege, grants.principal);
+        } else {
+            try grants.grant(a, self.io, target.entry.warehouse, target.ns, target.name, privilege, grants.principal);
+        }
+        const priv_name: []const u8 = if (g.privilege == .all) "all" else "select";
+        return catalog.utf8Cols(a, &.{ "privilege", "table", "principal" }, &.{
+            &.{priv_name}, &.{g.ident}, &.{grants.principal},
+        });
     }
 
     fn executeCreateNamespace(self: *Session, a: std.mem.Allocator, n: sql.CreateNamespace) !Batch {
@@ -2903,9 +2938,15 @@ pub const Session = struct {
                 .iceberg_rest => {
                     catalog_session = true;
                     const client = entry.rest orelse self.rest orelse continue;
-                    const namespaces = client.listNamespaces(a, self.transport()) catch continue;
+                    const namespaces = client.listNamespaces(a, self.transport()) catch |err| {
+                        if (err == error.AccessDenied) return err;
+                        continue;
+                    };
                     for (namespaces) |ns| {
-                        const idents = client.listTables(a, self.transport(), ns) catch continue;
+                        const idents = client.listTables(a, self.transport(), ns) catch |err| {
+                            if (err == error.AccessDenied) return err;
+                            continue;
+                        };
                         for (idents) |id| {
                             const ns_name = if (id.namespace.len > 0) id.namespace else ns;
                             const qn = if (ns_name.len == 0)
@@ -3042,9 +3083,13 @@ pub const Session = struct {
                                         try cats.append(a, entry.name);
                                         try nss.append(a, id.namespace);
                                     }
-                                } else |_| {}
+                                } else |err| {
+                                    if (err == error.AccessDenied) return err;
+                                }
                             }
-                        } else |_| {}
+                        } else |err| {
+                            if (err == error.AccessDenied) return err;
+                        }
                     }
                     if (!listed) {
                         const part = try self.showTables(a, entry, null, false);
@@ -10975,4 +11020,151 @@ test "CREATE INSERT Iceberg REST PutObject s3 location" {
     }
     try std.testing.expect(found_parquet);
     try std.testing.expect(found_avro);
+}
+
+fn testHttp(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    method: std.http.Method,
+    url: []const u8,
+    auth: []const u8,
+    payload: ?[]const u8,
+) !struct { status: std.http.Status, body: []u8 } {
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = auth },
+    };
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .method = method,
+        .payload = payload,
+        .extra_headers = &headers,
+        .response_writer = &aw.writer,
+        .keep_alive = false,
+        .headers = .{ .accept_encoding = .omit },
+    });
+    return .{ .status = result.status, .body = try aw.toOwnedSlice() };
+}
+
+fn showNames(session: *Session, query_sql: []const u8, name: []const u8) !bool {
+    var result = try session.execute(query_sql);
+    defer result.deinit();
+    const b = result.nextBatch() orelse return false;
+    var i: usize = 0;
+    while (i < b.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(b.columns[0].strAt(i), name)) return true;
+    }
+    return false;
+}
+
+test "GRANT bearer on the native catalog" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    const rest_server = @import("table/rest_server.zig");
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_grant_wh";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var session = try Session.open(gpa, io, root);
+    defer session.close();
+    {
+        var result = try session.execute("CREATE NAMESPACE sales");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE TABLE sales.orders (id BIGINT)");
+        defer result.deinit();
+    }
+    try std.testing.expect(try showNames(&session, "SELECT name FROM glacier.tables", "orders"));
+
+    var h = try rest_server.bind(gpa, io, root, "127.0.0.1:0");
+    try h.setBearer("s3cret");
+    var fut = try io.concurrent(rest_server.serveLoop, .{&h});
+    defer {
+        h.stop();
+        _ = fut.cancel(io) catch {};
+        h.deinit();
+    }
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{h.port()});
+    defer gpa.free(base);
+    const ns_url = try std.fmt.allocPrint(gpa, "{s}/v1/namespaces", .{base});
+    defer gpa.free(ns_url);
+    const tables_url = try std.fmt.allocPrint(gpa, "{s}/v1/namespaces/sales/tables", .{base});
+    defer gpa.free(tables_url);
+    const table_url = try std.fmt.allocPrint(gpa, "{s}/v1/namespaces/sales/tables/orders", .{base});
+    defer gpa.free(table_url);
+    const auth = "Bearer s3cret";
+
+    const hidden = try testHttp(gpa, io, .GET, ns_url, auth, null);
+    defer gpa.free(hidden.body);
+    try std.testing.expectEqual(std.http.Status.ok, hidden.status);
+    try std.testing.expect(std.mem.indexOf(u8, hidden.body, "sales") == null);
+    const denied = try testHttp(gpa, io, .GET, table_url, auth, null);
+    defer gpa.free(denied.body);
+    try std.testing.expectEqual(std.http.Status.forbidden, denied.status);
+
+    {
+        var result = try session.execute("GRANT SELECT ON TABLE sales.orders TO bearer");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("select", b.columns[0].strAt(0));
+        try std.testing.expectEqualStrings("bearer", b.columns[2].strAt(0));
+    }
+    try std.testing.expect(try showNames(&session, "SELECT name FROM glacier.tables", "orders"));
+    try std.testing.expectError(error.GrantPrincipal, session.execute("GRANT SELECT ON TABLE sales.orders TO alice"));
+
+    const listed = try testHttp(gpa, io, .GET, tables_url, auth, null);
+    defer gpa.free(listed.body);
+    try std.testing.expectEqual(std.http.Status.ok, listed.status);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "orders") != null);
+    const loaded = try testHttp(gpa, io, .GET, table_url, auth, null);
+    defer gpa.free(loaded.body);
+    try std.testing.expectEqual(std.http.Status.ok, loaded.status);
+    const commit_ro = try testHttp(gpa, io, .POST, table_url, auth, "{}");
+    defer gpa.free(commit_ro.body);
+    try std.testing.expectEqual(std.http.Status.forbidden, commit_ro.status);
+
+    {
+        var result = try session.execute("GRANT ALL ON TABLE sales.orders TO bearer");
+        defer result.deinit();
+    }
+    const commit_rw = try testHttp(gpa, io, .POST, table_url, auth, "{}");
+    defer gpa.free(commit_rw.body);
+    try std.testing.expect(commit_rw.status != .forbidden);
+
+    {
+        var result = try session.execute("REVOKE ALL ON TABLE sales.orders FROM bearer");
+        defer result.deinit();
+    }
+    const still = try testHttp(gpa, io, .GET, table_url, auth, null);
+    defer gpa.free(still.body);
+    try std.testing.expectEqual(std.http.Status.ok, still.status);
+    {
+        var result = try session.execute("REVOKE SELECT ON TABLE sales.orders FROM bearer");
+        defer result.deinit();
+    }
+    const gone = try testHttp(gpa, io, .GET, table_url, auth, null);
+    defer gpa.free(gone.body);
+    try std.testing.expectEqual(std.http.Status.forbidden, gone.status);
+    try std.testing.expect(try showNames(&session, "SELECT name FROM glacier.tables", "orders"));
+
+    const hadoop = "/tmp/glacier_grant_hadoop";
+    std.Io.Dir.cwd().deleteTree(io, hadoop) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, hadoop ++ "/sales/orders/metadata");
+    const meta = try std.Io.Dir.cwd().createFile(io, hadoop ++ "/sales/orders/metadata/v1.metadata.json", .{});
+    defer meta.close(io);
+    {
+        var result = try session.execute("ATTACH '/tmp/glacier_grant_hadoop' AS hop");
+        defer result.deinit();
+    }
+    try std.testing.expectError(error.ForeignGrant, session.execute("GRANT SELECT ON TABLE hop.sales.orders TO bearer"));
 }

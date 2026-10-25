@@ -327,7 +327,11 @@ fn addCarquet(b: *std.Build, mod: *std.Build.Module) void {
         const arch = moduleCpuArch(mod);
         const x86 = arch == .x86_64 or arch == .x86;
         const arm = arch == .aarch64 or arch == .arm;
-        const x86_flags = flags ++ [_][]const u8{"-DCARQUET_ARCH_X86"};
+        const x86_flags = flags ++ [_][]const u8{
+            "-DCARQUET_ARCH_X86",
+            "-DCARQUET_ENABLE_SSE",
+            "-DCARQUET_ENABLE_AVX2",
+        };
         const arm_flags = flags ++ [_][]const u8{ "-DCARQUET_ARCH_ARM", "-DCARQUET_ENABLE_NEON" };
         const native_flags: []const []const u8 = if (x86) &x86_flags else if (arm) &arm_flags else &flags;
         const snappy_x86 = x86_flags ++ [_][]const u8{"-mssse3"};
@@ -337,6 +341,20 @@ fn addCarquet(b: *std.Build, mod: *std.Build.Module) void {
             .files = &carquet_sources,
             .flags = native_flags,
         });
+        if (x86) {
+            const sse_flags = x86_flags ++ [_][]const u8{"-msse4.2"};
+            const avx2_flags = x86_flags ++ [_][]const u8{"-mavx2"};
+            mod.addCSourceFile(.{
+                .file = carquet_root.path(b, "src/simd/x86/sse_ops.c"),
+                .flags = &sse_flags,
+                .language = .c,
+            });
+            mod.addCSourceFile(.{
+                .file = carquet_root.path(b, "src/simd/x86/avx2_ops.c"),
+                .flags = &avx2_flags,
+                .language = .c,
+            });
+        }
         mod.addCSourceFile(.{
             .file = carquet_root.path(b, "src/compression/snappy.c"),
             .flags = snappy_flags,
