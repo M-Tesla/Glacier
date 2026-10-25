@@ -6,6 +6,7 @@
 //! Aggregates: COUNT/SUM/AVG/MIN/MAX(DISTINCT col). GROUP BY may emit first-row exprs.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const parquet = @import("../formats/parquet_wrap.zig");
 const avro = @import("../formats/avro_wrap.zig");
 const native = @import("../formats/native.zig");
@@ -14,6 +15,7 @@ const batch_mod = @import("batch.zig");
 const iceberg = @import("../table/iceberg.zig");
 const vfs = @import("../vfs/source.zig");
 const spill = @import("../vfs/spill.zig");
+const aws = @import("../kernel/aws.zig");
 
 const Batch = batch_mod.Batch;
 const Column = batch_mod.Column;
@@ -22,7 +24,41 @@ const DataType = batch_mod.DataType;
 pub const ScanStats = struct {
     files_opened: usize = 0,
     files_pruned: usize = 0,
+    row_groups_pruned: usize = 0,
 };
+
+/// Bound for the statement currently running on this thread.
+pub const CancelState = struct {
+    flag: std.atomic.Value(u8) = .init(0),
+    /// When non-zero, the Nth `checkCancel` of this statement sets the flag.
+    after: u32 = 0,
+    checks: u32 = 0,
+    /// Awake-clock nanoseconds. 0 means no deadline.
+    deadline_ns: i128 = 0,
+    io: std.Io = undefined,
+    has_io: bool = false,
+};
+
+threadlocal var bound_cancel: ?*CancelState = null;
+threadlocal var bound_quiet: bool = false;
+
+pub fn bindCancel(state: ?*CancelState) void {
+    bound_cancel = state;
+    if (state == null) bound_quiet = false;
+}
+
+pub fn checkCancel() !void {
+    const st = bound_cancel orelse return;
+    if (!bound_quiet) {
+        st.checks += 1;
+        if (st.after != 0 and st.checks >= st.after) st.flag.store(1, .release);
+        if (st.deadline_ns != 0 and st.has_io) {
+            const now = std.Io.Clock.Timestamp.now(st.io, .awake).raw.toNanoseconds();
+            if (now >= st.deadline_ns) st.flag.store(1, .release);
+        }
+    }
+    if (st.flag.load(.acquire) != 0) return error.QueryCanceled;
+}
 
 pub fn execute(
     allocator: std.mem.Allocator,
@@ -75,7 +111,19 @@ fn executeNoJoin(
 
     var parts: std.ArrayList(Batch) = .empty;
     const wanted = try wantedForScan(allocator, query, files);
+    if (try parallelFinish(allocator, t, files, query, wanted, fallback_schema, stats, &parts)) {
+        if (parts.items.len == 0) {
+            if (fallback_schema) |fields| return emptyFromSchema(allocator, fields);
+            return .{ .columns = &.{}, .len = 0 };
+        }
+        const scanned = if (parts.items.len == 1)
+            parts.items[0]
+        else
+            try concatBatches(allocator, parts.items);
+        return applyTail(allocator, scanned, query, .{});
+    }
     for (files) |file| {
+        try checkCancel();
         if (query.where) |expr| {
             if (iceberg.canSkipFile(file, expr)) {
                 if (stats) |s| s.files_pruned += 1;
@@ -84,7 +132,7 @@ fn executeNoJoin(
         }
         if (stats) |s| s.files_opened += 1;
         const scanned_file = switch (file.format) {
-            .parquet => try scanParquet(allocator, t, file, wanted),
+            .parquet => try scanParquet(allocator, t, file, wanted, query.where, stats),
             .avro => try scanAvro(allocator, t, file),
             .glacier => try scanNativeAll(allocator, t, file, wanted, query.where),
         };
@@ -367,19 +415,179 @@ pub fn joinAndTail(allocator: std.mem.Allocator, left: Batch, right: Batch, quer
     const lq = tableQual(query.from, query.from_alias, "left");
     const rq = tableQual(j.table, j.alias, "right");
     if (std.ascii.eqlIgnoreCase(lq, rq)) return error.InvalidSyntax;
-    const keys = try resolveJoinKeys(allocator, left, right, lq, rq, j.eqs);
+    const shared = if (j.natural) try naturalNames(allocator, left, right) else j.using;
+    const eqs = if (shared.len > 0) try usingEqs(allocator, lq, rq, shared) else j.eqs;
+    const keys: JoinKeys = if (eqs.len == 0)
+        .{ .left = &.{}, .right = &.{} }
+    else
+        try resolveJoinKeys(allocator, left, right, lq, rq, eqs);
     if (isJoinCountStar(query)) {
         const n = try hashJoinCount(allocator, left, right, keys.left, keys.right, j.kind);
         const counted = try countStarBatch(allocator, n, query);
         return applyTail(allocator, counted, query, .{ .agg_done = true });
     }
     const joined = try hashJoin(allocator, left, right, keys.left, keys.right, lq, rq, j.kind);
-    return applyTail(allocator, joined, query, .{});
+    const shaped = if (shared.len == 0) joined else try shapeUsing(allocator, joined, lq, rq, shared);
+    return applyTail(allocator, shaped, query, .{});
+}
+
+fn naturalNames(allocator: std.mem.Allocator, left: Batch, right: Batch) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(allocator);
+    for (left.columns) |col| {
+        const tail = columnTail(col.name);
+        var hit = false;
+        for (right.columns) |other| {
+            if (std.ascii.eqlIgnoreCase(columnTail(other.name), tail)) hit = true;
+        }
+        if (!hit) continue;
+        var seen = false;
+        for (names.items) |prev| {
+            if (std.ascii.eqlIgnoreCase(prev, tail)) seen = true;
+        }
+        if (!seen) try names.append(allocator, tail);
+    }
+    return names.toOwnedSlice(allocator);
+}
+
+fn usingEqs(
+    allocator: std.mem.Allocator,
+    lq: []const u8,
+    rq: []const u8,
+    names: []const []const u8,
+) ![]const sql.JoinEq {
+    const eqs = try allocator.alloc(sql.JoinEq, names.len);
+    for (names, 0..) |name, i| {
+        eqs[i] = .{
+            .left = .{ .qualifier = lq, .name = name },
+            .right = .{ .qualifier = rq, .name = name },
+        };
+    }
+    return eqs;
+}
+
+fn shapeUsing(
+    allocator: std.mem.Allocator,
+    joined: Batch,
+    lq: []const u8,
+    rq: []const u8,
+    names: []const []const u8,
+) !Batch {
+    var n_keep: usize = names.len;
+    for (joined.columns) |col| {
+        if (qualMatches(col.name, lq) or qualMatches(col.name, rq)) {
+            if (!listedName(columnTail(col.name), names)) n_keep += 1;
+        }
+    }
+    const columns = try allocator.alloc(Column, n_keep);
+    var i: usize = 0;
+    for (names) |name| {
+        const li = try qualIndex(joined, lq, name);
+        const ri = try qualIndex(joined, rq, name);
+        columns[i] = try coalesceColumns(allocator, joined.columns[li], joined.columns[ri], columnTail(joined.columns[li].name));
+        i += 1;
+    }
+    for (joined.columns) |col| {
+        if (!qualMatches(col.name, lq)) continue;
+        if (listedName(columnTail(col.name), names)) continue;
+        columns[i] = col;
+        i += 1;
+    }
+    for (joined.columns) |col| {
+        if (!qualMatches(col.name, rq)) continue;
+        if (listedName(columnTail(col.name), names)) continue;
+        columns[i] = col;
+        i += 1;
+    }
+    return .{ .columns = columns, .len = joined.len };
+}
+
+fn qualMatches(name: []const u8, qual: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    return std.ascii.eqlIgnoreCase(name[0..dot], qual);
+}
+
+fn columnTail(name: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return name;
+    return name[dot + 1 ..];
+}
+
+fn listedName(name: []const u8, names: []const []const u8) bool {
+    for (names) |n| {
+        if (std.ascii.eqlIgnoreCase(n, name)) return true;
+    }
+    return false;
+}
+
+fn qualIndex(batch: Batch, qual: []const u8, name: []const u8) !usize {
+    for (batch.columns, 0..) |col, i| {
+        if (!qualMatches(col.name, qual)) continue;
+        if (std.ascii.eqlIgnoreCase(columnTail(col.name), name)) return i;
+    }
+    return error.ColumnNotFound;
+}
+
+fn coalesceColumns(allocator: std.mem.Allocator, left: Column, right: Column, name: []const u8) !Column {
+    if (left.data_type != right.data_type or left.len != right.len) return error.TypeMismatch;
+    var dst: Column = .{
+        .name = name,
+        .data_type = left.data_type,
+        .len = left.len,
+        .decimal_precision = left.decimal_precision,
+        .decimal_scale = left.decimal_scale,
+    };
+    const picks = try allocator.alloc(CoalescePick, left.len);
+    defer allocator.free(picks);
+    var any_null = false;
+    for (picks, 0..) |*p, i| {
+        const ln = left.isNull(i);
+        const rn = right.isNull(i);
+        if (ln and rn) {
+            p.* = .none;
+            any_null = true;
+        } else if (ln) {
+            p.* = .other;
+        } else {
+            p.* = .src;
+        }
+    }
+    if (left.data_type == .utf8) {
+        dst.utf8 = try coalesceUtf8(allocator, left, right, null, picks);
+    } else {
+        try allocTyped(allocator, &dst, left.len);
+        for (picks, 0..) |p, i| switch (p) {
+            .src => copyTypedCell(&dst, i, left, i),
+            .other => copyTypedCell(&dst, i, right, i),
+            .none, .lit => {},
+        };
+    }
+    if (any_null) {
+        dst.valid = try allocator.alloc(u8, left.len);
+        for (picks, 0..) |p, i| dst.valid[i] = if (p == .none) 0 else 1;
+    }
+    return dst;
 }
 
 pub fn executeOnBatch(allocator: std.mem.Allocator, input: Batch, query: sql.Query) !Batch {
     if (query.having != null and !query.needsAgg()) return error.InvalidSyntax;
     return applyTail(allocator, input, query, .{});
+}
+
+pub fn rowMatches(allocator: std.mem.Allocator, input: Batch, row: usize, expr: *const sql.BoolExpr, query: ?sql.Query) !bool {
+    return evalBool(allocator, input, row, expr, query);
+}
+
+pub fn takeRows(allocator: std.mem.Allocator, input: Batch, keep: []const bool) !Batch {
+    var n_keep: usize = 0;
+    for (keep) |k| if (k) {
+        n_keep += 1;
+    };
+    if (n_keep == input.len) return input;
+    const columns = try allocator.alloc(Column, input.columns.len);
+    for (input.columns, 0..) |src, ci| {
+        columns[ci] = try compactColumn(allocator, src, keep, n_keep);
+    }
+    return .{ .columns = columns, .len = n_keep };
 }
 
 const JoinKeys = struct { left: []const usize, right: []const usize };
@@ -571,7 +779,7 @@ fn hashJoin(
 
 fn isJoinCountStar(query: sql.Query) bool {
     if (query.where != null or query.having != null) return false;
-    if (query.group_by.len != 0) return false;
+    if (query.group_by.len != 0 or query.grouping_sets.len != 0) return false;
     if (query.distinct or query.hasWindow()) return false;
     if (query.items.len != 1) return false;
     const agg = switch (query.items[0]) {
@@ -824,7 +1032,19 @@ fn applyWindows(allocator: std.mem.Allocator, input: Batch, query: sql.Query) !B
     var i = input.columns.len;
     for (query.items) |item| {
         if (item == .window) {
-            columns[i] = try evalWindow(allocator, input, item.window);
+            var w = item.window;
+            if (w.spec.ref) |name| {
+                var found = false;
+                for (query.named_windows) |nw| {
+                    if (std.ascii.eqlIgnoreCase(nw.name, name)) {
+                        w.spec = nw.spec;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return error.InvalidSyntax;
+            }
+            columns[i] = try evalWindow(allocator, input, w);
             i += 1;
         }
     }
@@ -1044,7 +1264,49 @@ fn windowFrameSpan(
     return switch (frame.unit) {
         .rows => rowsFrameSpan(g.len, i, frame),
         .range => rangeFrameSpan(input, g, i, spec, frame),
+        .groups => groupsFrameSpan(input, g, i, spec, frame),
     };
+}
+
+fn groupsFrameSpan(
+    input: Batch,
+    g: []const usize,
+    i: usize,
+    spec: sql.WindowSpec,
+    frame: sql.WindowFrame,
+) !FrameSpan {
+    if (g.len == 0) return .{ .empty = true };
+    var n_groups: usize = 0;
+    var cur: usize = 0;
+    var row: usize = 0;
+    while (row < g.len) {
+        const pe = peerEnd(input, g, row, spec.order_by);
+        if (i >= row and i <= pe) cur = n_groups;
+        n_groups += 1;
+        row = pe + 1;
+    }
+    const start_g = rowsBoundRaw(n_groups, cur, frame.start);
+    const end_g = rowsBoundRaw(n_groups, cur, frame.end);
+    const last_g: isize = if (n_groups == 0) -1 else @intCast(n_groups - 1);
+    if (start_g > last_g or end_g < 0) return .{ .empty = true };
+    const gs: usize = @intCast(@max(start_g, 0));
+    const ge: usize = @intCast(@min(end_g, last_g));
+    var gi: usize = 0;
+    row = 0;
+    var start: usize = 0;
+    var end: usize = 0;
+    while (row < g.len) {
+        const pe = peerEnd(input, g, row, spec.order_by);
+        if (gi == gs) start = row;
+        if (gi == ge) {
+            end = pe;
+            break;
+        }
+        gi += 1;
+        row = pe + 1;
+    }
+    if (start > end) return .{ .empty = true };
+    return .{ .start = start, .end = end };
 }
 
 fn writeDefaultOrNull(dst: *Column, row: usize, lit: ?sql.Literal, allocator: std.mem.Allocator) !void {
@@ -1328,6 +1590,7 @@ fn copyStream(
     defer vec_aa.deinit();
 
     for (files) |file| {
+        try checkCancel();
         if (limit_left) |lim| {
             if (lim == 0) break;
         }
@@ -1402,7 +1665,9 @@ fn copyFilePages(
             defer reader.close();
             const picked = try pickParquetColumns(allocator, reader, wanted);
             const batch_size = streamBatchSize(query.where != null, offset_left.*, limit_left.*);
-            var br = try reader.openBatch(picked, batch_size);
+            var rg_filter: RgFilter = .{};
+            defer rg_filter.deinit();
+            var br = try beginParquetBatch(reader, picked, batch_size, query.where, null, &rg_filter);
             defer br.close();
             while (try br.next()) |rb_val| {
                 var rb = rb_val;
@@ -1495,6 +1760,13 @@ fn projectItems(allocator: std.mem.Allocator, input: Batch, query: sql.Query) !B
             .literal => |lit| try fillLiteralColumn(allocator, lit, input.len),
             .case => |cs| try evalCase(allocator, input, cs),
             .expr => |ex| try evalComputed(allocator, input, ex, query),
+            .grouping => |g| blk: {
+                const name = g.alias orelse g.name;
+                const idx = try input.lookup(name);
+                var col = input.columns[idx];
+                col.name = name;
+                break :blk col;
+            },
         };
     }
     return .{ .columns = columns, .len = input.len };
@@ -1643,6 +1915,21 @@ fn canStreamQuery(query: sql.Query) bool {
     return query.join == null and !query.hasWindow() and query.order_by.len == 0 and !query.distinct and !query.needsAgg();
 }
 
+/// Name of the scan path `execute` would take for this query and these files.
+pub fn explainScanMode(query: sql.Query, files: []const iceberg.DataFile) []const u8 {
+    if (canStreamQuery(query) and filesAreStreamable(files) and !filesHaveDeletes(files)) return "stream";
+    if (filesAreStreamable(files) and !filesHaveDeletes(files) and
+        (!query.hasWindow() or (query.order_by.len > 0 and !query.needsAgg())))
+    {
+        if (query.needsAgg() and query.group_by.len == 0) return "aggregate";
+        if (query.needsAgg()) return "hash_aggregate";
+        if (query.order_by.len > 0) return "sort";
+        if (query.distinct) return "distinct";
+    }
+    if (canParallelFiles(files, query.where)) return "parallel_scan";
+    return "scan";
+}
+
 fn filesAreStreamable(files: []const iceberg.DataFile) bool {
     for (files) |file| {
         if (file.format != .parquet and file.format != .glacier) return false;
@@ -1669,7 +1956,7 @@ fn executeCapped(
     const cap = spill.memoryCap();
     const vec_size = cappedVecSize(cap);
 
-    if (query.needsAgg() and query.group_by.len == 0) {
+    if (query.needsAgg() and query.group_by.len == 0 and query.grouping_sets.len == 0) {
         return executeGlobalAgg(allocator, t, files, query, fallback_schema, stats, wanted, vec_size);
     }
 
@@ -1699,9 +1986,11 @@ fn executeCapped(
         .run_paths = .empty,
         .part_paths = .{null} ** spill.partition_count,
         .part_writers = .{null} ** spill.partition_count,
+        .stats = stats,
     };
 
     for (files) |file| {
+        try checkCancel();
         if (query.where) |expr| {
             if (iceberg.canSkipFile(file, expr)) {
                 if (stats) |s| s.files_pruned += 1;
@@ -1751,6 +2040,7 @@ const CapCtx = struct {
     run_paths: std.ArrayList([]const u8),
     part_paths: [spill.partition_count]?[]const u8,
     part_writers: [spill.partition_count]?spill.RunWriter,
+    stats: ?*ScanStats = null,
 
     fn ingestFile(
         self: *CapCtx,
@@ -1777,7 +2067,13 @@ const CapCtx = struct {
         defer reader.close();
         const picked = try pickParquetColumns(self.allocator, reader, wanted);
         if (picked.len == 0) return error.ColumnNotFound;
-        var br = try reader.openBatch(picked, vec_size);
+        if (self.schema_batch == null) {
+            const empty = try emptyFromPicked(self.allocator, reader, picked);
+            try self.noteSchema(empty);
+        }
+        var rg_filter: RgFilter = .{};
+        defer rg_filter.deinit();
+        var br = try beginParquetBatch(reader, picked, vec_size, self.query.where, self.stats, &rg_filter);
         defer br.close();
         while (try br.next()) |rb_val| {
             var rb = rb_val;
@@ -1822,11 +2118,7 @@ const CapCtx = struct {
     }
 
     fn ingestVec(self: *CapCtx, vec: Batch) !void {
-        if (self.schema_batch == null) {
-            self.schema_batch = try emptyFromBatch(self.allocator, vec);
-            self.metas = try colMetas(self.allocator, vec);
-            self.part_idxs = try self.resolveIdxs(vec);
-        }
+        try self.noteSchema(vec);
         if (self.spilled and self.mode != .order) {
             try self.writeBatchToParts(vec);
             _ = self.vec_aa.reset(.retain_capacity);
@@ -1845,6 +2137,16 @@ const CapCtx = struct {
 
         if (self.work_bytes > self.cap) {
             try self.spillWork();
+        }
+    }
+
+    fn noteSchema(self: *CapCtx, vec: Batch) !void {
+        if (self.schema_batch == null) {
+            self.schema_batch = try emptyFromBatch(self.allocator, vec);
+        }
+        if (self.metas.len == 0 and vec.columns.len > 0) {
+            self.metas = try colMetas(self.allocator, vec);
+            self.part_idxs = try self.resolveIdxs(vec);
         }
     }
 
@@ -1892,7 +2194,10 @@ const CapCtx = struct {
         var row: usize = 0;
         while (row < batch.len) : (row += 1) {
             const key = try encodeKey(self.vec_aa.allocator(), batch, row, self.part_idxs);
-            const p: usize = @intCast(std.hash.Wyhash.hash(0, key) % @as(u64, spill.partition_count));
+            const p: usize = if (self.query.grouping_sets.len > 0)
+                0
+            else
+                @intCast(std.hash.Wyhash.hash(0, key) % @as(u64, spill.partition_count));
             try self.ensurePart(p);
             try self.part_writers[p].?.appendRow(batch, row);
         }
@@ -2010,6 +2315,7 @@ fn executeGlobalAgg(
     var any = false;
 
     for (files) |file| {
+        try checkCancel();
         if (query.where) |expr| {
             if (iceberg.canSkipFile(file, expr)) {
                 if (stats) |s| s.files_pruned += 1;
@@ -2072,7 +2378,9 @@ fn executeGlobalAgg(
                     any = any or n > 0;
                     continue;
                 }
-                var br = try reader.openBatch(picked, vec_size);
+                var rg_filter: RgFilter = .{};
+                defer rg_filter.deinit();
+                var br = try beginParquetBatch(reader, picked, vec_size, query.where, stats, &rg_filter);
                 defer br.close();
                 while (try br.next()) |rb_val| {
                     var rb = rb_val;
@@ -2220,6 +2528,12 @@ fn fillFromCursor(allocator: std.mem.Allocator, batch: *Batch, cur: *const spill
 }
 
 fn aggregateFromCursor(allocator: std.mem.Allocator, cur: *spill.Cursor, query: sql.Query) !Batch {
+    if (query.grouping_sets.len > 0) {
+        var grow = try spill.Grow.init(allocator, cur.cols);
+        while (try cur.next()) try grow.appendCursor(cur);
+        const snap = try grow.freeze();
+        return aggregateGroupingSets(allocator, snap, query);
+    }
     try validateAgg(query);
     var rowb = try batchFromMeta(allocator, cur.cols);
     var grow = try spill.Grow.init(allocator, cur.cols);
@@ -2270,6 +2584,10 @@ fn aggregateFromCursor(allocator: std.mem.Allocator, cur: *spill.Cursor, query: 
                 const src_i = snap.columnIndex(c.name) orelse return error.ColumnNotFound;
                 const name = c.alias orelse c.name;
                 out_cols[col_i] = try copyKeyColumn(allocator, snap.columns[src_i], first_rows, name);
+                col_i += 1;
+            },
+            .grouping => |g| {
+                out_cols[col_i] = try groupingColumn(allocator, g.alias orelse g.name, n_groups, &.{});
                 col_i += 1;
             },
             .agg => |agg| {
@@ -2415,7 +2733,14 @@ fn executeStream(
     var parts: std.ArrayList(Batch) = .empty;
     var empty_schema: ?Batch = null;
 
+    if ((query.offset orelse 0) == 0 and query.limit == null) {
+        if (try parallelStream(allocator, t, files, query, wanted, fallback_schema, stats, &parts, &empty_schema)) {
+            return finishStream(allocator, query, fallback_schema, &parts, empty_schema);
+        }
+    }
+
     for (files) |file| {
+        try checkCancel();
         if (limit_left) |lim| {
             if (lim == 0) break;
         }
@@ -2427,7 +2752,7 @@ fn executeStream(
         }
         if (stats) |s| s.files_opened += 1;
         const piece = switch (file.format) {
-            .parquet => try scanParquetStream(allocator, t, file, wanted, query.where, &offset_left, &limit_left),
+            .parquet => try scanParquetStream(allocator, t, file, wanted, query.where, &offset_left, &limit_left, stats),
             .glacier => try scanNativeStream(allocator, t, file, wanted, query.where, &offset_left, &limit_left),
             .avro => return error.UnsupportedType,
         };
@@ -2438,6 +2763,16 @@ fn executeStream(
         }
     }
 
+    return finishStream(allocator, query, fallback_schema, &parts, empty_schema);
+}
+
+fn finishStream(
+    allocator: std.mem.Allocator,
+    query: sql.Query,
+    fallback_schema: ?[]const iceberg.SchemaField,
+    parts: *std.ArrayList(Batch),
+    empty_schema: ?Batch,
+) !Batch {
     var scanned: Batch = if (parts.items.len == 0) blk: {
         if (empty_schema) |s| break :blk s;
         if (fallback_schema) |fields| break :blk try emptyFromSchema(allocator, fields);
@@ -2453,6 +2788,383 @@ fn executeStream(
     return scanned;
 }
 
+const ScanMode = enum { finish, stream };
+
+const PSlot = struct {
+    arena: std.heap.ArenaAllocator,
+    batch: Batch = .{ .columns = &.{}, .len = 0 },
+    err: ?anyerror = null,
+    ran: bool = false,
+};
+
+const PJob = struct {
+    t: vfs.Transport,
+    file: iceberg.DataFile,
+    wanted: ?[]const []const u8,
+    where: ?*const sql.BoolExpr,
+    schema: ?[]const iceberg.SchemaField,
+    mode: ScanMode,
+    slot: *PSlot,
+    cancel: ?*CancelState,
+    offset: u64 = 0,
+    limit: ?u64 = null,
+    stats: ?*ScanStats = null,
+};
+
+fn scanWidth() usize {
+    if (comptime builtin.cpu.arch == .wasm32 or builtin.single_threaded) return 1;
+    if (std.c.getenv("GLACIER_THREADS")) |raw| {
+        const text = std.mem.span(raw);
+        if (text.len == 0) return 1;
+        return @max(std.fmt.parseInt(usize, text, 10) catch 1, 1);
+    }
+    return @max(std.Thread.getCpuCount() catch 1, 1);
+}
+
+fn canParallelFiles(files: []const iceberg.DataFile, where: ?*const sql.BoolExpr) bool {
+    if (scanWidth() < 2) return false;
+    var n: usize = 0;
+    for (files) |file| {
+        if (file.bytes != null) return false;
+        if (aws.isRemote(file.path)) return false;
+        if (where) |expr| {
+            if (iceberg.canSkipFile(file, expr)) continue;
+        }
+        n += 1;
+    }
+    return n >= 2;
+}
+
+fn parallelFinish(
+    allocator: std.mem.Allocator,
+    t: vfs.Transport,
+    files: []const iceberg.DataFile,
+    query: sql.Query,
+    wanted: ?[]const []const u8,
+    fallback_schema: ?[]const iceberg.SchemaField,
+    stats: ?*ScanStats,
+    parts: *std.ArrayList(Batch),
+) !bool {
+    const got = try parallelBatches(allocator, t, files, wanted, query.where, fallback_schema, stats, .finish) orelse return false;
+    for (got) |batch| try parts.append(allocator, batch);
+    return true;
+}
+
+fn parallelStream(
+    allocator: std.mem.Allocator,
+    t: vfs.Transport,
+    files: []const iceberg.DataFile,
+    query: sql.Query,
+    wanted: ?[]const []const u8,
+    fallback_schema: ?[]const iceberg.SchemaField,
+    stats: ?*ScanStats,
+    parts: *std.ArrayList(Batch),
+    empty_schema: *?Batch,
+) !bool {
+    const got = try parallelBatches(allocator, t, files, wanted, query.where, fallback_schema, stats, .stream) orelse return false;
+    for (got) |piece| {
+        if (piece.len > 0) {
+            try parts.append(allocator, piece);
+        } else if (empty_schema.* == null and piece.columns.len > 0) {
+            empty_schema.* = piece;
+        }
+    }
+    return true;
+}
+
+fn parallelBatches(
+    allocator: std.mem.Allocator,
+    t: vfs.Transport,
+    files: []const iceberg.DataFile,
+    wanted: ?[]const []const u8,
+    where: ?*const sql.BoolExpr,
+    schema: ?[]const iceberg.SchemaField,
+    stats: ?*ScanStats,
+    mode: ScanMode,
+) !?[]Batch {
+    if (comptime builtin.cpu.arch == .wasm32 or builtin.single_threaded) return null;
+    if (!canParallelFiles(files, where)) return null;
+
+    const slots = try allocator.alloc(PSlot, files.len);
+    for (slots) |*s| s.* = .{ .arena = .init(std.heap.smp_allocator) };
+    defer for (slots) |*s| s.arena.deinit();
+
+    const jobs = try allocator.alloc(PJob, files.len);
+    var n_jobs: usize = 0;
+    for (files, 0..) |file, i| {
+        try checkCancel();
+        if (where) |expr| {
+            if (iceberg.canSkipFile(file, expr)) {
+                if (stats) |s| s.files_pruned += 1;
+                continue;
+            }
+        }
+        if (stats) |s| s.files_opened += 1;
+        jobs[n_jobs] = .{
+            .t = t,
+            .file = file,
+            .wanted = wanted,
+            .where = where,
+            .schema = schema,
+            .mode = mode,
+            .slot = &slots[i],
+            .cancel = bound_cancel,
+            .stats = stats,
+        };
+        n_jobs += 1;
+    }
+
+    var group: std.Io.Group = .init;
+    var joined = false;
+    defer if (!joined) group.cancel(t.io);
+    for (jobs[0..n_jobs]) |*job| {
+        group.concurrent(t.io, parallelScanJob, .{job}) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => try parallelScanJobInner(job),
+        };
+    }
+    group.await(t.io) catch |err| {
+        joined = true;
+        if (err == error.Canceled) return error.QueryCanceled;
+        return err;
+    };
+    joined = true;
+
+    var failed: ?anyerror = null;
+    for (jobs[0..n_jobs]) |job| {
+        if (job.slot.err) |e| {
+            failed = e;
+            break;
+        }
+    }
+    if (failed) |e| return e;
+    try checkCancel();
+
+    var out: std.ArrayList(Batch) = .empty;
+    for (slots) |*s| {
+        if (!s.ran) continue;
+        try out.append(allocator, try cloneBatch(allocator, s.batch));
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn parallelScanJob(job: *PJob) error{Canceled}!void {
+    bindCancel(job.cancel);
+    bound_quiet = true;
+    defer {
+        bound_quiet = false;
+        bindCancel(null);
+    }
+    parallelScanJobInner(job) catch |err| switch (err) {
+        error.QueryCanceled => return error.Canceled,
+        else => job.slot.err = err,
+    };
+}
+
+fn parallelScanJobInner(job: *PJob) !void {
+    const a = job.slot.arena.allocator();
+    job.slot.ran = true;
+    job.slot.batch = switch (job.mode) {
+        .finish => blk: {
+            const scanned = switch (job.file.format) {
+                .parquet => try scanParquet(a, job.t, job.file, job.wanted, job.where, job.stats),
+                .avro => try scanAvro(a, job.t, job.file),
+                .glacier => try scanNativeAll(a, job.t, job.file, job.wanted, job.where),
+            };
+            break :blk try finishScan(a, scanned, job.file, job.schema, job.wanted);
+        },
+        .stream => switch (job.file.format) {
+            .parquet => try scanParquetStream(a, job.t, job.file, job.wanted, job.where, &job.offset, &job.limit, job.stats),
+            .glacier => try scanNativeStream(a, job.t, job.file, job.wanted, job.where, &job.offset, &job.limit),
+            .avro => return error.UnsupportedType,
+        },
+    };
+}
+
+const RgCtx = struct {
+    where: *const sql.BoolExpr,
+    stats: ?*ScanStats,
+    seen: []u8,
+};
+
+const RgFilter = struct {
+    ctx: RgCtx = undefined,
+    hook: parquet.RgHook = undefined,
+    seen: []u8 = &.{},
+    allocator: std.mem.Allocator = if (builtin.cpu.arch == .wasm32)
+        std.heap.wasm_allocator
+    else
+        std.heap.page_allocator,
+
+    fn deinit(self: *RgFilter) void {
+        if (self.seen.len == 0) return;
+        self.allocator.free(self.seen);
+        self.seen = &.{};
+    }
+};
+
+fn beginParquetBatch(
+    reader: parquet.Reader,
+    picked: []const i32,
+    batch_size: i32,
+    where: ?*const sql.BoolExpr,
+    stats: ?*ScanStats,
+    filter: *RgFilter,
+) !parquet.BatchReader {
+    if (where) |expr| {
+        const n: usize = @intCast(@max(reader.numRowGroups(), 0));
+        const seen = try reader.allocator.alloc(u8, n);
+        @memset(seen, 0);
+        filter.* = .{
+            .allocator = reader.allocator,
+            .seen = seen,
+            .ctx = .{ .where = expr, .stats = stats, .seen = seen },
+        };
+        filter.hook = .{ .keep = keepRowGroup, .user = &filter.ctx };
+        return reader.openBatchFiltered(picked, batch_size, &filter.hook);
+    }
+    return reader.openBatch(picked, batch_size);
+}
+
+fn keepRowGroup(reader: ?*anyopaque, rg: i32, user: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *RgCtx = @ptrCast(@alignCast(user orelse return 1));
+    const handle = reader orelse return 1;
+    const keep = rgMayMatch(handle, rg, ctx.where);
+    if (rg >= 0 and @as(usize, @intCast(rg)) < ctx.seen.len) {
+        const i: usize = @intCast(rg);
+        if (ctx.seen[i] == 0) {
+            ctx.seen[i] = 1;
+            if (!keep) {
+                if (ctx.stats) |s| {
+                    _ = @atomicRmw(usize, &s.row_groups_pruned, .Add, 1, .monotonic);
+                }
+            }
+        }
+    }
+    return if (keep) 1 else 0;
+}
+
+fn rgMayMatch(handle: *anyopaque, rg: i32, expr: *const sql.BoolExpr) bool {
+    return switch (expr.*) {
+        .@"and" => |b| rgMayMatch(handle, rg, b.left) and rgMayMatch(handle, rg, b.right),
+        .@"or" => |b| rgMayMatch(handle, rg, b.left) or rgMayMatch(handle, rg, b.right),
+        .cmp => |cmp| rgCmpMayMatch(handle, rg, cmp),
+        .between => |b| rgBetweenMayMatch(handle, rg, b),
+        .isnull => |n| rgNullMayMatch(handle, rg, n),
+        else => true,
+    };
+}
+
+fn flipCmp(op: sql.CmpOp) sql.CmpOp {
+    return switch (op) {
+        .eq, .ne => op,
+        .lt => .gt,
+        .le => .ge,
+        .gt => .lt,
+        .ge => .le,
+    };
+}
+
+const RgCol = struct {
+    index: i32,
+    physical: parquet.PhysicalType,
+};
+
+fn findRgCol(handle: *anyopaque, name: []const u8) ?RgCol {
+    const n = parquet.rawNumColumns(handle);
+    var i: i32 = 0;
+    while (i < n) : (i += 1) {
+        const col = parquet.rawColumnName(handle, i) orelse continue;
+        if (std.ascii.eqlIgnoreCase(col, name)) {
+            return .{ .index = i, .physical = parquet.rawColumnType(handle, i) };
+        }
+    }
+    return null;
+}
+
+fn rgCmpMayMatch(handle: *anyopaque, rg: i32, cmp: sql.Cmp) bool {
+    if (sql.asColumn(cmp.left)) |name| {
+        if (sql.asLiteral(cmp.right)) |lit| return rgColLit(handle, rg, name, cmp.op, lit);
+    }
+    if (sql.asColumn(cmp.right)) |name| {
+        if (sql.asLiteral(cmp.left)) |lit| return rgColLit(handle, rg, name, flipCmp(cmp.op), lit);
+    }
+    return true;
+}
+
+fn rgBetweenMayMatch(handle: *anyopaque, rg: i32, between: sql.Between) bool {
+    if (between.negated) return true;
+    const name = switch (between.left) {
+        .column => |n| n,
+        .agg => return true,
+    };
+    return rgColLit(handle, rg, name, .ge, between.lo) and rgColLit(handle, rg, name, .le, between.hi);
+}
+
+fn rgNullMayMatch(handle: *anyopaque, rg: i32, isnull: sql.IsNull) bool {
+    const name = switch (isnull.left) {
+        .column => |n| n,
+        .agg => return true,
+    };
+    const col = findRgCol(handle, name) orelse return true;
+    const st = parquet.rawColumnStats(handle, rg, col.index) catch return true;
+    if (st.has_null_count == 0) return true;
+    if (isnull.negated) return st.null_count != st.num_values;
+    return st.null_count != 0;
+}
+
+fn rgColLit(handle: *anyopaque, rg: i32, name: []const u8, op: sql.CmpOp, lit: sql.Literal) bool {
+    const col = findRgCol(handle, name) orelse return true;
+    var i32v: i32 = 0;
+    var i64v: i64 = 0;
+    var f32v: f32 = 0;
+    var f64v: f64 = 0;
+    const bytes: []const u8 = switch (col.physical) {
+        .int32 => blk: {
+            if (lit != .int) return true;
+            if (lit.int < std.math.minInt(i32) or lit.int > std.math.maxInt(i32)) return true;
+            i32v = @intCast(lit.int);
+            break :blk std.mem.asBytes(&i32v);
+        },
+        .int64 => blk: {
+            if (lit != .int) return true;
+            i64v = lit.int;
+            break :blk std.mem.asBytes(&i64v);
+        },
+        .float => blk: {
+            f32v = switch (lit) {
+                .int => |v| blk2: {
+                    if (v < -(1 << 24) or v > (1 << 24)) return true;
+                    break :blk2 @floatFromInt(v);
+                },
+                .float => |v| blk2: {
+                    const f: f32 = @floatCast(v);
+                    if (@as(f64, f) != v) return true;
+                    break :blk2 f;
+                },
+                else => return true,
+            };
+            break :blk std.mem.asBytes(&f32v);
+        },
+        .double => blk: {
+            f64v = switch (lit) {
+                .int => |v| blk2: {
+                    if (v < -(1 << 53) or v > (1 << 53)) return true;
+                    break :blk2 @floatFromInt(v);
+                },
+                .float => |v| v,
+                else => return true,
+            };
+            break :blk std.mem.asBytes(&f64v);
+        },
+        .byte_array => blk: {
+            if (lit != .string) return true;
+            break :blk lit.string;
+        },
+        else => return true,
+    };
+    return parquet.rawRowGroupMightMatch(handle, rg, col.index, @intFromEnum(op), bytes);
+}
+
 fn scanParquetStream(
     allocator: std.mem.Allocator,
     t: vfs.Transport,
@@ -2461,6 +3173,7 @@ fn scanParquetStream(
     where: ?*const sql.BoolExpr,
     offset_left: *u64,
     limit_left: *?u64,
+    stats: ?*ScanStats,
 ) !Batch {
     var reader = try parquet.openLocation(allocator, t, file.path);
     defer reader.close();
@@ -2491,11 +3204,15 @@ fn scanParquetStream(
     }
 
     const batch_size = streamBatchSize(where != null, offset_left.*, limit_left.*);
-    var br = try reader.openBatch(picked, batch_size);
+    var rg_filter: RgFilter = .{};
+    defer rg_filter.deinit();
+    var br = try beginParquetBatch(reader, picked, batch_size, where, stats, &rg_filter);
     defer br.close();
 
     var parts: std.ArrayList(Batch) = .empty;
-    while (try br.next()) |rb_val| {
+    while (true) {
+        try checkCancel();
+        const rb_val = (try br.next()) orelse break;
         var rb = rb_val;
         defer rb.deinit();
         const nrows64 = rb.numRows();
@@ -2568,7 +3285,9 @@ fn scanNativeStream(
     }
 
     var parts: std.ArrayList(Batch) = .empty;
-    while (try reader.nextPage(allocator, wanted, where)) |page| {
+    while (true) {
+        try checkCancel();
+        const page = (try reader.nextPage(allocator, wanted, where)) orelse break;
         var vec = page;
         if (where) |expr| {
             vec = try filterExpr(allocator, vec, expr, null);
@@ -2689,9 +3408,18 @@ fn collectScanColumns(allocator: std.mem.Allocator, query: sql.Query) !?[]const 
             .column => |c| try addScanName(&names, allocator, c.name),
             .agg => |a| if (a.arg) |arg| try addScanName(&names, allocator, arg),
             .window => |w| {
+                var spec = w.spec;
+                if (spec.ref) |name| {
+                    for (query.named_windows) |nw| {
+                        if (std.ascii.eqlIgnoreCase(nw.name, name)) {
+                            spec = nw.spec;
+                            break;
+                        }
+                    }
+                }
                 if (w.arg) |arg| try addScanName(&names, allocator, arg);
-                for (w.spec.partition_by) |p| try addScanName(&names, allocator, p);
-                for (w.spec.order_by) |ob| try addScanName(&names, allocator, ob.column);
+                for (spec.partition_by) |p| try addScanName(&names, allocator, p);
+                for (spec.order_by) |ob| try addScanName(&names, allocator, ob.column);
             },
             .scalar => |s| {
                 try addScanName(&names, allocator, s.arg);
@@ -2706,6 +3434,7 @@ fn collectScanColumns(allocator: std.mem.Allocator, query: sql.Query) !?[]const 
                 }
                 try addScanNameFromCaseValue(&names, allocator, cs.else_value);
             },
+            .grouping => |g| try addScanName(&names, allocator, g.name),
         }
     }
     for (query.group_by) |g| try addScanName(&names, allocator, g);
@@ -2776,7 +3505,14 @@ fn addScanNamesFromBool(names: *std.ArrayList([]const u8), allocator: std.mem.Al
     }
 }
 
-fn scanParquet(allocator: std.mem.Allocator, t: vfs.Transport, file: iceberg.DataFile, wanted: ?[]const []const u8) !Batch {
+fn scanParquet(
+    allocator: std.mem.Allocator,
+    t: vfs.Transport,
+    file: iceberg.DataFile,
+    wanted: ?[]const []const u8,
+    where: ?*const sql.BoolExpr,
+    stats: ?*ScanStats,
+) !Batch {
     var reader = if (file.bytes) |b|
         try parquet.openMemory(allocator, b)
     else
@@ -2787,7 +3523,9 @@ fn scanParquet(allocator: std.mem.Allocator, t: vfs.Transport, file: iceberg.Dat
     if (picked.len == 0) {
         return .{ .columns = &.{}, .len = @intCast(reader.numRows()) };
     }
-    var br = try reader.openBatch(picked, 65536);
+    var rg_filter: RgFilter = .{};
+    defer rg_filter.deinit();
+    var br = try beginParquetBatch(reader, picked, 65536, where, stats, &rg_filter);
     defer br.close();
     var parts: std.ArrayList(Batch) = .empty;
     while (try br.next()) |rb_raw| {
@@ -4367,6 +5105,12 @@ fn inGroupedOutput(query: sql.Query, name: []const u8) bool {
                     if (std.ascii.eqlIgnoreCase(al, name)) return true;
                 }
             },
+            .grouping => |g| {
+                if (std.ascii.eqlIgnoreCase(g.name, name)) return true;
+                if (g.alias) |al| {
+                    if (std.ascii.eqlIgnoreCase(al, name)) return true;
+                }
+            },
             else => {},
         }
     }
@@ -4406,6 +5150,7 @@ fn validateAgg(query: sql.Query) !void {
             .expr => {},
             .agg => {},
             .window => |w| try validateWindowInAgg(query, w),
+            .grouping => |g| if (!inGroupBy(query, g.name)) return error.InvalidSyntax,
         }
     }
 }
@@ -4440,6 +5185,7 @@ const AggState = struct {
 const Group = struct {
     first_row: usize,
     states: []AggState,
+    set_i: usize = 0,
 };
 
 fn numericI64(col: Column, row: usize) !i64 {
@@ -4806,7 +5552,207 @@ fn copyKeyColumn(allocator: std.mem.Allocator, src: Column, first_rows: []const 
     return dst;
 }
 
+fn setHasName(set: []const []const u8, name: []const u8) bool {
+    for (set) |g| {
+        if (sameGroupKey(g, identQual(name), identTail(name))) return true;
+    }
+    return false;
+}
+
+fn exprCoveredBySet(e: *const sql.Expr, set: []const []const u8) bool {
+    return switch (e.*) {
+        .literal => true,
+        .column => |n| setHasName(set, n),
+        .binary => |b| exprCoveredBySet(b.left, set) and exprCoveredBySet(b.right, set),
+        .unary_minus => |arg| exprCoveredBySet(arg, set),
+        .call => |c| blk: {
+            for (c.args) |arg| if (!exprCoveredBySet(arg, set)) break :blk false;
+            break :blk true;
+        },
+        .agg, .subquery => true,
+    };
+}
+
+fn encodeSetKey(
+    allocator: std.mem.Allocator,
+    input: Batch,
+    row: usize,
+    set_i: usize,
+    idxs: []const usize,
+) ![]u8 {
+    const body = try encodeKey(allocator, input, row, idxs);
+    defer allocator.free(body);
+    var buf: std.ArrayList(u8) = .empty;
+    var prefix: [4]u8 = undefined;
+    std.mem.writeInt(u32, &prefix, @intCast(set_i), .little);
+    try buf.appendSlice(allocator, &prefix);
+    try buf.appendSlice(allocator, body);
+    return buf.toOwnedSlice(allocator);
+}
+
+fn nullsLike(allocator: std.mem.Allocator, src: Column, n: usize, name: []const u8) !Column {
+    var dst: Column = .{
+        .name = name,
+        .data_type = src.data_type,
+        .len = n,
+        .decimal_precision = src.decimal_precision,
+        .decimal_scale = src.decimal_scale,
+    };
+    try allocTyped(allocator, &dst, n);
+    if (src.data_type == .utf8) {
+        dst.utf8.offsets = try allocator.alloc(u32, n + 1);
+        @memset(dst.utf8.offsets, 0);
+        dst.utf8.bytes = &.{};
+    }
+    if (n > 0) {
+        dst.valid = try allocator.alloc(u8, n);
+        @memset(dst.valid, 0);
+    }
+    return dst;
+}
+
+fn groupingColumn(allocator: std.mem.Allocator, name: []const u8, n: usize, bits: []const u8) !Column {
+    const i64s = try allocator.alloc(i64, n);
+    if (bits.len == n) {
+        for (bits, 0..) |bit, i| i64s[i] = bit;
+    } else if (n > 0) {
+        @memset(i64s, 0);
+    }
+    return .{ .name = name, .data_type = .int64, .len = n, .i64s = i64s };
+}
+
+fn aggregateGroupingSets(allocator: std.mem.Allocator, input: Batch, query: sql.Query) !Batch {
+    try validateAgg(query);
+
+    var groups: std.StringArrayHashMapUnmanaged(Group) = .empty;
+    if (input.len == 0) {
+        for (query.grouping_sets, 0..) |set, set_i| {
+            if (set.len != 0) continue;
+            const states = try makeStates(allocator, query);
+            const key = try allocator.alloc(u8, 4);
+            std.mem.writeInt(u32, key[0..4], @intCast(set_i), .little);
+            try groups.put(allocator, key, .{ .first_row = 0, .states = states, .set_i = set_i });
+        }
+    } else {
+        const idx_per_set = try allocator.alloc([]const usize, query.grouping_sets.len);
+        for (query.grouping_sets, 0..) |set, si| {
+            const idxs = try allocator.alloc(usize, set.len);
+            for (set, 0..) |name, i| idxs[i] = try input.lookup(name);
+            idx_per_set[si] = idxs;
+        }
+        var row: usize = 0;
+        while (row < input.len) : (row += 1) {
+            for (idx_per_set, 0..) |idxs, set_i| {
+                const encoded = try encodeSetKey(allocator, input, row, set_i, idxs);
+                if (groups.getPtr(encoded)) |g| {
+                    try feedRow(g.states, input, query, row, allocator);
+                    allocator.free(encoded);
+                } else {
+                    const states = try makeStates(allocator, query);
+                    try feedRow(states, input, query, row, allocator);
+                    try groups.put(allocator, encoded, .{ .first_row = row, .states = states, .set_i = set_i });
+                }
+            }
+        }
+    }
+
+    const n_groups = groups.count();
+    const first_rows = try allocator.alloc(usize, n_groups);
+    for (groups.values(), 0..) |g, i| first_rows[i] = g.first_row;
+    const blank_keys = input.len == 0 and n_groups > 0;
+
+    const out_cols = try allocator.alloc(Column, aggOutLen(query));
+    var col_i: usize = 0;
+    if (query.hasWindow()) {
+        for (query.group_by) |gname| {
+            const src_i = try input.lookup(gname);
+            if (blank_keys) {
+                out_cols[col_i] = try nullsLike(allocator, input.columns[src_i], n_groups, gname);
+            } else {
+                var col = try copyKeyColumn(allocator, input.columns[src_i], first_rows, gname);
+                for (groups.values(), 0..) |g, gi| {
+                    if (!setHasName(query.grouping_sets[g.set_i], gname)) try markNull(&col, gi, allocator);
+                }
+                out_cols[col_i] = col;
+            }
+            col_i += 1;
+        }
+    }
+    var agg_i: usize = 0;
+    for (query.items) |item| {
+        switch (item) {
+            .star, .scalar, .literal, .case => return error.UnsupportedSql,
+            .window => {},
+            .expr => |ex| {
+                if (blank_keys) {
+                    const template = try evalGroupComputed(allocator, input, &.{}, ex, query);
+                    const name = ex.alias orelse template.name;
+                    out_cols[col_i] = try nullsLike(allocator, template, n_groups, name);
+                } else {
+                    var col = try evalGroupComputed(allocator, input, first_rows, ex, query);
+                    for (groups.values(), 0..) |g, gi| {
+                        if (!exprCoveredBySet(ex.expr, query.grouping_sets[g.set_i])) {
+                            try markNull(&col, gi, allocator);
+                        }
+                    }
+                    out_cols[col_i] = col;
+                }
+                col_i += 1;
+            },
+            .column => |c| {
+                const key = if (c.qualifier) |q|
+                    try std.fmt.allocPrint(allocator, "{s}.{s}", .{ q, c.name })
+                else
+                    c.name;
+                const src_i = try input.lookup(key);
+                const name = c.alias orelse key;
+                if (blank_keys) {
+                    out_cols[col_i] = try nullsLike(allocator, input.columns[src_i], n_groups, name);
+                } else {
+                    var col = try copyKeyColumn(allocator, input.columns[src_i], first_rows, name);
+                    for (groups.values(), 0..) |g, gi| {
+                        if (!setHasName(query.grouping_sets[g.set_i], key)) try markNull(&col, gi, allocator);
+                    }
+                    out_cols[col_i] = col;
+                }
+                col_i += 1;
+            },
+            .grouping => |g| {
+                const bits = try allocator.alloc(u8, n_groups);
+                if (blank_keys) {
+                    @memset(bits, 1);
+                } else {
+                    for (groups.values(), 0..) |grp, gi| {
+                        bits[gi] = if (setHasName(query.grouping_sets[grp.set_i], g.name)) 0 else 1;
+                    }
+                }
+                out_cols[col_i] = try groupingColumn(allocator, g.alias orelse g.name, n_groups, bits);
+                col_i += 1;
+            },
+            .agg => |agg| {
+                const src = try aggColumn(input, agg);
+                const name = try aggName(allocator, agg);
+                const template = if (n_groups == 0)
+                    AggState{ .kind = agg.kind }
+                else
+                    groups.values()[0].states[agg_i];
+                var col = try finalizeAgg(allocator, template, src, name, n_groups);
+                if (n_groups > 0) {
+                    for (groups.values(), 0..) |grp, gi| {
+                        try writeAggCell(&col, grp.states[agg_i], gi, allocator);
+                    }
+                }
+                out_cols[col_i] = col;
+                col_i += 1;
+                agg_i += 1;
+            },
+        }
+    }
+    return .{ .columns = out_cols, .len = n_groups };
+}
+
 fn aggregateBatch(allocator: std.mem.Allocator, input: Batch, query: sql.Query) !Batch {
+    if (query.grouping_sets.len > 0) return aggregateGroupingSets(allocator, input, query);
     try validateAgg(query);
 
     const group_idxs = try allocator.alloc(usize, query.group_by.len);
@@ -4891,6 +5837,10 @@ fn aggregateBatch(allocator: std.mem.Allocator, input: Batch, query: sql.Query) 
                 const src_i = try input.lookup(key);
                 const name = c.alias orelse key;
                 out_cols[col_i] = try copyKeyColumn(allocator, input.columns[src_i], first_rows, name);
+                col_i += 1;
+            },
+            .grouping => |g| {
+                out_cols[col_i] = try groupingColumn(allocator, g.alias orelse g.name, n_groups, &.{});
                 col_i += 1;
             },
             .agg => |agg| {

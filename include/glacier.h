@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define GLACIER_API_VERSION 1
+#define GLACIER_API_VERSION 2
 
 /* Arrow C Data Interface (https://arrow.apache.org/docs/format/CDataInterface.html).
  * Guard matches the official header so Python/Polars can include either. */
@@ -50,7 +50,9 @@ typedef struct GlacierDatabase GlacierDatabase;
 typedef struct GlacierConn GlacierConn;
 typedef struct GlacierResult GlacierResult;
 
-/* Opaque handles. One connection = one thread (v1). Do not share a Conn across threads.
+/* Opaque handles. One connection = one thread (v1), except glacier_cancel, which
+ * may be called from another thread on that same connection. Do not share a Conn
+ * for query or fetch.
  *
  * glacier_open / glacier_connect: on failure return NULL and set *err (caller glacier_free).
  * glacier_query: NULL only for missing args / OOM (then *err is set). SQL and engine errors
@@ -82,6 +84,9 @@ void glacier_malloc_free(void *p, size_t n);
 GlacierConn *glacier_connect(GlacierDatabase *db, char **err);
 void glacier_disconnect(GlacierConn *conn);
 
+/* Runs every statement in `sql`, in order, on this connection. Returns the last
+ * result. A failure stops the rest; earlier statements keep their effect.
+ * glacier_open(path) is still the one-catalog shortcut. */
 GlacierResult *glacier_query(GlacierConn *conn, const char *sql, char **err);
 void glacier_result_destroy(GlacierResult *result);
 const char *glacier_result_error(GlacierResult *result);
@@ -91,6 +96,10 @@ const char *glacier_result_error(GlacierResult *result);
  * Caller must ArrowArray.release / ArrowSchema.release when non-NULL. */
 int glacier_result_arrow(GlacierResult *result, struct ArrowArray *array, struct ArrowSchema *schema);
 int glacier_result_next_arrow(GlacierResult *result, struct ArrowArray *array, struct ArrowSchema *schema);
+
+/* Ask the running statement on this connection to stop. The next glacier_query
+ * also fails once if cancel was requested while idle. The connection stays open. */
+void glacier_cancel(GlacierConn *conn);
 
 const char *glacier_version(void);
 int glacier_api_version(void);

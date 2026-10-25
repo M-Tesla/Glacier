@@ -63,12 +63,15 @@ pub fn run(
     listen: []const u8,
     flight: []const u8,
     out: *std.Io.Writer,
+    tls_cert: ?[]const u8,
+    tls_key: ?[]const u8,
 ) !void {
-    var rest = try rest_server.bind(gpa, io, warehouse, listen);
+    var rest = try rest_server.bindTls(gpa, io, warehouse, listen, tls_cert, tls_key);
     defer rest.deinit();
     var fl = try bind(gpa, io, warehouse, flight);
     defer fl.deinit();
-    try out.print("Iceberg REST  http://{f}\n", .{rest.server.socket.address});
+    const scheme: []const u8 = if (rest.tls != null) "https" else "http";
+    try out.print("Iceberg REST  {s}://{f}\n", .{ scheme, rest.server.socket.address });
     try out.print("Arrow Flight  grpc://{f}\n", .{fl.server.socket.address});
     try out.print("warehouse     {s}\n", .{warehouse});
     try out.flush();

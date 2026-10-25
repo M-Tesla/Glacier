@@ -29,7 +29,7 @@ pub const Batch = batch.Batch;
 pub const Column = batch.Column;
 pub const GlacierError = err.GlacierError;
 
-pub const version = "0.6.0";
+pub const version = "0.6.1";
 
 comptime {
     _ = &c_api.glacier_open;
@@ -45,6 +45,7 @@ comptime {
     _ = &c_api.glacier_result_error;
     _ = &c_api.glacier_result_arrow;
     _ = &c_api.glacier_result_next_arrow;
+    _ = &c_api.glacier_cancel;
     _ = &c_api.glacier_free;
     _ = &c_api.glacier_version;
     _ = &c_api.glacier_api_version;

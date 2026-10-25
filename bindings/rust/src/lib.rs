@@ -315,8 +315,8 @@ mod tests {
 
     #[test]
     fn select_1() {
-        assert_eq!(version(), "0.6.0");
-        assert_eq!(api_version(), 1);
+        assert_eq!(version(), "0.6.1");
+        assert_eq!(api_version(), 2);
         let con = Conn::connect(None).unwrap();
         let rows = con.execute("select 1").unwrap();
         assert_eq!(rows, vec![vec![Cell::I64(1)]]);

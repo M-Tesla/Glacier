@@ -787,6 +787,104 @@ GLACIER_INTERNAL int glacier_avro_write_iceberg_manifest(
     return rc;
 }
 
+typedef struct GlacierAvroBound {
+    int32_t field_id;
+    const uint8_t *lower;
+    int32_t lower_len;
+    const uint8_t *upper;
+    int32_t upper_len;
+} GlacierAvroBound;
+
+static int fill_bound_map(
+    avro_value_t *data_file,
+    const char *name,
+    const GlacierAvroBound *bounds,
+    int begin,
+    int end,
+    int is_lower
+) {
+    avro_value_t field, map, elem;
+    if (avro_value_get_by_name(data_file, name, &field, NULL)) return -1;
+    if (begin >= end) {
+        avro_value_t null_branch;
+        if (avro_value_set_branch(&field, 0, &null_branch)) return -1;
+        return avro_value_set_null(&null_branch);
+    }
+    if (avro_value_set_branch(&field, 1, &map)) return -1;
+    for (int i = begin; i < end; i++) {
+        char key[16];
+        const void *bytes = is_lower ? bounds[i].lower : bounds[i].upper;
+        int len = is_lower ? bounds[i].lower_len : bounds[i].upper_len;
+        if (len < 0) return -1;
+        if (!bytes) {
+            if (len != 0) return -1;
+            bytes = "";
+        }
+        snprintf(key, sizeof(key), "%d", bounds[i].field_id);
+        if (avro_value_add(&map, key, &elem, NULL, NULL)) return -1;
+        if (avro_value_set_bytes(&elem, (void *)bytes, (size_t)len)) return -1;
+    }
+    return 0;
+}
+
+GLACIER_INTERNAL int glacier_avro_write_iceberg_manifest_bounds(
+    const char *path,
+    const char *const *file_paths,
+    const int64_t *counts,
+    const int32_t *contents,
+    int n,
+    const int32_t *bound_off,
+    const GlacierAvroBound *bounds
+) {
+    static const char schema_json[] =
+        "{\"type\":\"record\",\"name\":\"manifest_entry\",\"fields\":["
+        "{\"name\":\"status\",\"type\":\"int\"},"
+        "{\"name\":\"data_file\",\"type\":{\"type\":\"record\",\"name\":\"r2\",\"fields\":["
+        "{\"name\":\"content\",\"type\":\"int\"},"
+        "{\"name\":\"file_path\",\"type\":\"string\"},"
+        "{\"name\":\"file_format\",\"type\":\"string\"},"
+        "{\"name\":\"record_count\",\"type\":\"long\"},"
+        "{\"name\":\"file_size_in_bytes\",\"type\":\"long\"},"
+        "{\"name\":\"lower_bounds\",\"type\":[\"null\",{\"type\":\"map\",\"values\":\"bytes\"}]},"
+        "{\"name\":\"upper_bounds\",\"type\":[\"null\",{\"type\":\"map\",\"values\":\"bytes\"}]}"
+        "]}}"
+        "]}";
+    avro_schema_t schema;
+    if (avro_schema_from_json_length(schema_json, sizeof(schema_json) - 1, &schema)) return -1;
+    avro_file_writer_t writer;
+    if (avro_file_writer_create(path, schema, &writer)) {
+        avro_schema_decref(schema);
+        return -1;
+    }
+    avro_value_iface_t *iface = avro_generic_class_from_schema(schema);
+    int rc = 0;
+    for (int i = 0; i < n && rc == 0; i++) {
+        avro_value_t rec, df, f;
+        avro_generic_value_new(iface, &rec);
+        avro_value_get_by_name(&rec, "status", &f, NULL);
+        avro_value_set_int(&f, 1);
+        avro_value_get_by_name(&rec, "data_file", &df, NULL);
+        avro_value_get_by_name(&df, "content", &f, NULL);
+        avro_value_set_int(&f, contents ? contents[i] : 0);
+        avro_value_get_by_name(&df, "file_path", &f, NULL);
+        avro_value_set_string(&f, file_paths[i]);
+        avro_value_get_by_name(&df, "file_format", &f, NULL);
+        avro_value_set_string(&f, "PARQUET");
+        avro_value_get_by_name(&df, "record_count", &f, NULL);
+        avro_value_set_long(&f, counts[i]);
+        avro_value_get_by_name(&df, "file_size_in_bytes", &f, NULL);
+        avro_value_set_long(&f, 0);
+        if (fill_bound_map(&df, "lower_bounds", bounds, bound_off[i], bound_off[i + 1], 1)) rc = -1;
+        if (rc == 0 && fill_bound_map(&df, "upper_bounds", bounds, bound_off[i], bound_off[i + 1], 0)) rc = -1;
+        if (rc == 0 && avro_file_writer_append_value(writer, &rec)) rc = -1;
+        avro_value_decref(&rec);
+    }
+    avro_value_iface_decref(iface);
+    avro_file_writer_close(writer);
+    avro_schema_decref(schema);
+    return rc;
+}
+
 GLACIER_INTERNAL int glacier_avro_write_sales_rows(
     const char *path,
     const int64_t *ids,

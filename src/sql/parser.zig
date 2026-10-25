@@ -1,6 +1,6 @@
 //! SQL surface:
 //! SELECT [DISTINCT] … [FROM t | (SELECT …) [AS a] [INNER] JOIN t2 | (SELECT …) [AS b] ON a.x = b.y]
-//!   [WHERE bool] [GROUP BY cols] [HAVING bool]
+//!   [WHERE bool] [GROUP BY cols | GROUPING SETS ((cols), …, ()) | ROLLUP (cols) | CUBE (cols)] [HAVING bool]
 //!   [ORDER BY col [ASC|DESC], …] [LIMIT n] [OFFSET m]
 //! WITH t AS (SELECT …) [, …] SELECT …
 //! COPY TO 'file.glacier'
@@ -16,6 +16,8 @@
 //! CREATE NAMESPACE [catalog.]ns
 //! CREATE TABLE [catalog.][ns.]name (col BIGINT|INT|STRING|DOUBLE|FLOAT|BOOLEAN, …)
 //! CREATE TABLE [catalog.][ns.]name AS SELECT …
+//! PARTITIONED BY (col | identity(col) | year(col) | month(col) | day(col) | hour(col) | bucket(N, col) | truncate(W, col))
+//! CREATE TEMP[ORARY] TABLE name (cols…) | AS SELECT …   (session lifetime, not a catalog)
 //! INSERT INTO [catalog.][ns.]name VALUES (…)[, …] | SELECT …
 //! DELETE FROM [catalog.][ns.]name [WHERE bool]   (Iceberg equality deletes)
 //! UPDATE [catalog.][ns.]name SET col = lit|col [, …] [WHERE bool]
@@ -30,10 +32,11 @@
 //! Literals: `SELECT 1` / `SELECT NULL` (no FROM). Escalars: abs, round, cast, coalesce, lower, upper, length, trim, replace, substr, concat, left, right, starts_with, date_trunc, extract, year/month/day/hour/minute/second, ceil, floor, sign, greatest, least, CASE.
 //! Expr: `+ - * / %`, unary minus, col vs col, nested calls (`abs(price * 2)`), scalar subquery `(SELECT …)`.
 //! Aggregates: COUNT/SUM/AVG/MIN/MAX(DISTINCT col). `VALUES (1), (2)` as a query / FROM subquery.
-//! WHERE: comparisons (expr vs expr), `IS [NOT] NULL`, `LIKE`, `IN (lits | SELECT)`, `BETWEEN`, scalar subquery, `EXISTS` / `NOT EXISTS` (uncorrelated).
-//! UNION [ALL] of two SELECTs (same schema). Correlated subquery → UnsupportedSql.
-//! JOIN: [INNER] JOIN / LEFT [OUTER] JOIN / RIGHT [OUTER] JOIN / FULL [OUTER] JOIN … ON eq.
-//! USING / NATURAL / comma-join → UnsupportedJoin. Recursive CTE / named WINDOW → UnsupportedSql.
+//! WHERE: comparisons (expr vs expr), `IS [NOT] NULL`, `LIKE`, `IN (lits | SELECT)`, `BETWEEN`, scalar subquery, `EXISTS` / `NOT EXISTS`.
+//! A subquery correlates when it names an outer alias (`a.id`), including `HAVING`. `LATERAL` runs once per left row.
+//! UNION [ALL] of two SELECTs (same schema).
+//! JOIN: [INNER] JOIN / LEFT [OUTER] JOIN / RIGHT [OUTER] JOIN / FULL [OUTER] JOIN … ON eq | USING (cols).
+//! NATURAL and a comma are joins. WITH RECURSIVE, LATERAL, named WINDOW, and GROUPS frames parse.
 
 const std = @import("std");
 
@@ -217,11 +220,18 @@ pub const Join = struct {
     alias: ?[]const u8 = null,
     sub: ?*Query = null,
     eqs: []const JoinEq,
+    /// Names in `USING (…)` . Empty when the join is `ON`.
+    using: []const []const u8 = &.{},
+    /// Shared column names, resolved when the inputs are known.
+    natural: bool = false,
+    /// Right input is evaluated once per left row.
+    lateral: bool = false,
 };
 
 pub const Cte = struct {
     name: []const u8,
     query: *Query,
+    recursive: bool = false,
 };
 
 pub const WindowKind = enum { count, sum, avg, min, max, row_number, rank, dense_rank, lag, lead };
@@ -234,7 +244,7 @@ pub const FrameBound = union(enum) {
     following: u64,
 };
 
-pub const FrameUnit = enum { rows, range };
+pub const FrameUnit = enum { rows, range, groups };
 
 pub const WindowFrame = struct {
     unit: FrameUnit,
@@ -246,6 +256,13 @@ pub const WindowSpec = struct {
     partition_by: []const []const u8 = &.{},
     order_by: []const OrderBy = &.{},
     frame: ?WindowFrame = null,
+    /// `OVER name`. Filled from `Query.named_windows` before the window runs.
+    ref: ?[]const u8 = null,
+};
+
+pub const NamedWindow = struct {
+    name: []const u8,
+    spec: WindowSpec,
 };
 
 pub const Window = struct {
@@ -326,6 +343,11 @@ pub const Case = struct {
     alias: ?[]const u8,
 };
 
+pub const Grouping = struct {
+    name: []const u8,
+    alias: ?[]const u8 = null,
+};
+
 pub const SelectItem = union(enum) {
     star,
     column: ColumnRef,
@@ -335,6 +357,7 @@ pub const SelectItem = union(enum) {
     literal: LiteralItem,
     case: Case,
     expr: Computed,
+    grouping: Grouping,
 };
 
 pub const OrderBy = struct {
@@ -356,6 +379,8 @@ pub const Query = struct {
     join: ?Join = null,
     where: ?*BoolExpr,
     group_by: []const []const u8,
+    /// One slice per set. Empty means a plain `GROUP BY`. An empty inner slice is the grand total.
+    grouping_sets: []const []const []const u8 = &.{},
     having: ?*BoolExpr,
     order_by: []const OrderBy,
     distinct: bool,
@@ -364,6 +389,7 @@ pub const Query = struct {
     union_all: bool = false,
     union_right: ?*Query = null,
     ctes: []const Cte = &.{},
+    named_windows: []const NamedWindow = &.{},
 
     pub fn isStar(self: Query) bool {
         return self.items.len == 1 and self.items[0] == .star;
@@ -384,7 +410,7 @@ pub const Query = struct {
     }
 
     pub fn needsAgg(self: Query) bool {
-        return self.hasAgg() or self.group_by.len > 0;
+        return self.hasAgg() or self.group_by.len > 0 or self.grouping_sets.len > 0;
     }
 
     /// `SELECT 1` / `SELECT 1, 'x'` with no FROM: one row, no scan.
@@ -475,12 +501,20 @@ pub const CreateNamespace = struct {
     ident: []const u8,
 };
 
+pub const PartitionExpr = struct {
+    column: []const u8,
+    /// `identity`, `year`, `month`, `day`, `hour`, `bucket[N]`, `truncate[W]`.
+    transform: []const u8,
+};
+
 pub const CreateTable = struct {
     ident: []const u8,
     columns: []const ColDef = &.{},
     as_select: ?Query = null,
-    /// Iceberg identity columns. Empty = unpartitioned.
-    partition_by: []const []const u8 = &.{},
+    /// Empty = unpartitioned. A bare name is `identity`.
+    partition_by: []const PartitionExpr = &.{},
+    /// Lives in the session. Not written to a catalog.
+    temporary: bool = false,
 };
 
 pub const Insert = struct {
@@ -490,6 +524,24 @@ pub const Insert = struct {
 
 pub const DropTable = struct {
     ident: []const u8,
+};
+
+pub const CompactTable = struct {
+    ident: []const u8,
+};
+
+pub const ExpireSnapshots = struct {
+    ident: []const u8,
+    execute: bool = false,
+};
+
+pub const RemoveOrphans = struct {
+    ident: []const u8,
+    execute: bool = false,
+};
+
+pub const Explain = struct {
+    query: Query,
 };
 
 pub const Delete = struct {
@@ -555,6 +607,10 @@ pub const Stmt = union(enum) {
     merge: Merge,
     alter_table: AlterTable,
     drop_table: DropTable,
+    compact_table: CompactTable,
+    expire_snapshots: ExpireSnapshots,
+    remove_orphans: RemoveOrphans,
+    explain: Explain,
 };
 
 pub fn aggArgsEqual(a: ?[]const u8, b: ?[]const u8) bool {
@@ -597,6 +653,10 @@ const Kind = enum {
     using,
     into,
     with,
+    recursive,
+    natural,
+    cross,
+    window,
     join,
     inner,
     left,
@@ -893,14 +953,19 @@ const Lexer = struct {
                 .@"union"
             else if (eqlKw(lexeme, "values"))
                 .values
-            else if (eqlKw(lexeme, "natural") or eqlKw(lexeme, "cross"))
-                return error.UnsupportedJoin
+            else if (eqlKw(lexeme, "natural"))
+                .natural
+            else if (eqlKw(lexeme, "cross"))
+                .cross
+            else if (eqlKw(lexeme, "recursive"))
+                .recursive
+            else if (eqlKw(lexeme, "window"))
+                .window
             else if (eqlKw(lexeme, "exists"))
                 .exists
             else if (eqlKw(lexeme, "for"))
                 .@"for"
-            else if (eqlKw(lexeme, "window") or eqlKw(lexeme, "except") or eqlKw(lexeme, "intersect") or
-                eqlKw(lexeme, "recursive"))
+            else if (eqlKw(lexeme, "except") or eqlKw(lexeme, "intersect"))
                 return error.UnsupportedSql
             else
                 .ident;
@@ -976,7 +1041,34 @@ fn windowKindFromAgg(kind: AggKind) WindowKind {
 
 fn parseWindowSpec(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) ParseError!WindowSpec {
     _ = try expect(lexer, .over);
+    if ((try lexer.peek()).kind == .ident) {
+        const name = (try lexer.next()).slice(sql);
+        return .{ .ref = name };
+    }
     _ = try expect(lexer, .lparen);
+    return parseWindowBody(allocator, lexer, sql);
+}
+
+fn parseNamedWindows(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) ![]const NamedWindow {
+    _ = try expect(lexer, .window);
+    var out: std.ArrayList(NamedWindow) = .empty;
+    defer out.deinit(allocator);
+    while (true) {
+        const name = (try expect(lexer, .ident)).slice(sql);
+        for (out.items) |prev| {
+            if (std.ascii.eqlIgnoreCase(prev.name, name)) return error.InvalidSyntax;
+        }
+        _ = try expect(lexer, .as);
+        _ = try expect(lexer, .lparen);
+        try out.append(allocator, .{ .name = name, .spec = try parseWindowBody(allocator, lexer, sql) });
+        if ((try lexer.peek()).kind != .comma) break;
+        _ = try lexer.next();
+    }
+    if (out.items.len == 0) return error.InvalidSyntax;
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseWindowBody(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) ParseError!WindowSpec {
     var partition_by: std.ArrayList([]const u8) = .empty;
     defer partition_by.deinit(allocator);
     var order_by: std.ArrayList(OrderBy) = .empty;
@@ -1028,6 +1120,8 @@ fn parseWindowFrame(lexer: *Lexer, sql: []const u8) ParseError!WindowFrame {
         .rows
     else if (tokIsKw(unit_tok, sql, "range"))
         .range
+    else if (tokIsKw(unit_tok, sql, "groups"))
+        .groups
     else
         return error.UnsupportedSql;
     _ = try lexer.next();
@@ -1417,6 +1511,14 @@ fn parseSelectItem(lexer: *Lexer, sql: []const u8, allocator: std.mem.Allocator)
     }
     if (t.kind == .ident and identFollowedByLparen(lexer, sql)) {
         const name = t.slice(sql);
+        if (eqlKw(name, "grouping")) {
+            _ = try lexer.next();
+            _ = try expect(lexer, .lparen);
+            const col = try parseColumnName(lexer, sql);
+            _ = try expect(lexer, .rparen);
+            const alias = try optionalAlias(lexer, sql);
+            return .{ .grouping = .{ .name = col, .alias = alias } };
+        }
         if (parseRankingKind(name) != null or parseLagLeadKind(name) != null or parseAggKind(name) != null) {
             return parseSelectAggOrWindow(lexer, sql, allocator);
         }
@@ -1765,11 +1867,65 @@ fn parseU64(tok: Token, sql: []const u8) Error!u64 {
     return std.fmt.parseInt(u64, tok.slice(sql), 10) catch error.InvalidNumber;
 }
 
+/// Splits a script on `;` outside quotes and `--` comments. Empty pieces are dropped.
+pub fn splitStatements(allocator: std.mem.Allocator, sql: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < sql.len) {
+        const c = sql[i];
+        if (c == '\'') {
+            i += 1;
+            while (i < sql.len) {
+                if (sql[i] == '\'') {
+                    if (i + 1 < sql.len and sql[i + 1] == '\'') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if (c == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
+            i += 2;
+            while (i < sql.len and sql[i] != '\n') i += 1;
+            continue;
+        }
+        if (c == ';') {
+            if (!blankSql(sql[start..i])) try out.append(allocator, std.mem.trim(u8, sql[start..i], " \t\r\n"));
+            i += 1;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    if (!blankSql(sql[start..])) try out.append(allocator, std.mem.trim(u8, sql[start..], " \t\r\n"));
+}
+
+fn blankSql(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            i += 1;
+            continue;
+        }
+        if (c == '-' and i + 1 < s.len and s[i + 1] == '-') {
+            i += 2;
+            while (i < s.len and s[i] != '\n') i += 1;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 pub fn parse(allocator: std.mem.Allocator, sql: []const u8) !Query {
     switch (try parseStmt(allocator, sql)) {
         .query => |q| return q,
-        .copy, .show, .attach, .describe, .use, .detach,
-        .create_namespace, .create_table, .insert, .delete, .update, .merge, .alter_table, .drop_table => return error.InvalidSyntax,
+        .copy, .show, .attach, .describe, .use, .detach, .create_namespace, .create_table, .insert, .delete, .update, .merge, .alter_table, .drop_table, .compact_table, .expire_snapshots, .remove_orphans, .explain => return error.InvalidSyntax,
     }
 }
 
@@ -1814,7 +1970,61 @@ pub fn parseStmt(allocator: std.mem.Allocator, sql: []const u8) !Stmt {
     if ((try lexer.peek()).kind == .alter) {
         return .{ .alter_table = try parseAlterTable(&lexer, sql) };
     }
+    if ((try lexer.peek()).kind == .ident and eqlKw((try lexer.peek()).slice(sql), "compact")) {
+        return .{ .compact_table = try parseCompact(&lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .ident and eqlKw((try lexer.peek()).slice(sql), "expire")) {
+        return .{ .expire_snapshots = try parseExpire(&lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .ident and eqlKw((try lexer.peek()).slice(sql), "remove")) {
+        return .{ .remove_orphans = try parseRemoveOrphans(&lexer, sql) };
+    }
+    if ((try lexer.peek()).kind == .ident and eqlKw((try lexer.peek()).slice(sql), "explain")) {
+        _ = try lexer.next();
+        return .{ .explain = .{ .query = try parseQuery(allocator, &lexer, sql, .eof) } };
+    }
     return .{ .query = try parseQuery(allocator, &lexer, sql, .eof) };
+}
+
+fn parseCompact(lexer: *Lexer, sql: []const u8) !CompactTable {
+    const word = try expect(lexer, .ident);
+    if (!eqlKw(word.slice(sql), "compact")) return error.InvalidSyntax;
+    const table = try expect(lexer, .ident);
+    if (!eqlKw(table.slice(sql), "table")) return error.InvalidSyntax;
+    const ident = try parseDottedIdent(lexer, sql);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .ident = ident };
+}
+
+fn parseExecuteFlag(lexer: *Lexer, sql: []const u8) !bool {
+    if ((try lexer.peek()).kind != .ident) return false;
+    if (!eqlKw((try lexer.peek()).slice(sql), "execute")) return false;
+    _ = try lexer.next();
+    return true;
+}
+
+fn parseExpire(lexer: *Lexer, sql: []const u8) !ExpireSnapshots {
+    const word = try expect(lexer, .ident);
+    if (!eqlKw(word.slice(sql), "expire")) return error.InvalidSyntax;
+    const snaps = try expect(lexer, .ident);
+    if (!eqlKw(snaps.slice(sql), "snapshots")) return error.InvalidSyntax;
+    const ident = try parseDottedIdent(lexer, sql);
+    const execute = try parseExecuteFlag(lexer, sql);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .ident = ident, .execute = execute };
+}
+
+fn parseRemoveOrphans(lexer: *Lexer, sql: []const u8) !RemoveOrphans {
+    const word = try expect(lexer, .ident);
+    if (!eqlKw(word.slice(sql), "remove")) return error.InvalidSyntax;
+    const orphan = try expect(lexer, .ident);
+    if (!eqlKw(orphan.slice(sql), "orphan")) return error.InvalidSyntax;
+    const files = try expect(lexer, .ident);
+    if (!eqlKw(files.slice(sql), "files")) return error.InvalidSyntax;
+    const ident = try parseDottedIdent(lexer, sql);
+    const execute = try parseExecuteFlag(lexer, sql);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return .{ .ident = ident, .execute = execute };
 }
 
 fn parseShow(lexer: *Lexer, sql: []const u8) !Show {
@@ -1917,6 +2127,15 @@ fn parseCreate(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !St
         if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
         return .{ .create_namespace = .{ .ident = ident } };
     }
+    if (eqlKw(word, "temp") or eqlKw(word, "temporary")) {
+        const table_tok = try lexer.next();
+        if (table_tok.kind != .ident or !eqlKw(table_tok.slice(sql), "table")) return error.InvalidSyntax;
+        var ct = try parseCreateTable(allocator, lexer, sql);
+        ct.temporary = true;
+        if (std.mem.indexOfScalar(u8, ct.ident, '.') != null) return error.InvalidSyntax;
+        if (ct.partition_by.len != 0) return error.UnsupportedSql;
+        return .{ .create_table = ct };
+    }
     if (eqlKw(word, "table")) {
         return .{ .create_table = try parseCreateTable(allocator, lexer, sql) };
     }
@@ -1925,7 +2144,7 @@ fn parseCreate(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !St
 
 fn parseCreateTable(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !CreateTable {
     const ident = try parseDottedIdent(lexer, sql);
-    var partition_by: std.ArrayList([]const u8) = .empty;
+    var partition_by: std.ArrayList(PartitionExpr) = .empty;
     defer partition_by.deinit(allocator);
     if (try peekPartitioned(lexer, sql)) {
         try parsePartitionedBy(allocator, lexer, sql, &partition_by);
@@ -1976,7 +2195,7 @@ fn parsePartitionedBy(
     allocator: std.mem.Allocator,
     lexer: *Lexer,
     sql: []const u8,
-    out: *std.ArrayList([]const u8),
+    out: *std.ArrayList(PartitionExpr),
 ) !void {
     const tok = try lexer.next();
     if (tok.kind == .ident) {
@@ -1985,27 +2204,57 @@ fn parsePartitionedBy(
     _ = try expect(lexer, .by);
     _ = try expect(lexer, .lparen);
     while (true) {
-        try out.append(allocator, try parsePartitionCol(lexer, sql));
+        try out.append(allocator, try parsePartitionCol(allocator, lexer, sql));
         if ((try lexer.peek()).kind != .comma) break;
         _ = try lexer.next();
     }
     _ = try expect(lexer, .rparen);
     if (out.items.len == 0) return error.InvalidSyntax;
-    for (out.items, 0..) |name, i| {
+    for (out.items, 0..) |expr, i| {
         for (out.items[0..i]) |prev| {
-            if (std.ascii.eqlIgnoreCase(prev, name)) return error.InvalidSyntax;
+            if (std.ascii.eqlIgnoreCase(prev.column, expr.column) and
+                std.ascii.eqlIgnoreCase(prev.transform, expr.transform))
+                return error.InvalidSyntax;
         }
     }
 }
 
-fn parsePartitionCol(lexer: *Lexer, sql: []const u8) ![]const u8 {
+fn parsePartitionCol(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !PartitionExpr {
     const name = try parseColumnName(lexer, sql);
-    if ((try lexer.peek()).kind != .lparen) return name;
-    if (!eqlKw(name, "identity")) return error.UnsupportedPartitionSpec;
+    if ((try lexer.peek()).kind != .lparen) return .{ .column = name, .transform = "identity" };
     _ = try lexer.next();
-    const inner = try parseColumnName(lexer, sql);
-    _ = try expect(lexer, .rparen);
-    return inner;
+    if (eqlKw(name, "identity")) {
+        const inner = try parseColumnName(lexer, sql);
+        _ = try expect(lexer, .rparen);
+        return .{ .column = inner, .transform = "identity" };
+    }
+    if (eqlKw(name, "year") or eqlKw(name, "month") or eqlKw(name, "day") or eqlKw(name, "hour")) {
+        const inner = try parseColumnName(lexer, sql);
+        _ = try expect(lexer, .rparen);
+        const tf: []const u8 = if (eqlKw(name, "year"))
+            "year"
+        else if (eqlKw(name, "month"))
+            "month"
+        else if (eqlKw(name, "day"))
+            "day"
+        else
+            "hour";
+        return .{ .column = inner, .transform = tf };
+    }
+    if (eqlKw(name, "bucket") or eqlKw(name, "truncate")) {
+        const width = try expect(lexer, .number);
+        const n = std.fmt.parseInt(u32, width.slice(sql), 10) catch return error.UnsupportedPartitionSpec;
+        if (n == 0) return error.UnsupportedPartitionSpec;
+        _ = try expect(lexer, .comma);
+        const inner = try parseColumnName(lexer, sql);
+        _ = try expect(lexer, .rparen);
+        const kind: []const u8 = if (eqlKw(name, "bucket")) "bucket" else "truncate";
+        return .{
+            .column = inner,
+            .transform = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ kind, n }),
+        };
+    }
+    return error.UnsupportedPartitionSpec;
 }
 
 fn icebergTypeName(name: []const u8) ?[]const u8 {
@@ -2290,6 +2539,11 @@ fn valuesRowQuery(allocator: std.mem.Allocator, row: []const Literal) !Query {
 
 fn parseWith(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8, stop: Kind) !Query {
     _ = try expect(lexer, .with);
+    var recursive = false;
+    if ((try lexer.peek()).kind == .recursive) {
+        _ = try lexer.next();
+        recursive = true;
+    }
     var ctes: std.ArrayList(Cte) = .empty;
     defer ctes.deinit(allocator);
     while (true) {
@@ -2299,7 +2553,7 @@ fn parseWith(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8, stop:
         }
         _ = try expect(lexer, .as);
         const body = try parseSubquery(allocator, lexer, sql);
-        try ctes.append(allocator, .{ .name = name, .query = body });
+        try ctes.append(allocator, .{ .name = name, .query = body, .recursive = recursive });
         if ((try lexer.peek()).kind != .comma) break;
         _ = try lexer.next();
     }
@@ -2383,6 +2637,10 @@ fn parseSelect(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8, sto
         tail.union_all = union_all;
         tail.union_right = right;
         tail = right;
+    }
+
+    if ((try lexer.peek()).kind == .window) {
+        q.named_windows = try parseNamedWindows(allocator, lexer, sql);
     }
 
     var order_by: std.ArrayList(OrderBy) = .empty;
@@ -2486,15 +2744,12 @@ fn parseSelectArm(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) 
 
     var group_by: std.ArrayList([]const u8) = .empty;
     defer group_by.deinit(allocator);
+    var grouping_sets: []const []const []const u8 = &.{};
 
     if ((try lexer.peek()).kind == .group) {
-        _ = try lexer.next();
-        _ = try expect(lexer, .by);
-        try group_by.append(allocator, try parseColumnName(lexer, sql));
-        while ((try lexer.peek()).kind == .comma) {
-            _ = try lexer.next();
-            try group_by.append(allocator, try parseColumnName(lexer, sql));
-        }
+        const parsed = try parseGroupBy(allocator, lexer, sql);
+        grouping_sets = parsed.sets;
+        for (parsed.group_by) |name| try group_by.append(allocator, name);
     }
 
     var having_expr: ?*BoolExpr = null;
@@ -2506,6 +2761,9 @@ fn parseSelectArm(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) 
     if (having_expr != null and group_by.items.len == 0 and !hasAggItems(items.items)) {
         return error.InvalidSyntax;
     }
+    for (items.items) |item| {
+        if (item == .grouping and group_by.items.len == 0) return error.InvalidSyntax;
+    }
 
     return .{
         .items = try items.toOwnedSlice(allocator),
@@ -2516,11 +2774,151 @@ fn parseSelectArm(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) 
         .join = join,
         .where = where_expr,
         .group_by = try group_by.toOwnedSlice(allocator),
+        .grouping_sets = grouping_sets,
         .having = having_expr,
         .order_by = &.{},
         .distinct = distinct,
         .limit = null,
         .offset = null,
+    };
+}
+
+const ParsedGroupBy = struct {
+    group_by: []const []const u8,
+    sets: []const []const []const u8,
+};
+
+fn parseGroupBy(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !ParsedGroupBy {
+    _ = try expect(lexer, .group);
+    _ = try expect(lexer, .by);
+    const first = try lexer.peek();
+    if (first.kind == .ident and eqlKw(first.slice(sql), "grouping")) {
+        const grouping_tok = try lexer.next();
+        const nxt = try lexer.peek();
+        if (nxt.kind == .ident and eqlKw(nxt.slice(sql), "sets")) {
+            _ = try lexer.next();
+            return parseGroupingSets(allocator, lexer, sql);
+        }
+        var cols: std.ArrayList([]const u8) = .empty;
+        defer cols.deinit(allocator);
+        try cols.append(allocator, grouping_tok.slice(sql));
+        while ((try lexer.peek()).kind == .comma) {
+            _ = try lexer.next();
+            try cols.append(allocator, try parseColumnName(lexer, sql));
+        }
+        return .{ .group_by = try cols.toOwnedSlice(allocator), .sets = &.{} };
+    }
+    if (first.kind == .ident and (eqlKw(first.slice(sql), "rollup") or eqlKw(first.slice(sql), "cube"))) {
+        const word = first.slice(sql);
+        const cube = eqlKw(word, "cube");
+        _ = try lexer.next();
+        if ((try lexer.peek()).kind == .lparen) {
+            return parseRollupOrCube(allocator, lexer, sql, cube);
+        }
+        var named: std.ArrayList([]const u8) = .empty;
+        defer named.deinit(allocator);
+        try named.append(allocator, word);
+        while ((try lexer.peek()).kind == .comma) {
+            _ = try lexer.next();
+            try named.append(allocator, try parseColumnName(lexer, sql));
+        }
+        return .{ .group_by = try named.toOwnedSlice(allocator), .sets = &.{} };
+    }
+    var cols: std.ArrayList([]const u8) = .empty;
+    defer cols.deinit(allocator);
+    try cols.append(allocator, try parseColumnName(lexer, sql));
+    while ((try lexer.peek()).kind == .comma) {
+        _ = try lexer.next();
+        try cols.append(allocator, try parseColumnName(lexer, sql));
+    }
+    return .{ .group_by = try cols.toOwnedSlice(allocator), .sets = &.{} };
+}
+
+fn parseRollupOrCube(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8, cube: bool) !ParsedGroupBy {
+    _ = try expect(lexer, .lparen);
+    var cols: std.ArrayList([]const u8) = .empty;
+    defer cols.deinit(allocator);
+    if ((try lexer.peek()).kind == .rparen) return error.InvalidSyntax;
+    while (true) {
+        const name = try parseColumnName(lexer, sql);
+        for (cols.items) |prev| {
+            if (std.ascii.eqlIgnoreCase(prev, name)) return error.InvalidSyntax;
+        }
+        try cols.append(allocator, name);
+        if ((try lexer.peek()).kind != .comma) break;
+        _ = try lexer.next();
+    }
+    _ = try expect(lexer, .rparen);
+    if (cols.items.len == 0) return error.InvalidSyntax;
+    if (cols.items.len > 16) return error.UnsupportedSql;
+
+    var sets: std.ArrayList([]const []const u8) = .empty;
+    defer sets.deinit(allocator);
+    if (cube) {
+        const nsets: usize = @as(usize, 1) << @intCast(cols.items.len);
+        var rev: usize = 0;
+        while (rev < nsets) : (rev += 1) {
+            const mask = nsets - 1 - rev;
+            var set: std.ArrayList([]const u8) = .empty;
+            defer set.deinit(allocator);
+            for (cols.items, 0..) |name, i| {
+                if (mask & (@as(usize, 1) << @intCast(i)) != 0) try set.append(allocator, name);
+            }
+            try sets.append(allocator, try set.toOwnedSlice(allocator));
+        }
+    } else {
+        var k: usize = cols.items.len;
+        while (true) {
+            try sets.append(allocator, try allocator.dupe([]const u8, cols.items[0..k]));
+            if (k == 0) break;
+            k -= 1;
+        }
+    }
+    return .{
+        .group_by = try cols.toOwnedSlice(allocator),
+        .sets = try sets.toOwnedSlice(allocator),
+    };
+}
+
+fn parseGroupingSets(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) !ParsedGroupBy {
+    _ = try expect(lexer, .lparen);
+    var sets: std.ArrayList([]const []const u8) = .empty;
+    defer sets.deinit(allocator);
+    var union_cols: std.ArrayList([]const u8) = .empty;
+    defer union_cols.deinit(allocator);
+    while (true) {
+        _ = try expect(lexer, .lparen);
+        var cols: std.ArrayList([]const u8) = .empty;
+        defer cols.deinit(allocator);
+        if ((try lexer.peek()).kind != .rparen) {
+            while (true) {
+                const name = try parseColumnName(lexer, sql);
+                for (cols.items) |prev| {
+                    if (std.ascii.eqlIgnoreCase(prev, name)) return error.InvalidSyntax;
+                }
+                try cols.append(allocator, name);
+                var seen = false;
+                for (union_cols.items) |prev| {
+                    if (std.ascii.eqlIgnoreCase(prev, name)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) try union_cols.append(allocator, name);
+                if ((try lexer.peek()).kind != .comma) break;
+                _ = try lexer.next();
+            }
+        }
+        _ = try expect(lexer, .rparen);
+        try sets.append(allocator, try cols.toOwnedSlice(allocator));
+        if ((try lexer.peek()).kind != .comma) break;
+        _ = try lexer.next();
+    }
+    if (sets.items.len == 0) return error.InvalidSyntax;
+    _ = try expect(lexer, .rparen);
+    return .{
+        .group_by = try union_cols.toOwnedSlice(allocator),
+        .sets = try sets.toOwnedSlice(allocator),
     };
 }
 
@@ -2600,15 +2998,86 @@ fn parseTableAlias(lexer: *Lexer, sql: []const u8) Error!?[]const u8 {
 }
 
 fn parseOptionalJoin(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) ParseError!?Join {
-    if ((try lexer.peek()).kind == .comma) return error.UnsupportedJoin;
     if ((try lexer.peek()).kind == .using) return error.UnsupportedJoin;
+    if ((try lexer.peek()).kind == .comma) {
+        _ = try lexer.next();
+        return try parseCrossJoin(allocator, lexer, sql, true);
+    }
     switch ((try lexer.peek()).kind) {
-        .join, .inner, .left, .right, .full => return try parseJoin(allocator, lexer, sql),
+        .natural, .cross, .join, .inner, .left, .right, .full => return try parseJoin(allocator, lexer, sql),
         else => return null,
     }
 }
 
+fn parseCrossJoin(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8, from_comma: bool) ParseError!Join {
+    var lateral = false;
+    if (tokIsKw(try lexer.peek(), sql, "lateral")) {
+        _ = try lexer.next();
+        lateral = true;
+    }
+    var table: []const u8 = undefined;
+    var alias: ?[]const u8 = null;
+    var sub: ?*Query = null;
+    if ((try lexer.peek()).kind == .lparen) {
+        sub = try parseSubquery(allocator, lexer, sql);
+        alias = try parseTableAlias(lexer, sql);
+        if (alias == null) return error.InvalidSyntax;
+        table = alias.?;
+    } else {
+        table = try parseFrom(lexer, sql);
+        alias = try parseTableAlias(lexer, sql);
+    }
+    if (!from_comma and !lateral and (try lexer.peek()).kind == .on) return error.UnsupportedJoin;
+    return .{
+        .kind = .inner,
+        .table = table,
+        .alias = alias,
+        .sub = sub,
+        .eqs = &.{},
+        .lateral = lateral,
+    };
+}
+
 fn parseJoin(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) ParseError!Join {
+    if ((try lexer.peek()).kind == .natural) {
+        _ = try lexer.next();
+        var kind: JoinKind = .inner;
+        switch ((try lexer.peek()).kind) {
+            .left => {
+                _ = try lexer.next();
+                if ((try lexer.peek()).kind == .outer) _ = try lexer.next();
+                kind = .left;
+            },
+            .right => {
+                _ = try lexer.next();
+                if ((try lexer.peek()).kind == .outer) _ = try lexer.next();
+                kind = .right;
+            },
+            .full => {
+                _ = try lexer.next();
+                if ((try lexer.peek()).kind == .outer) _ = try lexer.next();
+                kind = .full;
+            },
+            .inner => _ = try lexer.next(),
+            else => {},
+        }
+        _ = try expect(lexer, .join);
+        const tail = try parseCrossJoin(allocator, lexer, sql, false);
+        return .{
+            .kind = kind,
+            .table = tail.table,
+            .alias = tail.alias,
+            .sub = tail.sub,
+            .eqs = &.{},
+            .natural = true,
+            .lateral = tail.lateral,
+        };
+    }
+    if ((try lexer.peek()).kind == .cross) {
+        _ = try lexer.next();
+        _ = try expect(lexer, .join);
+        return parseCrossJoin(allocator, lexer, sql, false);
+    }
     var kind: JoinKind = .inner;
     switch ((try lexer.peek()).kind) {
         .left => {
@@ -2642,16 +3111,43 @@ fn parseJoin(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) Parse
         table = try parseFrom(lexer, sql);
         alias = try parseTableAlias(lexer, sql);
     }
-    if ((try lexer.peek()).kind != .on) return error.UnsupportedJoin;
-    _ = try lexer.next();
-    const eqs = try parseJoinEqs(allocator, lexer, sql);
+    var using: []const []const u8 = &.{};
+    const eqs = if ((try lexer.peek()).kind == .on) blk: {
+        _ = try lexer.next();
+        break :blk try parseJoinEqs(allocator, lexer, sql);
+    } else if ((try lexer.peek()).kind == .using) blk: {
+        _ = try lexer.next();
+        using = try parseUsingNames(allocator, lexer, sql);
+        break :blk &.{};
+    } else return error.UnsupportedJoin;
     return .{
         .kind = kind,
         .table = table,
         .alias = alias,
         .sub = sub,
         .eqs = eqs,
+        .using = using,
     };
+}
+
+fn parseUsingNames(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8) ![]const []const u8 {
+    _ = try expect(lexer, .lparen);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(allocator);
+    while (true) {
+        const tok = try expect(lexer, .ident);
+        if ((try lexer.peek()).kind == .dot) return error.InvalidSyntax;
+        const name = tok.slice(sql);
+        for (names.items) |prev| {
+            if (std.ascii.eqlIgnoreCase(prev, name)) return error.InvalidSyntax;
+        }
+        try names.append(allocator, name);
+        if ((try lexer.peek()).kind != .comma) break;
+        _ = try lexer.next();
+    }
+    if (names.items.len == 0) return error.InvalidSyntax;
+    _ = try expect(lexer, .rparen);
+    return names.toOwnedSlice(allocator);
 }
 
 fn parseQualName(lexer: *Lexer, sql: []const u8) Error!QualName {
@@ -2862,11 +3358,59 @@ fn queryRefsOuter(q: *const Query, outer: []const []const u8) bool {
     return false;
 }
 
-/// True when `inner` references a qualifier that belongs to `outer` (correlated subquery).
+/// True when `inner` references a qualifier that belongs to `outer`.
 pub fn isCorrelated(inner: *const Query, outer: *const Query) bool {
     var buf: [16][]const u8 = undefined;
     const n = fillAliases(outer, &buf);
     return queryRefsOuter(inner, buf[0..n]);
+}
+
+pub fn refersOuter(name: []const u8, inner: *const Query, outer: *const Query) bool {
+    var ibuf: [16][]const u8 = undefined;
+    var obuf: [16][]const u8 = undefined;
+    const ni = fillAliases(inner, &ibuf);
+    const no = fillAliases(outer, &obuf);
+    return columnRefersOuter(name, ibuf[0..ni], obuf[0..no]);
+}
+
+pub fn aliasIsOuter(alias: []const u8, inner: *const Query, outer: *const Query) bool {
+    var ibuf: [16][]const u8 = undefined;
+    var obuf: [16][]const u8 = undefined;
+    const ni = fillAliases(inner, &ibuf);
+    const no = fillAliases(outer, &obuf);
+    return qualRefersOuter(alias, ibuf[0..ni], obuf[0..no]);
+}
+
+/// `WHERE` / `HAVING` / select list names an outer alias inside a subquery.
+pub fn hasCorrelation(q: *const Query) bool {
+    var buf: [16][]const u8 = undefined;
+    const n = fillAliases(q, &buf);
+    const names = buf[0..n];
+    if (q.where) |e| if (exprRefsOuter(e, names, names)) return true;
+    if (q.having) |e| if (exprRefsOuter(e, names, names)) return true;
+    for (q.items) |item| if (itemRefsOuter(item, names, names)) return true;
+    if (q.join) |j| {
+        if (j.lateral) return true;
+        if (j.sub) |sub| {
+            if (isCorrelated(sub, q)) return true;
+        }
+    }
+    return false;
+}
+
+pub fn predicateIsCorrelated(expr: *const BoolExpr, outer: *const Query) bool {
+    var buf: [16][]const u8 = undefined;
+    const n = fillAliases(outer, &buf);
+    const names = buf[0..n];
+    return exprRefsOuter(expr, names, names);
+}
+
+pub fn itemsAreCorrelated(q: *const Query) bool {
+    var buf: [16][]const u8 = undefined;
+    const n = fillAliases(q, &buf);
+    const names = buf[0..n];
+    for (q.items) |item| if (itemRefsOuter(item, names, names)) return true;
+    return false;
 }
 
 pub fn usesTableName(q: *const Query, name: []const u8) bool {
@@ -2964,14 +3508,78 @@ test "parse count and group by" {
     try std.testing.expect(q.hasAgg());
     try std.testing.expectEqualStrings("category", q.group_by[0]);
     try std.testing.expectEqual(AggKind.count, q.items[1].agg.kind);
+    try std.testing.expectEqual(@as(usize, 0), q.grouping_sets.len);
+}
+
+test "parse grouping sets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const q = try parse(
+        arena.allocator(),
+        "SELECT category, COUNT(*) FROM sales GROUP BY GROUPING SETS ((category), ())",
+    );
+    try std.testing.expectEqual(@as(usize, 1), q.group_by.len);
+    try std.testing.expectEqualStrings("category", q.group_by[0]);
+    try std.testing.expectEqual(@as(usize, 2), q.grouping_sets.len);
+    try std.testing.expectEqual(@as(usize, 1), q.grouping_sets[0].len);
+    try std.testing.expectEqual(@as(usize, 0), q.grouping_sets[1].len);
+    const named = try parse(arena.allocator(), "SELECT grouping, COUNT(*) FROM sales GROUP BY grouping");
+    try std.testing.expectEqual(@as(usize, 0), named.grouping_sets.len);
+    try std.testing.expectEqualStrings("grouping", named.group_by[0]);
+    try std.testing.expectError(
+        error.InvalidSyntax,
+        parse(arena.allocator(), "SELECT category FROM sales GROUP BY GROUPING SETS ((category, category))"),
+    );
+}
+
+test "parse rollup cube and grouping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rollup = try parse(
+        arena.allocator(),
+        "SELECT category, GROUPING(category) AS g, COUNT(*) FROM sales GROUP BY ROLLUP (category)",
+    );
+    try std.testing.expectEqual(@as(usize, 2), rollup.grouping_sets.len);
+    try std.testing.expectEqual(@as(usize, 1), rollup.grouping_sets[0].len);
+    try std.testing.expectEqual(@as(usize, 0), rollup.grouping_sets[1].len);
+    try std.testing.expect(rollup.items[1] == .grouping);
+    try std.testing.expectEqualStrings("g", rollup.items[1].grouping.alias.?);
+    const cube = try parse(
+        arena.allocator(),
+        "SELECT category, id FROM sales GROUP BY CUBE (category, id)",
+    );
+    try std.testing.expectEqual(@as(usize, 4), cube.grouping_sets.len);
+    try std.testing.expectEqual(@as(usize, 2), cube.grouping_sets[0].len);
+    try std.testing.expectEqual(@as(usize, 0), cube.grouping_sets[3].len);
+    const named = try parse(arena.allocator(), "SELECT rollup FROM sales GROUP BY rollup");
+    try std.testing.expectEqual(@as(usize, 0), named.grouping_sets.len);
+    try std.testing.expectEqualStrings("rollup", named.group_by[0]);
+    try std.testing.expectError(
+        error.InvalidSyntax,
+        parse(arena.allocator(), "SELECT GROUPING(category) FROM sales"),
+    );
+    try std.testing.expectError(
+        error.InvalidSyntax,
+        parse(arena.allocator(), "SELECT category FROM sales GROUP BY ROLLUP ()"),
+    );
+    try std.testing.expectError(
+        error.InvalidSyntax,
+        parse(arena.allocator(), "SELECT category FROM sales GROUP BY CUBE (category, category)"),
+    );
 }
 
 test "join without on is unsupported" {
     try std.testing.expectError(error.UnsupportedJoin, parse(std.testing.allocator, "SELECT * FROM a JOIN b"));
 }
 
-test "comma join is unsupported" {
-    try std.testing.expectError(error.UnsupportedJoin, parse(std.testing.allocator, "SELECT * FROM a, b"));
+test "comma join is a cross join" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const q = try parse(arena.allocator(), "SELECT * FROM a, b");
+    const j = q.join orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("b", j.table);
+    try std.testing.expectEqual(@as(usize, 0), j.eqs.len);
+    try std.testing.expect(!j.natural);
 }
 
 test "left join parses" {
@@ -2995,9 +3603,28 @@ test "right and full join parse" {
     try std.testing.expectEqual(JoinKind.full, f.join.?.kind);
 }
 
-test "using and natural stay unsupported" {
-    try std.testing.expectError(error.UnsupportedJoin, parse(std.testing.allocator, "SELECT * FROM a JOIN b USING (id)"));
-    try std.testing.expectError(error.UnsupportedJoin, parse(std.testing.allocator, "SELECT * FROM a NATURAL JOIN b"));
+test "using parses and natural stays unsupported" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const q = try parse(arena.allocator(), "SELECT * FROM a JOIN b USING (id, category)");
+    const j = q.join orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), j.using.len);
+    try std.testing.expectEqualStrings("id", j.using[0]);
+    try std.testing.expectEqualStrings("category", j.using[1]);
+    try std.testing.expectEqual(@as(usize, 0), j.eqs.len);
+    try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, "SELECT * FROM a JOIN b USING (id, id)"));
+    try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, "SELECT * FROM a JOIN b USING (a.id)"));
+    const natural = try parse(arena.allocator(), "SELECT * FROM a NATURAL JOIN b");
+    try std.testing.expect(natural.join.?.natural);
+    const lateral = try parse(arena.allocator(), "SELECT * FROM a, LATERAL (SELECT 1) b");
+    try std.testing.expect(lateral.join.?.lateral);
+    const rec = try parse(arena.allocator(), "WITH RECURSIVE c AS (SELECT 1 AS n) SELECT n FROM c");
+    try std.testing.expect(rec.ctes[0].recursive);
+    const named = try parse(arena.allocator(), "SELECT SUM(id) OVER w FROM sales WINDOW w AS (PARTITION BY category)");
+    try std.testing.expectEqualStrings("w", named.items[0].window.spec.ref.?);
+    try std.testing.expectEqualStrings("w", named.named_windows[0].name);
+    const groups = try parse(arena.allocator(), "SELECT SUM(id) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM sales");
+    try std.testing.expectEqual(FrameUnit.groups, groups.items[0].window.spec.frame.?.unit);
 }
 
 test "parse inner join on equality" {
@@ -3074,10 +3701,8 @@ test "window frame LAG LEAD parse" {
     try std.testing.expectEqual(@as(u64, 2), lead.items[0].window.offset);
     try std.testing.expectEqualStrings("nxt", lead.items[0].window.alias.?);
 
-    try std.testing.expectError(
-        error.UnsupportedSql,
-        parse(std.testing.allocator, "SELECT SUM(price) OVER (ORDER BY id GROUPS UNBOUNDED PRECEDING) FROM sales"),
-    );
+    const groups = try parse(a, "SELECT SUM(price) OVER (ORDER BY id GROUPS UNBOUNDED PRECEDING) FROM sales");
+    try std.testing.expectEqual(FrameUnit.groups, groups.items[0].window.spec.frame.?.unit);
 }
 
 test "parse select literal without from" {
@@ -3195,6 +3820,18 @@ test "parse CASE LIKE IN BETWEEN NULL UNION" {
     try std.testing.expectEqual(@as(usize, 0), uo.union_right.?.union_right.?.order_by.len);
 }
 
+test "split statements keeps a semicolon inside a string" {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(std.testing.allocator);
+    try splitStatements(std.testing.allocator, "SELECT ';'; SELECT 2;", &parts);
+    try std.testing.expectEqual(@as(usize, 2), parts.items.len);
+    try std.testing.expectEqualStrings("SELECT ';'", parts.items[0]);
+    try std.testing.expectEqualStrings("SELECT 2", parts.items[1]);
+    parts.clearRetainingCapacity();
+    try splitStatements(std.testing.allocator, "  ; -- only\n  ", &parts);
+    try std.testing.expectEqual(@as(usize, 0), parts.items.len);
+}
+
 test "parse WITH FROM subquery IN subquery" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3233,7 +3870,8 @@ test "parse WITH FROM subquery IN subquery" {
     try std.testing.expect(not_exists_q.where.?.* == .exists);
     try std.testing.expect(not_exists_q.where.?.exists.negated);
 
-    try std.testing.expectError(error.UnsupportedSql, parse(a, "WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t"));
+    const rec = try parse(a, "WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t");
+    try std.testing.expect(rec.ctes[0].recursive);
 }
 
 test "parse COPY to glacier" {
@@ -3378,18 +4016,42 @@ test "parse CREATE INSERT DROP" {
 
     const part = try parseStmt(a, "CREATE TABLE lake.sales.orders (id BIGINT, category STRING) PARTITIONED BY (category)");
     try std.testing.expectEqual(@as(usize, 1), part.create_table.partition_by.len);
-    try std.testing.expectEqualStrings("category", part.create_table.partition_by[0]);
+    try std.testing.expectEqualStrings("category", part.create_table.partition_by[0].column);
+    try std.testing.expectEqualStrings("identity", part.create_table.partition_by[0].transform);
 
     const ident_tf = try parseStmt(a, "CREATE TABLE t (id BIGINT, category STRING) PARTITION BY (identity(category))");
-    try std.testing.expectEqualStrings("category", ident_tf.create_table.partition_by[0]);
+    try std.testing.expectEqualStrings("category", ident_tf.create_table.partition_by[0].column);
+    try std.testing.expectEqualStrings("identity", ident_tf.create_table.partition_by[0].transform);
 
     const ctas_part = try parseStmt(a, "CREATE TABLE lake.sales.cats PARTITIONED BY (category) AS SELECT category, COUNT(*) AS n FROM orders GROUP BY category");
-    try std.testing.expectEqualStrings("category", ctas_part.create_table.partition_by[0]);
+    try std.testing.expectEqualStrings("category", ctas_part.create_table.partition_by[0].column);
     try std.testing.expect(ctas_part.create_table.as_select != null);
 
-    try std.testing.expectError(error.UnsupportedPartitionSpec, parseStmt(a, "CREATE TABLE t (id BIGINT) PARTITIONED BY (bucket(4, id))"));
+    const day = try parseStmt(a, "CREATE TABLE t (id BIGINT, ts BIGINT) PARTITIONED BY (day(ts), bucket(4, id))");
+    try std.testing.expectEqualStrings("ts", day.create_table.partition_by[0].column);
+    try std.testing.expectEqualStrings("day", day.create_table.partition_by[0].transform);
+    try std.testing.expectEqualStrings("id", day.create_table.partition_by[1].column);
+    try std.testing.expectEqualStrings("bucket[4]", day.create_table.partition_by[1].transform);
+    const trunc = try parseStmt(a, "CREATE TABLE t (id BIGINT) PARTITIONED BY (truncate(10, id), year(id), month(id), hour(id))");
+    try std.testing.expectEqualStrings("truncate[10]", trunc.create_table.partition_by[0].transform);
+    try std.testing.expectEqualStrings("year", trunc.create_table.partition_by[1].transform);
+    try std.testing.expectEqualStrings("month", trunc.create_table.partition_by[2].transform);
+    try std.testing.expectEqualStrings("hour", trunc.create_table.partition_by[3].transform);
+    try std.testing.expectError(error.UnsupportedPartitionSpec, parseStmt(a, "CREATE TABLE t (id BIGINT) PARTITIONED BY (bucket(0, id))"));
+    try std.testing.expectError(error.UnsupportedPartitionSpec, parseStmt(a, "CREATE TABLE t (id BIGINT) PARTITIONED BY (foo(id))"));
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "CREATE TABLE t (ts BIGINT) PARTITIONED BY (day(ts), day(ts))"));
     try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "CREATE TABLE t (id BIGINT) PARTITIONED BY ()"));
     try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "CREATE TABLE t (id BIGINT, category STRING) PARTITIONED BY (category, category)"));
+
+    const temp = try parseStmt(a, "CREATE TEMP TABLE hot AS SELECT id FROM orders");
+    try std.testing.expect(temp.create_table.temporary);
+    try std.testing.expectEqualStrings("hot", temp.create_table.ident);
+    try std.testing.expect(temp.create_table.as_select != null);
+    const temporary = try parseStmt(a, "CREATE TEMPORARY TABLE note (id BIGINT, label STRING)");
+    try std.testing.expect(temporary.create_table.temporary);
+    try std.testing.expectEqual(@as(usize, 2), temporary.create_table.columns.len);
+    try std.testing.expectError(error.InvalidSyntax, parseStmt(a, "CREATE TEMP TABLE lake.sales.hot (id BIGINT)"));
+    try std.testing.expectError(error.UnsupportedSql, parseStmt(a, "CREATE TEMP TABLE hot (id BIGINT) PARTITIONED BY (id)"));
 
     const ctas = try parseStmt(a, "CREATE TABLE lake.sales.cats AS SELECT category, COUNT(*) AS n FROM orders GROUP BY category");
     try std.testing.expectEqualStrings("lake.sales.cats", ctas.create_table.ident);

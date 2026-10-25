@@ -36,6 +36,11 @@ pub const ColStats = extern struct {
     max_bytes: [32]u8,
 };
 
+pub const RgHook = extern struct {
+    keep: *const fn (?*anyopaque, i32, ?*anyopaque) callconv(.c) c_int,
+    user: ?*anyopaque,
+};
+
 const c = struct {
     extern fn glacier_carquet_init() c_int;
     extern fn glacier_carquet_cleanup() void;
@@ -109,7 +114,25 @@ const c = struct {
         n: i32,
     ) c_int;
     extern fn glacier_carquet_write_struct_fixture(path: [*:0]const u8) c_int;
-    extern fn glacier_carquet_write_columns(path: [*:0]const u8, cols: [*]const WriteCol, n_cols: i32) c_int;
+    extern fn glacier_carquet_write_columns(path: [*:0]const u8, cols: [*]const WriteCol, n_cols: i32, rows_per_group: i64) c_int;
+    extern fn glacier_carquet_batch_open_filter(
+        reader: ?*anyopaque,
+        cols: ?[*]const i32,
+        n_cols: i32,
+        batch_size: i32,
+        hook: ?*RgHook,
+        err_buf: [*]u8,
+        err_len: usize,
+    ) ?*anyopaque;
+    extern fn glacier_carquet_row_group_matches(
+        reader: ?*anyopaque,
+        row_group: i32,
+        column: i32,
+        op: i32,
+        value: ?*const anyopaque,
+        value_size: i32,
+        might_match: *i32,
+    ) c_int;
 };
 
 pub const PhysicalType = enum(c_int) {
@@ -217,7 +240,53 @@ pub const Reader = struct {
         };
         return .{ .handle = handle };
     }
+
+    pub fn openBatchFiltered(self: Reader, columns: []const i32, batch_size: i32, hook: ?*RgHook) !BatchReader {
+        var err_buf: [256]u8 = undefined;
+        @memset(&err_buf, 0);
+        const handle = c.glacier_carquet_batch_open_filter(
+            self.handle,
+            if (columns.len == 0) null else columns.ptr,
+            @intCast(columns.len),
+            batch_size,
+            hook,
+            &err_buf,
+            err_buf.len,
+        ) orelse {
+            setDetail(std.mem.sliceTo(&err_buf, 0));
+            return error.ParquetOpenFailed;
+        };
+        return .{ .handle = handle };
+    }
 };
+
+pub fn rawNumColumns(handle: *anyopaque) i32 {
+    return c.glacier_carquet_num_columns(handle);
+}
+
+pub fn rawColumnName(handle: *anyopaque, index: i32) ?[]const u8 {
+    const name_z = c.glacier_carquet_column_name(handle, index) orelse return null;
+    return std.mem.span(name_z);
+}
+
+pub fn rawColumnType(handle: *anyopaque, index: i32) PhysicalType {
+    return @enumFromInt(c.glacier_carquet_column_type(handle, index));
+}
+
+pub fn rawColumnStats(handle: *anyopaque, row_group: i32, col: i32) !ColStats {
+    var out: ColStats = std.mem.zeroes(ColStats);
+    if (c.glacier_carquet_column_stats(handle, row_group, col, &out) != 0) return error.ParquetStatsFailed;
+    return out;
+}
+
+/// True when the row group cannot be ruled out. Missing stats keep the group.
+pub fn rawRowGroupMightMatch(handle: *anyopaque, row_group: i32, col: i32, op: i32, value: []const u8) bool {
+    var might: i32 = 1;
+    const ptr: ?*const anyopaque = if (value.len == 0) @as(?*const anyopaque, "") else value.ptr;
+    if (c.glacier_carquet_row_group_matches(handle, row_group, col, op, ptr, @intCast(value.len), &might) != 0)
+        return true;
+    return might != 0;
+}
 
 pub const RowBatch = struct {
     ptr: *anyopaque,
@@ -407,11 +476,18 @@ pub fn writeStructFixture(path: [:0]const u8) !void {
 }
 
 pub fn writeColumns(path: [:0]const u8, cols: []const WriteCol) !void {
+    try writeColumnsGrouped(path, cols, 0);
+}
+
+pub fn writeColumnsGrouped(path: [:0]const u8, cols: []const WriteCol, rows_per_group: i64) !void {
     try ensureInit();
     if (cols.len == 0) return error.ParquetWriteFailed;
-    if (c.glacier_carquet_write_columns(path.ptr, cols.ptr, @intCast(cols.len)) != 0)
+    if (c.glacier_carquet_write_columns(path.ptr, cols.ptr, @intCast(cols.len), rows_per_group) != 0)
         return error.ParquetWriteFailed;
 }
+
+/// One row group per this many rows. Smaller files stay a single group.
+pub const row_group_rows: i64 = 65536;
 
 pub fn writeBatch(allocator: std.mem.Allocator, path: [:0]const u8, input: batch_mod.Batch) !void {
     if (input.len == 0 or input.columns.len == 0) return error.ParquetWriteFailed;
@@ -462,7 +538,7 @@ pub fn writeBatch(allocator: std.mem.Allocator, path: [:0]const u8, input: batch
             .n_rows = @intCast(input.len),
         };
     }
-    try writeColumns(path, cols);
+    try writeColumnsGrouped(path, cols, row_group_rows);
 }
 
 pub const ByteArray = extern struct {

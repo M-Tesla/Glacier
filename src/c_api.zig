@@ -223,6 +223,11 @@ pub export fn glacier_result_next_arrow(result: ?*ResultHandle, array: ?*ArrowAr
     return if (rc == 0) 1 else -1;
 }
 
+pub export fn glacier_cancel(conn: ?*Database) callconv(.c) void {
+    const db = conn orelse return;
+    db.session.requestCancel();
+}
+
 pub export fn glacier_malloc(n: usize) callconv(.c) ?*anyopaque {
     if (n == 0) return null;
     const s = heap().alloc(u8, n) catch return null;
@@ -243,11 +248,11 @@ pub export fn glacier_free(p: ?*anyopaque) callconv(.c) void {
 }
 
 pub export fn glacier_version() callconv(.c) [*:0]const u8 {
-    return "0.6.0";
+    return "0.6.1";
 }
 
 pub export fn glacier_api_version() callconv(.c) c_int {
-    return 1;
+    return 2;
 }
 
 const QueryArrow = struct {
@@ -298,6 +303,22 @@ fn runSql(db: *Database, sql: [*:0]const u8) !QueryArrow {
     return out;
 }
 
+test "C ABI glacier_cancel aborts the next statement and the session stays" {
+    try parquet.writeSalesFixture("/tmp/sales-cancel.parquet");
+    var err: ?[*:0]u8 = null;
+    const db = glacier_open("/tmp/sales-cancel.parquet", &err) orelse return error.TestUnexpectedResult;
+    defer glacier_close(db);
+    _ = glacier_connect(db, &err) orelse return error.TestUnexpectedResult;
+    glacier_cancel(db);
+    const q = glacier_query(db, "SELECT *", &err) orelse return error.TestUnexpectedResult;
+    defer glacier_result_destroy(q);
+    const msg = glacier_result_error(q) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(msg), "query canceled") != null);
+    var ok = try runSql(db, "SELECT 1");
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(i64, 1), ok.array.length);
+}
+
 test "C ABI executes arbitrary SQL not a hardcoded select" {
     try parquet.writeSalesFixture("/tmp/sales.parquet");
 
@@ -306,8 +327,14 @@ test "C ABI executes arbitrary SQL not a hardcoded select" {
     defer glacier_close(db);
     _ = glacier_connect(db, &err) orelse return error.ConnectFailed;
 
-    try std.testing.expectEqualStrings("0.6.0", std.mem.span(glacier_version()));
-    try std.testing.expectEqual(@as(c_int, 1), glacier_api_version());
+    try std.testing.expectEqualStrings("0.6.1", std.mem.span(glacier_version()));
+    try std.testing.expectEqual(@as(c_int, 2), glacier_api_version());
+    {
+        var q = try runSql(db, "SELECT 1; SELECT 2");
+        defer q.deinit();
+        try std.testing.expectEqual(@as(i64, 1), q.array.length);
+        try std.testing.expectEqual(@as(i64, 2), q.i64s(0)[0]);
+    }
 
     {
         var q = try runSql(db, "SELECT * WHERE price > 100");

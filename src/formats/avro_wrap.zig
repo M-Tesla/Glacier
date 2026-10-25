@@ -10,6 +10,14 @@ const c = struct {
         len: usize,
     };
 
+    const BoundIn = extern struct {
+        field_id: i32,
+        lower: [*]const u8,
+        lower_len: i32,
+        upper: [*]const u8,
+        upper_len: i32,
+    };
+
     const DataFile = extern struct {
         path: ?[*:0]u8,
         format: ?[*:0]u8,
@@ -58,6 +66,15 @@ const c = struct {
         n: c_int,
         bound_field_id: i32,
         contents: ?[*]const i32,
+    ) c_int;
+    extern fn glacier_avro_write_iceberg_manifest_bounds(
+        path: [*:0]const u8,
+        file_paths: [*]const [*:0]const u8,
+        counts: [*]const i64,
+        contents: [*]const i32,
+        n: c_int,
+        bound_off: [*]const i32,
+        bounds: [*]const BoundIn,
     ) c_int;
     extern fn glacier_avro_write_sales_rows(
         path: [*:0]const u8,
@@ -174,6 +191,13 @@ pub fn openPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Rea
 }
 
 pub fn openLocation(allocator: std.mem.Allocator, t: @import("../vfs/source.zig").Transport, path: []const u8) !Reader {
+    const aws = @import("../kernel/aws.zig");
+    if (aws.isRemote(path)) {
+        const cache = @import("../vfs/cache.zig");
+        const cached = try cache.materialize(t, path);
+        defer t.allocator.free(cached);
+        return openPath(allocator, t.io, cached);
+    }
     var source = try FileSource.openLocation(t, path);
     if (source.view() != null) return openSource(allocator, source);
     defer source.close();
@@ -231,6 +255,7 @@ pub fn readIcebergEntries(allocator: std.mem.Allocator, buf: []const u8) ![]Mani
         return error.AvroOpenFailed;
     }
     defer c.glacier_avro_free_iceberg_entries(ptr, n);
+    if (n == 0) return &.{};
     const src = (ptr orelse return error.AvroOpenFailed)[0..n];
     const out = try allocator.alloc(ManifestEntry, n);
     for (src, 0..) |e, i| {
@@ -286,6 +311,69 @@ pub fn writeDataManifest(
         @intCast(file_paths.len),
         bound_field_id,
         if (contents.len == 0) null else contents.ptr,
+    ) != 0) return error.AvroWriteFailed;
+}
+
+pub const ManifestBound = struct {
+    field_id: i32,
+    lower: []const u8,
+    upper: []const u8,
+};
+
+pub fn writeDataManifestBounds(
+    allocator: std.mem.Allocator,
+    path: [:0]const u8,
+    file_paths: []const [*:0]const u8,
+    counts: []const i64,
+    contents: []const i32,
+    bound_off: []const i32,
+    bounds: []const ManifestBound,
+) !void {
+    if (file_paths.len != counts.len or file_paths.len != contents.len)
+        return error.AvroWriteFailed;
+    if (bound_off.len != file_paths.len + 1) return error.AvroWriteFailed;
+    if (file_paths.len == 0) {
+        var path0 = [_][*:0]const u8{""};
+        var count0 = [_]i64{0};
+        var content0 = [_]i32{0};
+        var off0 = [_]i32{0};
+        var bound0 = [_]c.BoundIn{.{
+            .field_id = 0,
+            .lower = "",
+            .lower_len = 0,
+            .upper = "",
+            .upper_len = 0,
+        }};
+        if (c.glacier_avro_write_iceberg_manifest_bounds(
+            path.ptr,
+            &path0,
+            &count0,
+            &content0,
+            0,
+            &off0,
+            &bound0,
+        ) != 0) return error.AvroWriteFailed;
+        return;
+    }
+    const encoded = try allocator.alloc(c.BoundIn, @max(bounds.len, 1));
+    defer allocator.free(encoded);
+    for (bounds, 0..) |b, i| {
+        encoded[i] = .{
+            .field_id = b.field_id,
+            .lower = if (b.lower.len == 0) "" else b.lower.ptr,
+            .lower_len = @intCast(b.lower.len),
+            .upper = if (b.upper.len == 0) "" else b.upper.ptr,
+            .upper_len = @intCast(b.upper.len),
+        };
+    }
+    if (c.glacier_avro_write_iceberg_manifest_bounds(
+        path.ptr,
+        file_paths.ptr,
+        counts.ptr,
+        contents.ptr,
+        @intCast(file_paths.len),
+        bound_off.ptr,
+        encoded.ptr,
     ) != 0) return error.AvroWriteFailed;
 }
 

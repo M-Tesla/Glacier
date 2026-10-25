@@ -9,7 +9,7 @@ const parquetPath = join(here, "../../tests/formats/sales.parquet");
 
 const wasm = readFileSync(wasmPath);
 const g = await Glacier.instantiate(wasm);
-if (g.version() !== "0.6.0") throw new Error(`version ${g.version()}`);
+if (g.version() !== "0.6.1") throw new Error(`version ${g.version()}`);
 
 const empty = g.openEmpty();
 const r1 = g.query(empty, "select 1");
@@ -21,5 +21,11 @@ const db = g.openBuffer(parquet);
 const r2 = g.query(db, "SELECT COUNT(*)");
 g.destroyResult(r2);
 g.close(db);
+
+const zstd = readFileSync(join(here, "../../tests/formats/i64_zstd.parquet"));
+const zdb = g.openBuffer(zstd);
+const zr = g.query(zdb, "SELECT SUM(id)");
+g.destroyResult(zr);
+g.close(zdb);
 
 console.log("wasm ok", g.version(), `${wasm.length} bytes`);

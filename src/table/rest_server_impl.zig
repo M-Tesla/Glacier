@@ -18,6 +18,7 @@ pub const Handle = struct {
     io: std.Io,
     warehouse: []u8,
     server: net.Server,
+    tls: ?*anyopaque = null,
     closed: bool = false,
 
     pub fn port(self: Handle) u16 {
@@ -32,15 +33,27 @@ pub const Handle = struct {
 
     pub fn deinit(self: *Handle) void {
         self.stop();
+        if (self.tls) |ctx| glacier_tls_free(ctx);
         self.gpa.free(self.warehouse);
     }
 };
+
+extern fn glacier_tls_server(cert: [*:0]const u8, key: [*:0]const u8) ?*anyopaque;
+extern fn glacier_tls_free(box: ?*anyopaque) void;
+extern fn glacier_tls_accept(box: *anyopaque, fd: c_int) ?*anyopaque;
+extern fn glacier_tls_read(ssl: *anyopaque, buf: [*]u8, n: c_int) c_int;
+extern fn glacier_tls_write(ssl: *anyopaque, buf: [*]const u8, n: c_int) c_int;
+extern fn glacier_tls_close(ssl: ?*anyopaque) void;
 
 pub fn parseListen(text: []const u8) !net.IpAddress {
     return parseListenPort(text, 8181);
 }
 
 pub fn parseListenPort(text: []const u8, default_port: u16) !net.IpAddress {
+    return parseListenPortTls(text, default_port, false);
+}
+
+pub fn parseListenPortTls(text: []const u8, default_port: u16, allow_public: bool) !net.IpAddress {
     var buf: [128]u8 = undefined;
     const spec = spec: {
         if (std.ascii.startsWithIgnoreCase(text, "localhost")) {
@@ -61,7 +74,7 @@ pub fn parseListenPort(text: []const u8, default_port: u16) !net.IpAddress {
         break :spec text;
     };
     const addr = net.IpAddress.parseLiteral(spec) catch return error.InvalidAddress;
-    if (!isLoopback(addr)) return error.TlsRequired;
+    if (!isLoopback(addr) and !allow_public) return error.TlsRequired;
     return addr;
 }
 
@@ -80,15 +93,37 @@ pub fn bind(
     warehouse: []const u8,
     listen: []const u8,
 ) !Handle {
-    var addr = try parseListen(listen);
+    return bindTls(gpa, io, warehouse, listen, null, null);
+}
+
+pub fn bindTls(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    warehouse: []const u8,
+    listen: []const u8,
+    cert: ?[]const u8,
+    key: ?[]const u8,
+) !Handle {
+    if ((cert == null) != (key == null)) return error.TlsRequired;
+    var addr = try parseListenPortTls(listen, 8181, cert != null);
     try glacier_catalog.ensure(gpa, io, warehouse);
+    var tls: ?*anyopaque = null;
+    if (cert) |c| {
+        const c_cert = try gpa.dupeZ(u8, c);
+        defer gpa.free(c_cert);
+        const c_key = try gpa.dupeZ(u8, key.?);
+        defer gpa.free(c_key);
+        tls = glacier_tls_server(c_cert.ptr, c_key.ptr) orelse return error.TlsRequired;
+    }
     var server = try addr.listen(io, .{ .reuse_address = true });
     errdefer server.deinit(io);
+    errdefer if (tls) |ctx| glacier_tls_free(ctx);
     return .{
         .gpa = gpa,
         .io = io,
         .warehouse = try gpa.dupe(u8, warehouse),
         .server = server,
+        .tls = tls,
     };
 }
 
@@ -120,6 +155,10 @@ pub fn serveLoop(self: *Handle) std.Io.Cancelable!void {
 }
 
 fn serveConn(self: *Handle, stream: net.Stream) void {
+    if (self.tls) |ctx| {
+        serveConnTls(self, stream, ctx);
+        return;
+    }
     const io = self.io;
     defer {
         var copy = stream;
@@ -144,6 +183,63 @@ fn serveConn(self: *Handle, stream: net.Stream) void {
             return;
         };
         return;
+    }
+}
+
+fn httpReady(buf: []const u8) bool {
+    const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return false;
+    const head = buf[0..sep];
+    var len: usize = 0;
+    var it = std.mem.splitScalar(u8, head, '\n');
+    while (it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, "\r");
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            const n = std.mem.trim(u8, line["content-length:".len..], " \t");
+            len = std.fmt.parseInt(usize, n, 10) catch return false;
+        }
+    }
+    return buf.len >= sep + 4 + len;
+}
+
+fn serveConnTls(self: *Handle, stream: net.Stream, ctx: *anyopaque) void {
+    const io = self.io;
+    defer {
+        var copy = stream;
+        copy.close(io);
+    }
+    const ssl = glacier_tls_accept(ctx, stream.socket.handle) orelse return;
+    defer glacier_tls_close(ssl);
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(self.gpa);
+    var tmp: [4096]u8 = undefined;
+    while (req.items.len < 1024 * 1024) {
+        const n = glacier_tls_read(ssl, &tmp, tmp.len);
+        if (n <= 0) break;
+        req.appendSlice(self.gpa, tmp[0..@intCast(n)]) catch return;
+        if (httpReady(req.items)) break;
+    }
+    if (!httpReady(req.items)) return;
+    var reader = std.Io.Reader.fixed(req.items);
+    var aw: std.Io.Writer.Allocating = .init(self.gpa);
+    defer aw.deinit();
+    var server: http.Server = .init(&reader, &aw.writer);
+    var request = server.receiveHead() catch return;
+    handleRequest(self, &request) catch {
+        request.respond(
+            "{\"error\":{\"message\":\"internal\",\"type\":\"InternalServerError\"}}",
+            .{
+                .status = .internal_server_error,
+                .keep_alive = false,
+                .extra_headers = &json_headers,
+            },
+        ) catch {};
+    };
+    const out = aw.written();
+    var off: usize = 0;
+    while (off < out.len) {
+        const n = glacier_tls_write(ssl, out[off..].ptr, @intCast(out.len - off));
+        if (n <= 0) return;
+        off += @intCast(n);
     }
 }
 
@@ -759,12 +855,73 @@ fn eql(a: []const u8, b: []const u8) bool {
 }
 
 test "parseListen loopback only" {
+    const pub_ok = try parseListenPortTls("0.0.0.0:8181", 8181, true);
+    try std.testing.expect(!isLoopback(pub_ok));
     const a = try parseListen("127.0.0.1:8181");
     try std.testing.expectEqual(@as(u16, 8181), a.getPort());
     const b = try parseListen("localhost");
     try std.testing.expectEqual(@as(u16, 8181), b.getPort());
     try std.testing.expectError(error.TlsRequired, parseListen("0.0.0.0:8181"));
+    try std.testing.expectError(error.TlsRequired, parseListenPortTls("0.0.0.0:9", 8181, false));
     try std.testing.expectError(error.TlsRequired, parseListen("1.2.3.4:90"));
+}
+
+test "tls rest answers https config" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cert = "/tmp/glacier-tls-test.crt";
+    const key = "/tmp/glacier-tls-test.key";
+    var gen = std.process.spawn(io, .{
+        .argv = &.{
+            "openssl", "req",    "-x509", "-newkey",       "rsa:2048",
+            "-keyout", key,      "-out",  cert,            "-days",
+            "1",       "-nodes", "-subj", "/CN=localhost",
+        },
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    }) catch return error.SkipZigTest;
+    switch (gen.wait(io) catch return error.SkipZigTest) {
+        .exited => |code| if (code != 0) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+
+    const root = "/tmp/glacier_tls_wh";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var h = try bindTls(gpa, io, root, "127.0.0.1:0", cert, key);
+    var fut = try io.concurrent(serveLoop, .{&h});
+    defer {
+        h.stop();
+        _ = fut.cancel(io) catch {};
+        h.deinit();
+    }
+    const url = try std.fmt.allocPrint(gpa, "https://127.0.0.1:{d}/v1/config", .{h.port()});
+    defer gpa.free(url);
+    var py = try std.process.spawn(io, .{
+        .argv = &.{
+            "python3", "-c",
+            \\import ssl, sys, urllib.request
+            \\ctx = ssl._create_unverified_context()
+            \\print(urllib.request.urlopen(sys.argv[1], context=ctx, timeout=5).read().decode())
+            ,
+            url,
+        },
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    });
+    defer py.kill(io);
+    var line_buf: [2048]u8 = undefined;
+    var stdout_reader = py.stdout.?.readerStreaming(io, &line_buf);
+    const line = try stdout_reader.interface.takeDelimiterExclusive('\n');
+    try std.testing.expect(std.mem.indexOf(u8, line, "glacier_tls_wh") != null);
 }
 
 test "decodeNs unit separator" {
@@ -772,4 +929,3 @@ test "decodeNs unit separator" {
     defer std.testing.allocator.free(ns);
     try std.testing.expectEqualStrings("public.nyc", ns);
 }
-

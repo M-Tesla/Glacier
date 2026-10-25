@@ -510,12 +510,14 @@ fn loadSnapshotFiles(
     var deletes: std.ArrayList(DataFile) = .empty;
     var pos_paths: std.ArrayList([]const u8) = .empty;
     var eq_paths: std.ArrayList([]const u8) = .empty;
+    var manifests_read: usize = 0;
     const schema_fields = if (metadata.schemaForSnapshot(snap)) |s| s.fields else if (metadata.currentSchema()) |s| s.fields else &.{};
     const spec = metadata.currentPartitionSpec();
     for (manifest_paths) |rel| {
         const man_path = resolveListedPath(allocator, table_dir, metadata.location, rel) catch continue;
         const man_buf = readLocation(allocator, t, man_path) catch continue;
         const entries = avro.readIcebergEntries(allocator, man_buf) catch continue;
+        manifests_read += 1;
         for (entries) |e| {
             if (e.status == 2) continue;
             const path = try resolveListedPath(allocator, table_dir, metadata.location, e.path);
@@ -538,7 +540,10 @@ fn loadSnapshotFiles(
         }
     }
     if (manifest_paths.len == 0) return .{ .data = &.{}, .deletes = deletes.items };
-    if (data.items.len == 0) return error.ManifestsNeedAvro;
+    if (data.items.len == 0) {
+        if (manifests_read == 0) return error.ManifestsNeedAvro;
+        return .{ .data = &.{}, .deletes = deletes.items };
+    }
 
     const eq_deletes = try loadEqDeletes(allocator, t, eq_paths.items);
     for (data.items) |*f| f.eq_deletes = eq_deletes;
@@ -904,44 +909,147 @@ fn listedRel(table_dir: []const u8, path: []const u8) []const u8 {
     return path;
 }
 
-fn firstLongField(fields: []const SchemaField) ?SchemaField {
+fn boundsForBatch(
+    allocator: std.mem.Allocator,
+    fields: []const SchemaField,
+    input: batch_mod.Batch,
+) ![]const ColBound {
+    var out: std.ArrayList(ColBound) = .empty;
     for (fields) |f| {
-        if (std.ascii.eqlIgnoreCase(f.type_name, "long") or std.ascii.eqlIgnoreCase(f.type_name, "int"))
-            return f;
+        const idx = input.columnIndex(f.name) orelse continue;
+        const span = columnSpan(input.columns[idx]) orelse continue;
+        try out.append(allocator, .{
+            .column = f.name,
+            .lower = span.lo,
+            .upper = span.hi,
+        });
     }
-    return if (fields.len > 0) fields[0] else null;
+    return out.items;
 }
 
-fn boundI64(file: DataFile, col_name: []const u8, is_lower: bool) i64 {
-    for (file.bounds) |b| {
-        if (!std.ascii.eqlIgnoreCase(b.column, col_name)) continue;
-        const v = if (is_lower) b.lower else b.upper;
-        return switch (v) {
-            .int => |n| n,
-            else => 0,
+fn columnSpan(col: batch_mod.Column) ?struct { lo: BoundValue, hi: BoundValue } {
+    switch (col.data_type) {
+        .int32, .int64, .timestamp, .timestamptz => {
+            var lo: i64 = std.math.maxInt(i64);
+            var hi: i64 = std.math.minInt(i64);
+            var any = false;
+            var row: usize = 0;
+            while (row < col.len) : (row += 1) {
+                if (col.isNull(row)) continue;
+                const v: i64 = if (col.data_type == .int32) col.i32s[row] else col.i64s[row];
+                if (!any or v < lo) lo = v;
+                if (!any or v > hi) hi = v;
+                any = true;
+            }
+            if (!any) return null;
+            return .{ .lo = .{ .int = lo }, .hi = .{ .int = hi } };
+        },
+        .float32, .float64 => {
+            var lo: f64 = std.math.floatMax(f64);
+            var hi: f64 = -std.math.floatMax(f64);
+            var any = false;
+            var row: usize = 0;
+            while (row < col.len) : (row += 1) {
+                if (col.isNull(row)) continue;
+                const v: f64 = if (col.data_type == .float32) col.f32s[row] else col.f64s[row];
+                if (std.math.isNan(v)) continue;
+                if (!any or v < lo) lo = v;
+                if (!any or v > hi) hi = v;
+                any = true;
+            }
+            if (!any) return null;
+            return .{ .lo = .{ .float = lo }, .hi = .{ .float = hi } };
+        },
+        .utf8 => {
+            var lo: []const u8 = "";
+            var hi: []const u8 = "";
+            var any = false;
+            var row: usize = 0;
+            while (row < col.len) : (row += 1) {
+                if (col.isNull(row)) continue;
+                const v = col.strAt(row);
+                if (!any or std.mem.order(u8, v, lo) == .lt) lo = v;
+                if (!any or std.mem.order(u8, v, hi) == .gt) hi = v;
+                any = true;
+            }
+            if (!any) return null;
+            return .{ .lo = .{ .string = lo }, .hi = .{ .string = hi } };
+        },
+        else => return null,
+    }
+}
+
+fn appendEncodedBounds(
+    allocator: std.mem.Allocator,
+    fields: []const SchemaField,
+    bounds: []const ColBound,
+    out: *std.ArrayList(avro.ManifestBound),
+) !void {
+    for (bounds) |b| {
+        const field = fieldByName(fields, b.column) orelse continue;
+        const lower = try encodeBound(allocator, field.type_name, b.lower) orelse continue;
+        const upper = try encodeBound(allocator, field.type_name, b.upper) orelse {
+            allocator.free(lower);
+            continue;
         };
+        try out.append(allocator, .{
+            .field_id = field.id,
+            .lower = lower,
+            .upper = upper,
+        });
     }
-    return 0;
 }
 
-fn batchBoundI64(input: batch_mod.Batch, col_name: []const u8) struct { lo: i64, hi: i64 } {
-    const idx = input.columnIndex(col_name) orelse return .{ .lo = 0, .hi = 0 };
-    const col = input.columns[idx];
-    if (col.data_type != .int64 and col.data_type != .int32 and !col.data_type.storesI64())
-        return .{ .lo = 0, .hi = 0 };
-    var lo: i64 = std.math.maxInt(i64);
-    var hi: i64 = std.math.minInt(i64);
-    var any = false;
-    var row: usize = 0;
-    while (row < input.len) : (row += 1) {
-        if (col.isNull(row)) continue;
-        const v: i64 = if (col.data_type == .int32) col.i32s[row] else col.i64s[row];
-        if (!any or v < lo) lo = v;
-        if (!any or v > hi) hi = v;
-        any = true;
+fn encodeBound(allocator: std.mem.Allocator, type_name: []const u8, value: BoundValue) !?[]u8 {
+    if (std.ascii.eqlIgnoreCase(type_name, "boolean") or std.ascii.eqlIgnoreCase(type_name, "decimal"))
+        return null;
+    if (std.ascii.eqlIgnoreCase(type_name, "long") or std.ascii.eqlIgnoreCase(type_name, "timestamp") or std.ascii.eqlIgnoreCase(type_name, "timestamptz") or std.ascii.eqlIgnoreCase(type_name, "timestamp_ntz") or std.ascii.eqlIgnoreCase(type_name, "timestamp_tz")) {
+        const n: i64 = switch (value) {
+            .int => |v| v,
+            else => return null,
+        };
+        const buf = try allocator.alloc(u8, 8);
+        std.mem.writeInt(i64, buf[0..8], n, .little);
+        return buf;
     }
-    if (!any) return .{ .lo = 0, .hi = 0 };
-    return .{ .lo = lo, .hi = hi };
+    if (std.ascii.eqlIgnoreCase(type_name, "int") or std.ascii.eqlIgnoreCase(type_name, "date")) {
+        const n: i64 = switch (value) {
+            .int => |v| v,
+            else => return null,
+        };
+        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return null;
+        const buf = try allocator.alloc(u8, 4);
+        std.mem.writeInt(i32, buf[0..4], @intCast(n), .little);
+        return buf;
+    }
+    if (std.ascii.eqlIgnoreCase(type_name, "double")) {
+        const n: f64 = switch (value) {
+            .float => |v| v,
+            .int => |v| @floatFromInt(v),
+            else => return null,
+        };
+        const buf = try allocator.alloc(u8, 8);
+        std.mem.writeInt(u64, buf[0..8], @bitCast(n), .little);
+        return buf;
+    }
+    if (std.ascii.eqlIgnoreCase(type_name, "float")) {
+        const n: f64 = switch (value) {
+            .float => |v| v,
+            .int => |v| @floatFromInt(v),
+            else => return null,
+        };
+        const buf = try allocator.alloc(u8, 4);
+        std.mem.writeInt(u32, buf[0..4], @bitCast(@as(f32, @floatCast(n))), .little);
+        return buf;
+    }
+    if (std.ascii.eqlIgnoreCase(type_name, "string") or std.ascii.eqlIgnoreCase(type_name, "binary") or std.ascii.eqlIgnoreCase(type_name, "uuid")) {
+        const s = switch (value) {
+            .string => |v| v,
+            else => return null,
+        };
+        return try allocator.dupe(u8, s);
+    }
+    return null;
 }
 
 fn nextHintVersion(allocator: std.mem.Allocator, t: Transport, table_dir: []const u8) !i32 {
@@ -952,23 +1060,33 @@ fn nextHintVersion(allocator: std.mem.Allocator, t: Transport, table_dir: []cons
     return n + 1;
 }
 
+fn partitionFieldName(allocator: std.mem.Allocator, column: []const u8, transform: []const u8) ![]const u8 {
+    const tf = try parseTransform(transform);
+    return switch (tf) {
+        .identity, .void => allocator.dupe(u8, column),
+        .year => std.fmt.allocPrint(allocator, "{s}_year", .{column}),
+        .month => std.fmt.allocPrint(allocator, "{s}_month", .{column}),
+        .day => std.fmt.allocPrint(allocator, "{s}_day", .{column}),
+        .hour => std.fmt.allocPrint(allocator, "{s}_hour", .{column}),
+        .bucket => std.fmt.allocPrint(allocator, "{s}_bucket", .{column}),
+        .truncate => std.fmt.allocPrint(allocator, "{s}_trunc", .{column}),
+    };
+}
+
 pub fn specFromNames(
     allocator: std.mem.Allocator,
     fields: []const SchemaField,
-    names: []const []const u8,
+    parts: []const sql.PartitionExpr,
 ) ![]PartitionField {
-    if (names.len == 0) return &.{};
-    for (names) |n| {
-        _ = fieldByName(fields, n) orelse return error.ColumnNotFound;
-    }
-    const out = try allocator.alloc(PartitionField, names.len);
-    for (names, 0..) |n, i| {
-        const sf = fieldByName(fields, n).?;
+    if (parts.len == 0) return &.{};
+    const out = try allocator.alloc(PartitionField, parts.len);
+    for (parts, 0..) |part, i| {
+        const sf = fieldByName(fields, part.column) orelse return error.ColumnNotFound;
         out[i] = .{
             .source_id = sf.id,
             .field_id = @intCast(1000 + i),
-            .name = sf.name,
-            .transform = "identity",
+            .name = try partitionFieldName(allocator, part.column, part.transform),
+            .transform = try allocator.dupe(u8, part.transform),
         };
     }
     return out;
@@ -994,6 +1112,7 @@ fn writeMetadataFile(
     fields: []const SchemaField,
     snapshots: []const Snapshot,
     partition_fields: []const PartitionField,
+    object_put: ?Transport,
 ) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -1060,7 +1179,17 @@ fn writeMetadataFile(
         try buf.append(allocator, '}');
     }
     try buf.appendSlice(allocator, "\n  ]\n}\n");
+    if (vfs_is_object(path)) {
+        if (object_put) |t| {
+            try vfs.putLocation(t, path, buf.items);
+            return;
+        }
+    }
     try writeText(io, path, buf.items);
+}
+
+fn vfs_is_object(path: []const u8) bool {
+    return aws.isObject(path);
 }
 
 pub fn createTable(
@@ -1094,6 +1223,7 @@ pub fn createTable(
         fields,
         &.{},
         partition_fields,
+        null,
     );
     try writeText(io, try std.fs.path.join(allocator, &.{ table_dir, "metadata", "version-hint.text" }), "1\n");
 }
@@ -1108,18 +1238,19 @@ pub const AppendResult = struct {
     snapshot: Snapshot,
     record_count: i64,
     operation: []const u8 = "append",
+    /// Data files written by this commit. Delete files are not counted.
+    files_written: usize = 0,
 };
 
 const AddedFile = struct {
     rel: []const u8,
     count: i64,
-    lo: i64,
-    hi: i64,
+    bounds: []const ColBound = &.{},
     content: i32,
 };
 
 fn isObjectStore(path: []const u8) bool {
-    return aws.isS3(path) or aws.isGs(path);
+    return aws.isObject(path);
 }
 
 fn localObjectPath(
@@ -1165,6 +1296,67 @@ fn hiveEscape(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+fn columnAsI64(col: batch_mod.Column, row: usize) ?i64 {
+    if (col.isNull(row)) return null;
+    return switch (col.data_type) {
+        .int32 => col.i32s[row],
+        .int64, .timestamp, .timestamptz => col.i64s[row],
+        else => null,
+    };
+}
+
+fn transformPathValue(
+    allocator: std.mem.Allocator,
+    tf: Transform,
+    col: batch_mod.Column,
+    row: usize,
+) ![]const u8 {
+    if (col.isNull(row)) return allocator.dupe(u8, "__HIVE_DEFAULT_PARTITION__");
+    switch (tf) {
+        .identity => return identityPathValue(allocator, col, row),
+        .void => return error.UnsupportedPartitionSpec,
+        .bucket => |n| {
+            if (columnAsI64(col, row)) |v| {
+                return std.fmt.allocPrint(allocator, "{d}", .{icebergBucketI64(v, n)});
+            }
+            if (col.data_type == .utf8) {
+                const h = murmur3_32(col.strAt(row));
+                const b: i64 = @intCast((h & 0x7FFFFFFF) % n);
+                return std.fmt.allocPrint(allocator, "{d}", .{b});
+            }
+            return error.UnsupportedPartitionSpec;
+        },
+        .truncate => |w| {
+            if (w == 0) return error.UnsupportedPartitionSpec;
+            if (columnAsI64(col, row)) |v| {
+                const ww: i64 = @intCast(w);
+                return std.fmt.allocPrint(allocator, "{d}", .{v - @mod(v, ww)});
+            }
+            if (col.data_type == .utf8) {
+                const s = col.strAt(row);
+                return hiveEscape(allocator, s[0..@min(s.len, @as(usize, w))]);
+            }
+            return error.UnsupportedPartitionSpec;
+        },
+        .year => {
+            const v = columnAsI64(col, row) orelse return error.UnsupportedPartitionSpec;
+            return std.fmt.allocPrint(allocator, "{d}", .{yearFromEpoch(v)});
+        },
+        .month => {
+            const v = columnAsI64(col, row) orelse return error.UnsupportedPartitionSpec;
+            return std.fmt.allocPrint(allocator, "{d}", .{monthFromEpoch(v)});
+        },
+        .day => {
+            const v = columnAsI64(col, row) orelse return error.UnsupportedPartitionSpec;
+            return std.fmt.allocPrint(allocator, "{d}", .{dayFromEpoch(v)});
+        },
+        .hour => {
+            const v = columnAsI64(col, row) orelse return error.UnsupportedPartitionSpec;
+            return std.fmt.allocPrint(allocator, "{d}", .{@divTrunc(v, 3_600_000_000)});
+        },
+    }
+}
+
 fn identityPathValue(allocator: std.mem.Allocator, col: batch_mod.Column, row: usize) ![]const u8 {
     if (col.isNull(row)) return allocator.dupe(u8, "__HIVE_DEFAULT_PARTITION__");
     return switch (col.data_type) {
@@ -1191,13 +1383,14 @@ fn hivePartitionKey(
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-    for (spec.fields, 0..) |pf, i| {
+    for (spec.fields) |pf| {
         const tf = try parseTransform(pf.transform);
-        if (tf != .identity) return error.UnsupportedPartitionSpec;
+        if (tf == .void) continue;
         const src = fieldById(schema_fields, pf.source_id) orelse return error.ColumnNotFound;
         const col_i = input.columnIndex(src.name) orelse return error.ColumnNotFound;
-        const val = try identityPathValue(allocator, input.columns[col_i], row);
-        if (i > 0) try buf.append(allocator, '/');
+        const val = try transformPathValue(allocator, tf, input.columns[col_i], row);
+        defer allocator.free(val);
+        if (buf.items.len > 0) try buf.append(allocator, '/');
         try buf.appendSlice(allocator, pf.name);
         try buf.append(allocator, '=');
         try buf.appendSlice(allocator, val);
@@ -1240,6 +1433,7 @@ fn groupByIdentity(
         var found = false;
         for (groups.items) |*g| {
             if (std.mem.eql(u8, g.key, key)) {
+                allocator.free(key);
                 try g.rows.append(allocator, row);
                 found = true;
                 break;
@@ -1300,9 +1494,6 @@ pub fn appendMix(
     if (table.metadata.snapshotById(snap_id) != null) snap_id += 1;
     const seq: i64 = if (table.metadata.currentSnapshot()) |s| s.sequence_number + 1 else 1;
     const uniq: usize = @intFromPtr(table.dir.ptr);
-    const bound_field = firstLongField(fields);
-    const bound_id: i32 = if (bound_field) |f| f.id else 1;
-    const bound_name: []const u8 = if (bound_field) |f| f.name else "";
 
     var added: std.ArrayList(AddedFile) = .empty;
     if (deletes.len > 0) {
@@ -1313,8 +1504,6 @@ pub fn appendMix(
         try added.append(allocator, .{
             .rel = data_name,
             .count = @intCast(deletes.len),
-            .lo = 0,
-            .hi = 0,
             .content = 2,
         });
     }
@@ -1325,12 +1514,10 @@ pub fn appendMix(
             const data_dest = try vfs.joinLocation(allocator, table_dir, data_name);
             const data_leaf = try std.fmt.allocPrint(allocator, "{d}-{d}-{x}.parquet", .{ snap_id, seq, uniq });
             try writeParquetAt(allocator, t, data_dest, data_leaf, inserts);
-            const bounds = batchBoundI64(inserts, bound_name);
             try added.append(allocator, .{
                 .rel = data_name,
                 .count = @intCast(inserts.len),
-                .lo = bounds.lo,
-                .hi = bounds.hi,
+                .bounds = try boundsForBatch(allocator, fields, inserts),
                 .content = 0,
             });
         } else {
@@ -1341,12 +1528,10 @@ pub fn appendMix(
                 const data_dest = try vfs.joinLocation(allocator, table_dir, data_name);
                 const data_leaf = try std.fmt.allocPrint(allocator, "{d}-{d}-{d}-{x}.parquet", .{ snap_id, seq, gi, uniq });
                 try writeParquetAt(allocator, t, data_dest, data_leaf, part_batch);
-                const bounds = batchBoundI64(part_batch, bound_name);
                 try added.append(allocator, .{
                     .rel = data_name,
                     .count = @intCast(part_batch.len),
-                    .lo = bounds.lo,
-                    .hi = bounds.hi,
+                    .bounds = try boundsForBatch(allocator, fields, part_batch),
                     .content = 0,
                 });
             }
@@ -1354,7 +1539,76 @@ pub fn appendMix(
     }
     const op: []const u8 = if (deletes.len > 0 and inserts.len > 0) "overwrite" else if (deletes.len > 0) "delete" else "append";
     const rec: i64 = if (inserts.len > 0) @intCast(inserts.len) else @intCast(deletes.len);
-    return rewriteWithAdded(allocator, t, table, snap_id, seq, uniq, bound_id, bound_name, added.items, rec, op);
+    return rewriteWithAdded(allocator, t, table, snap_id, seq, uniq, added.items, rec, op, true);
+}
+
+/// New snapshot whose manifest lists only the rewritten data files. Old snapshots stay.
+pub fn replaceWithBatch(
+    allocator: std.mem.Allocator,
+    t: Transport,
+    table: Table,
+    live: batch_mod.Batch,
+) !AppendResult {
+    const table_dir = stripFileUrl(table.dir);
+    if (std.mem.indexOf(u8, table_dir, "://") != null and !isObjectStore(table_dir))
+        return error.WriteUnsupported;
+    const schema = table.metadata.currentSchema() orelse return error.SchemaNotFound;
+    const fields = schema.fields;
+
+    if (!isObjectStore(table_dir)) {
+        try std.Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(allocator, &.{ table_dir, "metadata" }));
+        try std.Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(allocator, &.{ table_dir, "data" }));
+    }
+
+    var snap_id: i64 = nowMs(t.io);
+    if (snap_id <= 0) snap_id = 1;
+    if (table.metadata.snapshotById(snap_id) != null) snap_id += 1;
+    const seq: i64 = if (table.metadata.currentSnapshot()) |s| s.sequence_number + 1 else 1;
+    const uniq: usize = @intFromPtr(table.dir.ptr);
+
+    var added: std.ArrayList(AddedFile) = .empty;
+    if (live.len > 0) {
+        const spec = table.metadata.currentPartitionSpec();
+        if (spec == null or spec.?.fields.len == 0) {
+            const data_name = try std.fmt.allocPrint(allocator, "data/{d}-{d}.parquet", .{ snap_id, seq });
+            const data_dest = try vfs.joinLocation(allocator, table_dir, data_name);
+            const data_leaf = try std.fmt.allocPrint(allocator, "{d}-{d}-{x}.parquet", .{ snap_id, seq, uniq });
+            try writeParquetAt(allocator, t, data_dest, data_leaf, live);
+            try added.append(allocator, .{
+                .rel = data_name,
+                .count = @intCast(live.len),
+                .bounds = try boundsForBatch(allocator, fields, live),
+                .content = 0,
+            });
+        } else {
+            const groups = try groupByIdentity(allocator, spec.?.*, fields, live);
+            for (groups, 0..) |g, gi| {
+                const part_batch = try live.gather(allocator, g.rows.items);
+                const data_name = try std.fmt.allocPrint(allocator, "data/{s}/{d}-{d}.parquet", .{ g.key, snap_id, seq });
+                const data_dest = try vfs.joinLocation(allocator, table_dir, data_name);
+                const data_leaf = try std.fmt.allocPrint(allocator, "{d}-{d}-{d}-{x}.parquet", .{ snap_id, seq, gi, uniq });
+                try writeParquetAt(allocator, t, data_dest, data_leaf, part_batch);
+                try added.append(allocator, .{
+                    .rel = data_name,
+                    .count = @intCast(part_batch.len),
+                    .bounds = try boundsForBatch(allocator, fields, part_batch),
+                    .content = 0,
+                });
+            }
+        }
+    }
+    return rewriteWithAdded(
+        allocator,
+        t,
+        table,
+        snap_id,
+        seq,
+        uniq,
+        added.items,
+        @intCast(live.len),
+        "replace",
+        false,
+    );
 }
 
 fn rewriteWithAdded(
@@ -1364,11 +1618,10 @@ fn rewriteWithAdded(
     snap_id: i64,
     seq: i64,
     uniq: usize,
-    bound_id: i32,
-    bound_name: []const u8,
     added: []const AddedFile,
     record_count: i64,
     operation: []const u8,
+    keep_existing: bool,
 ) !AppendResult {
     const table_dir = stripFileUrl(table.dir);
     const schema = table.metadata.currentSchema() orelse return error.SchemaNotFound;
@@ -1389,38 +1642,43 @@ fn rewriteWithAdded(
         try std.fmt.allocPrint(allocator, "snap-{d}-{x}.avro", .{ snap_id, uniq }),
     );
 
-    const n_files = table.files.len + table.delete_files.len + added.len;
+    const n_kept: usize = if (keep_existing) table.files.len + table.delete_files.len else 0;
+    const n_files = n_kept + added.len;
     const paths = try allocator.alloc([*:0]const u8, n_files);
     const counts = try allocator.alloc(i64, n_files);
-    const lower = try allocator.alloc(i64, n_files);
-    const upper = try allocator.alloc(i64, n_files);
     const contents = try allocator.alloc(i32, n_files);
+    const bound_off = try allocator.alloc(i32, n_files + 1);
+    var encoded: std.ArrayList(avro.ManifestBound) = .empty;
     var at: usize = 0;
-    for (table.files) |f| {
-        paths[at] = try allocator.dupeZ(u8, listedRel(table_dir, f.path));
-        counts[at] = if (f.record_count > 0) f.record_count else 0;
-        lower[at] = boundI64(f, bound_name, true);
-        upper[at] = boundI64(f, bound_name, false);
-        contents[at] = 0;
-        at += 1;
+    bound_off[0] = 0;
+    if (keep_existing) {
+        for (table.files) |f| {
+            paths[at] = try allocator.dupeZ(u8, listedRel(table_dir, f.path));
+            counts[at] = if (f.record_count > 0) f.record_count else 0;
+            contents[at] = 0;
+            try appendEncodedBounds(allocator, schema.fields, f.bounds, &encoded);
+            at += 1;
+            bound_off[at] = @intCast(encoded.items.len);
+        }
+        for (table.delete_files) |f| {
+            paths[at] = try allocator.dupeZ(u8, listedRel(table_dir, f.path));
+            counts[at] = if (f.record_count > 0) f.record_count else 0;
+            contents[at] = f.content;
+            at += 1;
+            bound_off[at] = @intCast(encoded.items.len);
+        }
     }
-    for (table.delete_files) |f| {
-        paths[at] = try allocator.dupeZ(u8, listedRel(table_dir, f.path));
-        counts[at] = if (f.record_count > 0) f.record_count else 0;
-        lower[at] = 0;
-        upper[at] = 0;
-        contents[at] = f.content;
-        at += 1;
-    }
+    var data_files: usize = 0;
     for (added) |f| {
         paths[at] = try allocator.dupeZ(u8, f.rel);
         counts[at] = f.count;
-        lower[at] = f.lo;
-        upper[at] = f.hi;
         contents[at] = f.content;
+        try appendEncodedBounds(allocator, schema.fields, f.bounds, &encoded);
+        if (f.content == 0) data_files += 1;
         at += 1;
+        bound_off[at] = @intCast(encoded.items.len);
     }
-    try avro.writeDataManifest(man_z, paths, counts, lower, upper, bound_id, contents);
+    try avro.writeDataManifestBounds(allocator, man_z, paths, counts, contents, bound_off, encoded.items);
     try avro.writeManifestList(list_z, try allocator.dupeZ(u8, man_rel));
     try publishIfRemote(allocator, t, man_dest, man_z);
     try publishIfRemote(allocator, t, list_dest, list_z);
@@ -1435,6 +1693,7 @@ fn rewriteWithAdded(
         },
         .record_count = record_count,
         .operation = operation,
+        .files_written = data_files,
     };
 }
 
@@ -1484,6 +1743,21 @@ pub fn appendMixBatch(
     try publishNewSnapshot(allocator, io, table, appended);
 }
 
+pub fn replaceBatch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    table_dir: []const u8,
+    live: batch_mod.Batch,
+) !AppendResult {
+    var http: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer http.deinit();
+    const t = Transport{ .allocator = allocator, .io = io, .http = &http };
+    const table = try openTable(allocator, t, table_dir);
+    const appended = try replaceWithBatch(allocator, t, table, live);
+    try publishNewSnapshot(allocator, io, table, appended);
+    return appended;
+}
+
 pub fn addOptionalColumn(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1529,9 +1803,15 @@ pub fn addOptionalColumn(
         fields,
         table.metadata.snapshots,
         part,
+        t,
     );
     const hint = try std.fmt.allocPrint(allocator, "{d}\n", .{next_ver});
-    try writeText(io, try std.fs.path.join(allocator, &.{ table.dir, "metadata", "version-hint.text" }), hint);
+    const hint_path = try vfs.joinLocation(allocator, table.dir, "metadata/version-hint.text");
+    if (aws.isObject(table.dir)) {
+        try vfs.putLocation(t, hint_path, hint);
+    } else {
+        try writeText(io, hint_path, hint);
+    }
 }
 
 fn publishNewSnapshot(
@@ -1569,9 +1849,158 @@ fn publishNewSnapshot(
         fields,
         snaps,
         part,
+        t,
     );
     const hint = try std.fmt.allocPrint(allocator, "{d}\n", .{next_ver});
-    try writeText(io, try std.fs.path.join(allocator, &.{ table.dir, "metadata", "version-hint.text" }), hint);
+    const hint_path = try vfs.joinLocation(allocator, table.dir, "metadata/version-hint.text");
+    if (aws.isObject(table.dir)) {
+        try vfs.putLocation(t, hint_path, hint);
+    } else {
+        try writeText(io, hint_path, hint);
+    }
+}
+
+pub fn nonCurrentSnapshotIds(allocator: std.mem.Allocator, table: Table) ![]i64 {
+    var ids: std.ArrayList(i64) = .empty;
+    const cur = table.metadata.current_snapshot_id;
+    for (table.metadata.snapshots) |snap| {
+        if (cur != null and snap.snapshot_id == cur.?) continue;
+        try ids.append(allocator, snap.snapshot_id);
+    }
+    return ids.toOwnedSlice(allocator);
+}
+
+/// Rewrite metadata so only the current snapshot remains. Old files stay until orphan removal.
+pub fn expireOldSnapshots(allocator: std.mem.Allocator, t: Transport, table: Table) !void {
+    const table_dir = stripFileUrl(table.dir);
+    const cur = table.metadata.currentSnapshot() orelse return;
+    if (table.metadata.snapshots.len <= 1) return;
+    const schema = table.metadata.currentSchema() orelse return error.SchemaNotFound;
+    const snaps = try allocator.alloc(Snapshot, 1);
+    snaps[0] = cur.*;
+    var last_id: i32 = 0;
+    for (schema.fields) |f| {
+        if (f.id > last_id) last_id = f.id;
+    }
+    const next_ver = try nextHintVersion(allocator, t, table_dir);
+    const meta_name = try std.fmt.allocPrint(allocator, "v{d}.metadata.json", .{next_ver});
+    const meta_path = try vfs.joinLocation(allocator, table_dir, try std.fmt.allocPrint(allocator, "metadata/{s}", .{meta_name}));
+    const part = if (table.metadata.currentPartitionSpec()) |s| s.fields else &.{};
+    try writeMetadataFile(
+        allocator,
+        t.io,
+        meta_path,
+        table.metadata.table_uuid,
+        table.metadata.location,
+        nowMs(t.io),
+        last_id,
+        cur.snapshot_id,
+        cur.sequence_number,
+        schema.fields,
+        snaps,
+        part,
+        t,
+    );
+    const hint = try std.fmt.allocPrint(allocator, "{d}\n", .{next_ver});
+    const hint_path = try vfs.joinLocation(allocator, table_dir, "metadata/version-hint.text");
+    if (aws.isObject(table_dir)) {
+        try vfs.putLocation(t, hint_path, hint);
+    } else {
+        try writeText(t.io, hint_path, hint);
+    }
+}
+
+fn rememberBase(set: *std.StringHashMapUnmanaged(void), allocator: std.mem.Allocator, path: []const u8) !void {
+    const base = std.fs.path.basename(path);
+    if (set.get(base) != null) return;
+    try set.put(allocator, try allocator.dupe(u8, base), {});
+}
+
+fn appendLocalFiles(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    rel: []const u8,
+    out: *std.ArrayList([]u8),
+) !void {
+    const full = try std.fs.path.join(allocator, &.{ root, rel });
+    var dir = std.Io.Dir.cwd().openDir(io, full, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel, entry.name });
+        switch (entry.kind) {
+            .directory => try appendLocalFiles(allocator, io, root, child, out),
+            else => try out.append(allocator, try std.fs.path.join(allocator, &.{ root, child })),
+        }
+    }
+}
+
+/// Files under `data/` and `metadata/` that the remaining snapshots do not name.
+/// `unlink` removes them. `s3://`, `gs://`, and `az://` delete the object.
+pub fn orphanFiles(allocator: std.mem.Allocator, t: Transport, table_dir_in: []const u8, unlink: bool) ![][]u8 {
+    const table_dir = stripFileUrl(table_dir_in);
+    const table = try openTable(allocator, t, table_dir);
+    var refs: std.StringHashMapUnmanaged(void) = .empty;
+    try rememberBase(&refs, allocator, "version-hint.text");
+    if (metadataJsonPath(allocator, t, table_dir)) |meta| {
+        try rememberBase(&refs, allocator, meta);
+    } else |_| {}
+    for (table.metadata.snapshots) |snap| {
+        try rememberBase(&refs, allocator, snap.manifest_list);
+        const loaded = try loadSnapshotFiles(allocator, t, table_dir, table.metadata, .{ .snapshot = snap.snapshot_id });
+        for (loaded.data) |f| try rememberBase(&refs, allocator, f.path);
+        for (loaded.deletes) |f| try rememberBase(&refs, allocator, f.path);
+        const list_path = try resolveListedPath(allocator, table_dir, table.metadata.location, snap.manifest_list);
+        const list_buf = try readLocation(allocator, t, list_path);
+        const mans = try avro.collectStringField(allocator, list_buf, "manifest_path");
+        for (mans) |m| try rememberBase(&refs, allocator, m);
+    }
+    var found: std.ArrayList([]u8) = .empty;
+    if (aws.isObject(table_dir)) {
+        const data_prefix = try vfs.joinLocation(allocator, table_dir, "data");
+        const meta_prefix = try vfs.joinLocation(allocator, table_dir, "metadata");
+        const data_keys = try vfs.listObjectKeys(t, allocator, data_prefix);
+        const meta_keys = try vfs.listObjectKeys(t, allocator, meta_prefix);
+        try found.appendSlice(allocator, data_keys);
+        try found.appendSlice(allocator, meta_keys);
+    } else {
+        try appendLocalFiles(allocator, t.io, table_dir, "data", &found);
+        try appendLocalFiles(allocator, t.io, table_dir, "metadata", &found);
+    }
+    var orphans: std.ArrayList([]u8) = .empty;
+    for (found.items) |abs| {
+        if (refs.get(std.fs.path.basename(abs)) != null) continue;
+        try orphans.append(allocator, abs);
+        if (unlink) vfs.deleteLocation(t, abs) catch {};
+    }
+    return orphans.toOwnedSlice(allocator);
+}
+
+test "expire keeps the current snapshot id in the rendered set" {
+    const dir = "s3://bucket/sales/t";
+    var snaps = [_]Snapshot{
+        .{ .snapshot_id = 1, .timestamp_ms = 1, .manifest_list = "metadata/snap.avro" },
+        .{ .snapshot_id = 2, .timestamp_ms = 2, .manifest_list = "metadata/snap-2.avro" },
+    };
+    const table = Table{
+        .dir = dir,
+        .metadata = .{
+            .format_version = 2,
+            .table_uuid = "remote",
+            .location = dir,
+            .current_snapshot_id = 1,
+            .current_schema_id = 0,
+            .schemas = &.{},
+            .snapshots = &snaps,
+        },
+        .files = &.{},
+    };
+    const ids = try nonCurrentSnapshotIds(std.testing.allocator, table);
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqual(@as(i64, 2), ids[0]);
 }
 
 pub fn parquetDataFile(path: []const u8) DataFile {
@@ -2026,14 +2455,15 @@ fn findBound(file: DataFile, name: []const u8) ?ColBound {
 }
 
 fn rangeMayMatch(lower: BoundValue, upper: BoundValue, op: sql.CmpOp, lit: sql.Literal) bool {
-    const lo = boundAsFloat(lower) orelse return true;
-    const hi = boundAsFloat(upper) orelse return true;
-    const v = literalAsFloat(lit) orelse {
-        if (lower == .string and lit == .string) {
+    if (lower == .string or upper == .string or lit == .string) {
+        if (lower == .string and upper == .string and lit == .string) {
             return strRangeMayMatch(lower.string, upper.string, op, lit.string);
         }
         return true;
-    };
+    }
+    const lo = boundAsFloat(lower) orelse return true;
+    const hi = boundAsFloat(upper) orelse return true;
+    const v = literalAsFloat(lit) orelse return true;
     return switch (op) {
         .eq => v >= lo and v <= hi,
         .ne => true,
@@ -2099,6 +2529,11 @@ fn locationReadable(t: Transport, path: []const u8) bool {
 }
 
 fn readLocation(allocator: std.mem.Allocator, t: Transport, path: []const u8) ![]u8 {
+    if (aws.isRemote(path)) {
+        const cached = try cache.materialize(t, path);
+        defer t.allocator.free(cached);
+        return readAll(allocator, t.io, cached);
+    }
     var source = try FileSource.openLocation(t, path);
     defer source.close();
     return source.readAll(allocator);
@@ -2557,16 +2992,29 @@ test "snapshotFor id and timestamp as of" {
 }
 
 test "specFromNames identity starts at field-id 1000" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     const fields = [_]SchemaField{
         .{ .id = 1, .name = "id", .required = true, .type_name = "long" },
         .{ .id = 2, .name = "category", .required = true, .type_name = "string" },
     };
-    const spec = try specFromNames(std.testing.allocator, &fields, &.{"category"});
-    defer std.testing.allocator.free(spec);
+    const ident = [_]sql.PartitionExpr{.{ .column = "category", .transform = "identity" }};
+    const spec = try specFromNames(a, &fields, &ident);
     try std.testing.expectEqual(@as(usize, 1), spec.len);
     try std.testing.expectEqual(@as(i32, 2), spec[0].source_id);
     try std.testing.expectEqual(@as(i32, 1000), spec[0].field_id);
     try std.testing.expectEqualStrings("category", spec[0].name);
     try std.testing.expectEqualStrings("identity", spec[0].transform);
-    try std.testing.expectError(error.ColumnNotFound, specFromNames(std.testing.allocator, &fields, &.{"nope"}));
+    const day = [_]sql.PartitionExpr{
+        .{ .column = "id", .transform = "day" },
+        .{ .column = "id", .transform = "bucket[4]" },
+    };
+    const both = try specFromNames(a, &fields, &day);
+    try std.testing.expectEqualStrings("id_day", both[0].name);
+    try std.testing.expectEqualStrings("day", both[0].transform);
+    try std.testing.expectEqualStrings("id_bucket", both[1].name);
+    try std.testing.expectEqualStrings("bucket[4]", both[1].transform);
+    const missing = [_]sql.PartitionExpr{.{ .column = "nope", .transform = "identity" }};
+    try std.testing.expectError(error.ColumnNotFound, specFromNames(a, &fields, &missing));
 }

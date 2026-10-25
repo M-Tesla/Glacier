@@ -30,13 +30,15 @@ const usage_text =
     \\  serve [warehouse] Iceberg REST Catalog on 127.0.0.1:8181 and Arrow Flight SQL
     \\                    on 127.0.0.1:8815 (native catalog; not in WASM or the wheel)
     \\  --listen HOST:PORT  REST bind (localhost only without TLS)
+    \\  --tls-cert FILE     PEM certificate; with --tls-key, REST may bind a public address
+    \\  --tls-key FILE      PEM private key for --tls-cert
     \\  --flight HOST:PORT  Flight SQL bind, grpc:// (localhost only without TLS)
-
     \\  -h, --help        this help
     \\  -v, --version     print version
     \\
     \\  Interactive (no -c): pick a source, then type SQL. glacier PATH skips
-    \\  the picker. Ctrl+O opens the picker again. --no-tui for a line prompt.
+    \\  the picker. Ctrl+O opens the picker again. Ctrl+C cancels the running
+    \\  statement and leaves the session open. --no-tui for a line prompt.
     \\  Tab expands/folds the selected cell; arrows move and scroll wrapped text.
     \\
 ;
@@ -62,7 +64,43 @@ const Args = struct {
     serve: bool = false,
     listen: []const u8 = "127.0.0.1:8181",
     flight: []const u8 = "127.0.0.1:8815",
+    tls_cert: ?[]const u8 = null,
+    tls_key: ?[]const u8 = null,
 };
+
+var cli_flag: ?*std.atomic.Value(u8) = null;
+var cli_query: std.atomic.Value(u8) = .init(0);
+
+fn onCancelSig(_: std.posix.SIG) callconv(.c) void {
+    if (cli_query.load(.acquire) == 0) {
+        var dfl: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        _ = std.posix.sigaction(std.posix.SIG.INT, &dfl, null);
+        std.posix.raise(std.posix.SIG.INT) catch {};
+        return;
+    }
+    if (cli_flag) |flag| flag.store(1, .release);
+}
+
+fn armCliCancel(session: *glacier.Session) void {
+    if (comptime builtin.cpu.arch == .wasm32) return;
+    cli_flag = session.cancelSlot();
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onCancelSig },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    _ = std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
+
+fn execLine(session: *glacier.Session, line: []const u8) !glacier.Result {
+    cli_query.store(1, .release);
+    defer cli_query.store(0, .release);
+    return session.execute(line);
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -105,7 +143,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.serve) {
         const warehouse = args.path orelse ".";
-        flight_server.run(gpa, io, warehouse, args.listen, args.flight, out) catch |err| {
+        flight_server.run(gpa, io, warehouse, args.listen, args.flight, out, args.tls_cert, args.tls_key) catch |err| {
             switch (err) {
                 error.TlsRequired => try out.print("glacier serve: bind outside localhost needs TLS\n", .{}),
                 error.InvalidAddress => try out.print("glacier serve: invalid --listen / --flight\n", .{}),
@@ -152,6 +190,7 @@ pub fn main(init: std.process.Init) !void {
     else
         try glacier.Session.openEmpty(gpa, io);
     defer session.close();
+    armCliCancel(&session);
 
     var timer = args.timer;
     var ctx = RunCtx{
@@ -781,7 +820,7 @@ fn runTuiApp(session: *glacier.Session, ctx: *RunCtx) !void {
                         }
                         resetAlloc(&view, ctx.gpa);
                         const t0 = std.Io.Clock.Timestamp.now(ctx.io, .awake);
-                        const result = session.execute(trimmed) catch |exec_err| {
+                        const result = execLine(session, trimmed) catch |exec_err| {
                             pane.deinit();
                             const ge = session.lastError() orelse glacier.GlacierError.fromZig(exec_err);
                             try view.writer.print("error: {s}\n", .{ge.message});
@@ -900,7 +939,7 @@ fn runTuiCooked(session: *glacier.Session, ctx: *RunCtx) !void {
 
         resetAlloc(&view, ctx.gpa);
         const t0 = std.Io.Clock.Timestamp.now(ctx.io, .awake);
-        var result = session.execute(trimmed) catch |exec_err| {
+        var result = execLine(session, trimmed) catch |exec_err| {
             const ge = session.lastError() orelse glacier.GlacierError.fromZig(exec_err);
             try view.writer.print("error: {s}\n", .{ge.message});
             continue;
@@ -1806,7 +1845,7 @@ fn handleLine(session: *glacier.Session, ctx: *RunCtx, line: []const u8) !LineRe
     if (line.len > 0 and line[0] == '.') return handleDot(session, ctx, line);
 
     const t0 = std.Io.Clock.Timestamp.now(ctx.io, .awake);
-    var result = session.execute(line) catch |err| {
+    var result = execLine(session, line) catch |err| {
         const ge = session.lastError() orelse glacier.GlacierError.fromZig(err);
         try ctx.out.print("error: {s}\n", .{ge.message});
         return .fail;
@@ -1942,6 +1981,14 @@ fn parseArgs(
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
             out.flight = argv[i];
+        } else if (eql(a, "--tls-cert")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.tls_cert = argv[i];
+        } else if (eql(a, "--tls-key")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.tls_key = argv[i];
         } else if (a.len > 0 and a[0] == '-' and !std.mem.eql(u8, a, "-")) {
             return error.UnknownOption;
         } else if (eql(a, "serve") and !out.serve and out.path == null) {

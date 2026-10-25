@@ -64,11 +64,43 @@ GLACIER_INTERNAL void *glacier_carquet_open_path(const void *path, size_t path_l
     return reader;
 }
 
+typedef struct glacier_rg_hook {
+    int (*keep)(void *reader, int32_t row_group, void *user);
+    void *user;
+} glacier_rg_hook;
+
+static bool glacier_rg_wrap(const carquet_reader_t *reader, int32_t row_group, void *ctx) {
+    glacier_rg_hook *hook = ctx;
+    if (!hook || !hook->keep) return true;
+    return hook->keep((void *)reader, row_group, hook->user) != 0;
+}
+
+GLACIER_INTERNAL void *glacier_carquet_batch_open_filter(
+    void *reader,
+    const int32_t *cols,
+    int32_t n_cols,
+    int32_t batch_size,
+    glacier_rg_hook *hook,
+    char *err_buf,
+    size_t err_len);
+
 GLACIER_INTERNAL void *glacier_carquet_batch_open(
     void *reader,
     const int32_t *cols,
     int32_t n_cols,
     int32_t batch_size,
+    char *err_buf,
+    size_t err_len)
+{
+    return glacier_carquet_batch_open_filter(reader, cols, n_cols, batch_size, NULL, err_buf, err_len);
+}
+
+GLACIER_INTERNAL void *glacier_carquet_batch_open_filter(
+    void *reader,
+    const int32_t *cols,
+    int32_t n_cols,
+    int32_t batch_size,
+    glacier_rg_hook *hook,
     char *err_buf,
     size_t err_len)
 {
@@ -80,6 +112,10 @@ GLACIER_INTERNAL void *glacier_carquet_batch_open(
     if (cols && n_cols > 0) {
         cfg.column_indices = cols;
         cfg.num_columns = n_cols;
+    }
+    if (hook && hook->keep) {
+        cfg.row_group_filter = glacier_rg_wrap;
+        cfg.row_group_filter_ctx = hook;
     }
     carquet_batch_reader_t *br = carquet_batch_reader_create((carquet_reader_t *)reader, &cfg, &err);
     if (!br && err_buf && err_len > 0) {
@@ -238,6 +274,36 @@ GLACIER_INTERNAL int glacier_carquet_column_stats(
         memcpy(out->max_bytes, st.max_value, (size_t)n);
         out->max_len = n;
     }
+    return 0;
+}
+
+GLACIER_INTERNAL int glacier_carquet_row_group_matches(
+    void *reader,
+    int32_t row_group,
+    int32_t column,
+    int32_t op,
+    const void *value,
+    int32_t value_size,
+    int *might_match)
+{
+    bool match = true;
+    if (!reader || !might_match) return -1;
+    if (op < CARQUET_COMPARE_EQ || op > CARQUET_COMPARE_GE) {
+        *might_match = 1;
+        return 0;
+    }
+    if (carquet_reader_row_group_matches(
+            (const carquet_reader_t *)reader,
+            row_group,
+            column,
+            (carquet_compare_op_t)op,
+            value,
+            value_size,
+            &match) != CARQUET_OK) {
+        *might_match = 1;
+        return 0;
+    }
+    *might_match = match ? 1 : 0;
     return 0;
 }
 
@@ -877,10 +943,26 @@ typedef struct glacier_write_col {
     int64_t n_rows;
 } glacier_write_col_t;
 
+static size_t glacier_value_width(int32_t physical) {
+    switch (physical) {
+    case CARQUET_PHYSICAL_BOOLEAN:
+        return 1;
+    case CARQUET_PHYSICAL_INT32:
+    case CARQUET_PHYSICAL_FLOAT:
+        return 4;
+    case CARQUET_PHYSICAL_INT64:
+    case CARQUET_PHYSICAL_DOUBLE:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
 GLACIER_INTERNAL int glacier_carquet_write_columns(
     const char *path,
     const glacier_write_col_t *cols,
-    int32_t n_cols
+    int32_t n_cols,
+    int64_t rows_per_group
 ) {
     if (!path || !cols || n_cols <= 0) return -1;
     const int64_t n = cols[0].n_rows;
@@ -926,42 +1008,85 @@ GLACIER_INTERNAL int glacier_carquet_write_columns(
     carquet_schema_free(schema);
     if (!writer) return -1;
 
+    carquet_byte_array_t **held = calloc((size_t)n_cols, sizeof(*held));
+    if (!held) {
+        (void)carquet_writer_close(writer);
+        return -1;
+    }
+    int64_t rows_per = n;
+    if (rows_per_group > 0 && rows_per_group < n) {
+        int splittable = 1;
+        for (int32_t i = 0; i < n_cols; i++) {
+            if (cols[i].physical == CARQUET_PHYSICAL_BYTE_ARRAY) continue;
+            if (glacier_value_width(cols[i].physical) == 0) splittable = 0;
+        }
+        if (splittable) rows_per = rows_per_group;
+    }
+
     for (int32_t i = 0; i < n_cols; i++) {
         const glacier_write_col_t *col = &cols[i];
-        carquet_byte_array_t *bas = NULL;
-        const void *values = col->values;
         if (col->physical == CARQUET_PHYSICAL_BYTE_ARRAY) {
             if (!col->utf8_offsets) {
+                for (int32_t j = 0; j < n_cols; j++) free(held[j]);
+                free(held);
                 (void)carquet_writer_close(writer);
                 return -1;
             }
-            bas = malloc((size_t)n * sizeof(*bas));
-            if (!bas) {
+            held[i] = malloc((size_t)n * sizeof(*held[i]));
+            if (!held[i]) {
+                for (int32_t j = 0; j < n_cols; j++) free(held[j]);
+                free(held);
                 (void)carquet_writer_close(writer);
                 return -1;
             }
             for (int64_t r = 0; r < n; r++) {
                 const uint32_t start = col->utf8_offsets[r];
                 const uint32_t end = col->utf8_offsets[r + 1];
-                bas[r].length = (int32_t)(end - start);
-                if (bas[r].length > 0 && col->utf8_bytes) {
-                    bas[r].data = (uint8_t *)(col->utf8_bytes + start);
+                held[i][r].length = (int32_t)(end - start);
+                if (held[i][r].length > 0 && col->utf8_bytes) {
+                    held[i][r].data = (uint8_t *)(col->utf8_bytes + start);
                 } else {
-                    bas[r].data = (uint8_t *)"";
-                    bas[r].length = 0;
+                    held[i][r].data = (uint8_t *)"";
+                    held[i][r].length = 0;
                 }
             }
-            values = bas;
-        } else if (!values) {
+        } else if (!col->values) {
+            for (int32_t j = 0; j < n_cols; j++) free(held[j]);
+            free(held);
             (void)carquet_writer_close(writer);
             return -1;
         }
-        const carquet_status_t st = carquet_writer_write_batch(writer, i, values, n, NULL, NULL);
-        free(bas);
-        if (st != CARQUET_OK) {
-            (void)carquet_writer_close(writer);
-            return -1;
+    }
+
+    int failed = 0;
+    for (int64_t off = 0; off < n && !failed;) {
+        int64_t take = n - off;
+        if (take > rows_per) take = rows_per;
+        if (off > 0 && carquet_writer_new_row_group(writer) != CARQUET_OK) {
+            failed = 1;
+            break;
         }
+        for (int32_t i = 0; i < n_cols; i++) {
+            const glacier_write_col_t *col = &cols[i];
+            const void *values;
+            if (held[i]) {
+                values = held[i] + off;
+            } else {
+                const size_t width = glacier_value_width(col->physical);
+                values = (const char *)col->values + (size_t)off * width;
+            }
+            if (carquet_writer_write_batch(writer, i, values, take, NULL, NULL) != CARQUET_OK) {
+                failed = 1;
+                break;
+            }
+        }
+        off += take;
+    }
+    for (int32_t j = 0; j < n_cols; j++) free(held[j]);
+    free(held);
+    if (failed) {
+        (void)carquet_writer_close(writer);
+        return -1;
     }
     return carquet_writer_close(writer) == CARQUET_OK ? 0 : -1;
 }

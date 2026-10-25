@@ -8,7 +8,7 @@ from typing import Any, Optional, Union
 
 from . import _native
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 
 class GlacierError(Exception):
@@ -82,6 +82,7 @@ class Connection:
         self._conn = conn
 
     def execute(self, sql: str) -> "Result":
+        """Run a SQL script on this session. Statements run in order. The result is the last one."""
         self._check()
         err = ctypes.c_char_p()
         handle = self._lib.glacier_query(
@@ -98,6 +99,11 @@ class Connection:
             result.close()
             raise GlacierError(msg)
         return result
+
+    def cancel(self) -> None:
+        """Ask the running statement to stop. The next execute also fails once if nothing is running."""
+        self._check()
+        self._lib.glacier_cancel(self._conn)
 
     def read_parquet(self, buf: Union[bytes, bytearray, memoryview, str, Path]) -> "Result":
         """Attach a parquet (bytes or path) and `SELECT *`."""

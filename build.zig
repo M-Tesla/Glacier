@@ -11,6 +11,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addCarquet(b, glacier_mod);
+    const tls_flags = [_][]const u8{ "-std=c11", "-fno-sanitize=undefined" };
+    glacier_mod.addCSourceFile(.{
+        .file = b.path("src/table/tls_accept.c"),
+        .flags = &tls_flags,
+        .language = .c,
+    });
+    glacier_mod.linkSystemLibrary("ssl", .{});
+    glacier_mod.linkSystemLibrary("crypto", .{});
     addNanoarrow(b, glacier_mod);
     addAvro(b, glacier_mod);
 
@@ -288,7 +296,7 @@ fn addCarquet(b: *std.Build, mod: *std.Build.Module) void {
         mod.addIncludePath(b.path("vendor/zstd"));
         mod.addIncludePath(b.path("vendor/zstd/lib"));
         addZlib(b, mod);
-        addZstd(b, mod);
+        addZstd(b, mod, false);
         if (os != .windows) {
             mod.linkSystemLibrary("m", .{});
             mod.linkSystemLibrary("pthread", .{});
@@ -341,8 +349,11 @@ fn addCarquet(b: *std.Build, mod: *std.Build.Module) void {
         .language = .c,
     });
     if (wasm) {
+        mod.addIncludePath(b.path("vendor/zstd"));
+        mod.addIncludePath(b.path("vendor/zstd/lib"));
+        addZstd(b, mod, true);
         mod.addCSourceFile(.{
-            .file = b.path("src/formats/wasm/zstd_stub.c"),
+            .file = carquet_root.path(b, "src/compression/zstd.c"),
             .flags = &flags,
             .language = .c,
         });
@@ -402,7 +413,7 @@ fn addZlib(b: *std.Build, mod: *std.Build.Module) void {
     });
 }
 
-fn addZstd(b: *std.Build, mod: *std.Build.Module) void {
+fn addZstd(b: *std.Build, mod: *std.Build.Module, wasm: bool) void {
     const flags = [_][]const u8{
         "-std=c11",
         "-fno-sanitize=undefined",
@@ -414,38 +425,47 @@ fn addZstd(b: *std.Build, mod: *std.Build.Module) void {
         "-Wno-unused-function",
         "-Wno-unused-variable",
     };
-    mod.addCSourceFiles(.{
-        .root = b.path("vendor/zstd/lib"),
-        .files = &.{
-            "common/debug.c",
-            "common/entropy_common.c",
-            "common/error_private.c",
-            "common/fse_decompress.c",
-            "common/pool.c",
-            "common/threading.c",
-            "common/xxhash.c",
-            "common/zstd_common.c",
-            "compress/fse_compress.c",
-            "compress/hist.c",
-            "compress/huf_compress.c",
-            "compress/zstd_compress.c",
-            "compress/zstd_compress_literals.c",
-            "compress/zstd_compress_sequences.c",
-            "compress/zstd_compress_superblock.c",
-            "compress/zstd_double_fast.c",
-            "compress/zstd_fast.c",
-            "compress/zstd_lazy.c",
-            "compress/zstd_ldm.c",
-            "compress/zstdmt_compress.c",
-            "compress/zstd_opt.c",
-            "compress/zstd_preSplit.c",
-            "decompress/huf_decompress.c",
-            "decompress/zstd_ddict.c",
-            "decompress/zstd_decompress.c",
-            "decompress/zstd_decompress_block.c",
-        },
-        .flags = &flags,
-    });
+    const common = [_][]const u8{
+        "common/debug.c",
+        "common/entropy_common.c",
+        "common/error_private.c",
+        "common/fse_decompress.c",
+        "common/pool.c",
+        "common/threading.c",
+        "common/xxhash.c",
+        "common/zstd_common.c",
+        "compress/fse_compress.c",
+        "compress/hist.c",
+        "compress/huf_compress.c",
+        "compress/zstd_compress.c",
+        "compress/zstd_compress_literals.c",
+        "compress/zstd_compress_sequences.c",
+        "compress/zstd_compress_superblock.c",
+        "compress/zstd_double_fast.c",
+        "compress/zstd_fast.c",
+        "compress/zstd_lazy.c",
+        "compress/zstd_ldm.c",
+        "compress/zstd_opt.c",
+        "compress/zstd_preSplit.c",
+        "decompress/huf_decompress.c",
+        "decompress/zstd_ddict.c",
+        "decompress/zstd_decompress.c",
+        "decompress/zstd_decompress_block.c",
+    };
+    const with_mt = common ++ [_][]const u8{"compress/zstdmt_compress.c"};
+    if (wasm) {
+        mod.addCSourceFiles(.{
+            .root = b.path("vendor/zstd/lib"),
+            .files = &common,
+            .flags = &flags,
+        });
+    } else {
+        mod.addCSourceFiles(.{
+            .root = b.path("vendor/zstd/lib"),
+            .files = &with_mt,
+            .flags = &flags,
+        });
+    }
 }
 
 fn addAvro(b: *std.Build, mod: *std.Build.Module) void {

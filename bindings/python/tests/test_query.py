@@ -19,8 +19,8 @@ class TestQuery(unittest.TestCase):
             con.close()
 
     def test_version(self):
-        self.assertEqual(glacier.version(), "0.6.0")
-        self.assertEqual(glacier.api_version(), 1)
+        self.assertEqual(glacier.version(), "0.6.1")
+        self.assertEqual(glacier.api_version(), 2)
 
     def test_catalog_session(self):
         if not SALES.is_file():
@@ -137,11 +137,14 @@ class TestQuery(unittest.TestCase):
                 ).fetchall(),
                 [(10,)],
             )
-            with self.assertRaises(glacier.GlacierError) as ctx:
-                con.execute(
-                    "SELECT * FROM sales a WHERE a.id IN (SELECT b.id FROM sales b WHERE a.id > 0)"
-                )
-            self.assertIn("not supported", str(ctx.exception))
+            self.assertEqual(
+                len(
+                    con.execute(
+                        "SELECT * FROM sales a WHERE a.id IN (SELECT b.id FROM sales b WHERE a.id > 0)"
+                    ).fetchall()
+                ),
+                10,
+            )
 
     def test_read_parquet_bytes(self):
         if not SALES.is_file():

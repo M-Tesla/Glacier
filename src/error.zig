@@ -18,6 +18,7 @@ pub const Code = enum {
     parquet,
     avro,
     iceberg,
+    query_canceled,
 };
 
 pub const GlacierError = struct {
@@ -52,6 +53,7 @@ pub fn codeOf(err: anyerror) Code {
         error.RestCatalogFailed, error.OauthFailed, error.InvalidHeader, error.CommitConflict => .iceberg,
         error.RemoteAttachUnsupported => .unsupported_sql,
         error.WriteUnsupported => .unsupported_sql,
+        error.QueryCanceled => .query_canceled,
         error.TlsRequired => .unsupported_sql,
         error.ObjectPutFailed => .io,
         error.AwsCredentialsMissing, error.InvalidGsUrl => .io,
@@ -94,6 +96,7 @@ pub fn staticMessage(err: anyerror) []const u8 {
         error.CommitConflict => "Iceberg REST catalog rejected the commit (conflict)",
         error.RemoteAttachUnsupported => "remote ATTACH is not supported in WASM",
         error.WriteUnsupported => "this catalog does not support writes",
+        error.QueryCanceled => "query canceled",
         error.TlsRequired => "public Iceberg REST bind needs TLS",
         error.ObjectPutFailed => "failed to PUT object",
         error.OauthFailed => "OAuth token request failed",

@@ -1,5 +1,5 @@
 //! Iceberg Hadoop warehouse: `root/namespace/table/metadata/…`.
-//! Listing walks the local filesystem. Remote prefixes are not listed.
+//! A local root is a directory walk. `s3://`, `gs://`, and `az://` list one level of prefixes.
 
 const std = @import("std");
 const iceberg = @import("iceberg.zig");
@@ -15,19 +15,33 @@ fn isRemote(path: []const u8) bool {
     return std.mem.indexOf(u8, path, "://") != null;
 }
 
-fn listChildDirs(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![][]const u8 {
-    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return &.{};
-    defer dir.close(io);
+fn keepChild(name: []const u8) bool {
+    if (name.len == 0 or name[0] == '.') return false;
+    if (std.ascii.eqlIgnoreCase(name, "metadata") or std.ascii.eqlIgnoreCase(name, "data")) return false;
+    return true;
+}
+
+fn listChildDirs(allocator: std.mem.Allocator, t: Transport, path: []const u8) ![][]const u8 {
+    if (isRemote(path)) {
+        const raw = try vfs.listPrefixNames(t, allocator, path);
+        var names: std.ArrayList([]const u8) = .empty;
+        for (raw) |name| {
+            if (!keepChild(name)) {
+                allocator.free(name);
+                continue;
+            }
+            try names.append(allocator, name);
+        }
+        return names.items;
+    }
+    var dir = std.Io.Dir.cwd().openDir(t.io, path, .{ .iterate = true }) catch return &.{};
+    defer dir.close(t.io);
     var names: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+    while (try it.next(t.io)) |entry| {
+        if (!keepChild(entry.name)) continue;
         switch (entry.kind) {
-            .directory, .sym_link => {
-                if (std.ascii.eqlIgnoreCase(entry.name, "metadata") or
-                    std.ascii.eqlIgnoreCase(entry.name, "data")) continue;
-                try names.append(allocator, try allocator.dupe(u8, entry.name));
-            },
+            .directory, .sym_link => try names.append(allocator, try allocator.dupe(u8, entry.name)),
             else => {},
         }
     }
@@ -45,8 +59,7 @@ pub fn isWarehouse(allocator: std.mem.Allocator, t: Transport, warehouse: []cons
 }
 
 pub fn listNamespaces(allocator: std.mem.Allocator, t: Transport, warehouse: []const u8) ![][]const u8 {
-    if (isRemote(warehouse)) return &.{};
-    const children = try listChildDirs(allocator, t.io, warehouse);
+    const children = try listChildDirs(allocator, t, warehouse);
     var names: std.ArrayList([]const u8) = .empty;
     for (children) |ns| {
         const tables = listTables(allocator, t, warehouse, ns) catch continue;
@@ -56,9 +69,8 @@ pub fn listNamespaces(allocator: std.mem.Allocator, t: Transport, warehouse: []c
 }
 
 pub fn listTables(allocator: std.mem.Allocator, t: Transport, warehouse: []const u8, namespace: []const u8) ![]Ident {
-    if (isRemote(warehouse)) return &.{};
     const ns_path = try vfs.joinLocation(allocator, warehouse, namespace);
-    const children = try listChildDirs(allocator, t.io, ns_path);
+    const children = try listChildDirs(allocator, t, ns_path);
     var out: std.ArrayList(Ident) = .empty;
     for (children) |name| {
         const dir = try vfs.joinLocation(allocator, ns_path, name);

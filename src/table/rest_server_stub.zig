@@ -29,6 +29,17 @@ pub fn bind(
     return error.WriteUnsupported;
 }
 
+pub fn bindTls(
+    _: std.mem.Allocator,
+    _: std.Io,
+    _: []const u8,
+    _: []const u8,
+    _: ?[]const u8,
+    _: ?[]const u8,
+) !Handle {
+    return error.WriteUnsupported;
+}
+
 pub fn serveLoop(_: *Handle) !void {
     return error.WriteUnsupported;
 }

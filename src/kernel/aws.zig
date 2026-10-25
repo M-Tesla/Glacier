@@ -32,8 +32,16 @@ pub fn isGs(path: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(path, "gs://");
 }
 
+pub fn isAz(path: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(path, "az://");
+}
+
+pub fn isObject(path: []const u8) bool {
+    return isS3(path) or isGs(path) or isAz(path);
+}
+
 pub fn isRemote(path: []const u8) bool {
-    return isS3(path) or isHttp(path) or isGs(path);
+    return isObject(path) or isHttp(path);
 }
 
 pub fn parseGs(path: []const u8) !S3Url {
@@ -46,10 +54,72 @@ pub fn parseGs(path: []const u8) !S3Url {
 }
 
 /// XML API: `https://storage.googleapis.com/{bucket}/{key}`.
-pub fn httpUrlForGs(allocator: std.mem.Allocator, loc: S3Url) ![]u8 {
+/// `endpoint` (or `GCS_ENDPOINT_URL` when it is null) replaces that host, the same way `AWS_ENDPOINT_URL` does for S3.
+pub fn httpUrlForGs(allocator: std.mem.Allocator, loc: S3Url, endpoint: ?[]const u8) ![]u8 {
+    const from_env = if (endpoint == null) (envDup(allocator, "GCS_ENDPOINT_URL") catch null) else null;
+    defer if (from_env) |e| allocator.free(e);
+    if (endpoint orelse from_env) |ep| {
+        const base = std.mem.trimEnd(u8, ep, "/");
+        if (loc.key.len == 0)
+            return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, loc.bucket });
+        return std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ base, loc.bucket, loc.key });
+    }
     if (loc.key.len == 0)
         return std.fmt.allocPrint(allocator, "https://storage.googleapis.com/{s}", .{loc.bucket});
     return std.fmt.allocPrint(allocator, "https://storage.googleapis.com/{s}/{s}", .{ loc.bucket, loc.key });
+}
+
+pub fn parseAz(path: []const u8) !S3Url {
+    if (!isAz(path)) return error.InvalidAzUrl;
+    const rest = path["az://".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse
+        return S3Url{ .bucket = rest, .key = "" };
+    if (slash == 0) return error.InvalidAzUrl;
+    return .{ .bucket = rest[0..slash], .key = rest[slash + 1 ..] };
+}
+
+/// `{endpoint}/{container}/{key}`. `endpoint` or `AZURE_ENDPOINT_URL` is the account host
+/// (`https://{account}.blob.core.windows.net`). Without it the host is `blob.core.windows.net`.
+pub fn httpUrlForAz(allocator: std.mem.Allocator, loc: S3Url, endpoint: ?[]const u8) ![]u8 {
+    const from_env = if (endpoint == null) (envDup(allocator, "AZURE_ENDPOINT_URL") catch null) else null;
+    defer if (from_env) |e| allocator.free(e);
+    const base = if (endpoint orelse from_env) |ep|
+        std.mem.trimEnd(u8, ep, "/")
+    else
+        "https://blob.core.windows.net";
+    if (loc.key.len == 0)
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, loc.bucket });
+    return std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ base, loc.bucket, loc.key });
+}
+
+pub fn azureListUrl(
+    allocator: std.mem.Allocator,
+    loc: S3Url,
+    endpoint: ?[]const u8,
+    prefix: []const u8,
+    marker: ?[]const u8,
+    delimited: bool,
+) ![]u8 {
+    const bare_loc = S3Url{ .bucket = loc.bucket, .key = "" };
+    const bare = try httpUrlForAz(allocator, bare_loc, endpoint);
+    defer allocator.free(bare);
+    const enc_prefix = try uriEncode(allocator, prefix, true);
+    defer allocator.free(enc_prefix);
+    const delim = if (delimited) "&delimiter=%2F" else "";
+    if (marker) |tok| {
+        const enc_tok = try uriEncode(allocator, tok, true);
+        defer allocator.free(enc_tok);
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}?comp=list&marker={s}&prefix={s}&restype=container{s}",
+            .{ bare, enc_tok, enc_prefix, delim },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}?comp=list&prefix={s}&restype=container{s}",
+        .{ bare, enc_prefix, delim },
+    );
 }
 
 pub fn parseS3(path: []const u8) !S3Url {
@@ -85,6 +155,43 @@ pub fn httpUrlForS3(
     return std.fmt.allocPrint(allocator, "https://{s}/{s}", .{ host, loc.key });
 }
 
+/// One page of `ListObjectsV2` (`delimiter=/`) on the XML host.
+/// `gs` uses the same query against the GCS XML endpoint.
+pub fn listObjectsUrl(
+    allocator: std.mem.Allocator,
+    loc: S3Url,
+    region: []const u8,
+    endpoint: ?[]const u8,
+    prefix: []const u8,
+    token: ?[]const u8,
+    gs: bool,
+    delimited: bool,
+) ![]u8 {
+    const bare_loc = S3Url{ .bucket = loc.bucket, .key = "" };
+    const bare = if (gs)
+        try httpUrlForGs(allocator, bare_loc, endpoint)
+    else
+        try httpUrlForS3(allocator, bare_loc, region, endpoint);
+    defer allocator.free(bare);
+    const enc_prefix = try uriEncode(allocator, prefix, true);
+    defer allocator.free(enc_prefix);
+    const delim = if (delimited) "&delimiter=%2F" else "";
+    if (token) |tok| {
+        const enc_tok = try uriEncode(allocator, tok, true);
+        defer allocator.free(enc_tok);
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}?continuation-token={s}{s}&list-type=2&prefix={s}",
+            .{ bare, enc_tok, delim, enc_prefix },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}?list-type=2&prefix={s}{s}",
+        .{ bare, enc_prefix, delim },
+    );
+}
+
 pub fn uriEncode(allocator: std.mem.Allocator, s: []const u8, encode_slash: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -103,6 +210,24 @@ pub fn uriEncode(allocator: std.mem.Allocator, s: []const u8, encode_slash: bool
 
 fn unreserved(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
+}
+
+fn uriDecode(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '%' and i + 2 < s.len) {
+            if (std.fmt.parseInt(u8, s[i + 1 .. i + 3], 16)) |b| {
+                try out.append(allocator, b);
+                i += 3;
+                continue;
+            } else |_| {}
+        }
+        try out.append(allocator, s[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Sort `k=v` pairs and URI-encode keys and values.
@@ -125,9 +250,13 @@ pub fn canonicalQuery(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
         const eq = std.mem.indexOfScalar(u8, part, '=') orelse part.len;
         const k_raw = part[0..eq];
         const v_raw = if (eq < part.len) part[eq + 1 ..] else "";
+        const k_dec = try uriDecode(allocator, k_raw);
+        defer allocator.free(k_dec);
+        const v_dec = try uriDecode(allocator, v_raw);
+        defer allocator.free(v_dec);
         try pairs.append(allocator, .{
-            .k = try uriEncode(allocator, k_raw, true),
-            .v = try uriEncode(allocator, v_raw, true),
+            .k = try uriEncode(allocator, k_dec, true),
+            .v = try uriEncode(allocator, v_dec, true),
         });
     }
 
@@ -547,6 +676,12 @@ test "canonical query sorts and encodes" {
     const space = try canonicalQuery(a, "q=a b");
     defer a.free(space);
     try std.testing.expectEqualStrings("q=a%20b", space);
+    const slash = try canonicalQuery(a, "delimiter=%2F&list-type=2");
+    defer a.free(slash);
+    try std.testing.expectEqualStrings("delimiter=%2F&list-type=2", slash);
+    const plus = try canonicalQuery(a, "uploadId=a%2Bb");
+    defer a.free(plus);
+    try std.testing.expectEqualStrings("uploadId=a%2Bb", plus);
 }
 
 test "HMAC-SHA256 RFC 4231 case 1" {
@@ -644,7 +779,7 @@ test "gs URL to XML HTTPS" {
     const loc = try parseGs("gs://lake/ns/tbl/data/f.parquet");
     try std.testing.expectEqualStrings("lake", loc.bucket);
     try std.testing.expectEqualStrings("ns/tbl/data/f.parquet", loc.key);
-    const url = try httpUrlForGs(std.testing.allocator, loc);
+    const url = try httpUrlForGs(std.testing.allocator, loc, null);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://storage.googleapis.com/lake/ns/tbl/data/f.parquet", url);
 }

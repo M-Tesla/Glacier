@@ -44,6 +44,11 @@ fn captureError(buf: []u8, err: anyerror) GlacierError {
     return .{ .code = errmod.codeOf(err), .message = msg };
 }
 
+const TempTable = struct {
+    name: []u8,
+    batch: Batch,
+};
+
 fn openInner(gpa: std.mem.Allocator, io: std.Io, http: *std.http.Client, path: []const u8) !Session {
     var catalog_arena = std.heap.ArenaAllocator.init(gpa);
     errdefer catalog_arena.deinit();
@@ -140,11 +145,53 @@ pub const Session = struct {
     s3_region: ?[]const u8 = null,
     gcs_token: ?[]const u8 = null,
     gcs_user_project: ?[]const u8 = null,
+    gcs_endpoint: ?[]const u8 = null,
+    azure_token: ?[]const u8 = null,
+    azure_endpoint: ?[]const u8 = null,
     default_namespace: []const u8 = "default",
     error_buf: [512]u8 = undefined,
     last_error: ?GlacierError = null,
     /// Rows per `nextBatch`. 0 reads `GLACIER_BATCH_ROWS` (default 65536).
     stream_rows: usize = 0,
+    /// `CREATE TEMP TABLE`. Owned by `gpa`. Freed in `close`.
+    temps: std.ArrayList(TempTable) = .empty,
+    cancel: physical.CancelState = .{},
+
+    pub fn requestCancel(self: *Session) void {
+        self.cancel.flag.store(1, .release);
+    }
+
+    pub fn cancelSlot(self: *Session) *std.atomic.Value(u8) {
+        return &self.cancel.flag;
+    }
+
+    fn armCancel(self: *Session) bool {
+        const pending = self.cancel.flag.swap(0, .acq_rel) != 0;
+        self.cancel.checks = 0;
+        self.armDeadline();
+        physical.bindCancel(&self.cancel);
+        return pending;
+    }
+
+    fn endCancel(self: *Session) void {
+        self.cancel.after = 0;
+        self.cancel.deadline_ns = 0;
+        self.cancel.flag.store(0, .release);
+        physical.bindCancel(null);
+    }
+
+    fn armDeadline(self: *Session) void {
+        self.cancel.has_io = true;
+        self.cancel.io = self.io;
+        if (self.cancel.deadline_ns != 0) return;
+        if (comptime @import("builtin").cpu.arch == .wasm32) return;
+        const raw = std.c.getenv("GLACIER_QUERY_MS") orelse return;
+        const text = std.mem.span(raw);
+        if (text.len == 0) return;
+        const ms = std.fmt.parseInt(u64, text, 10) catch return;
+        const now: i128 = std.Io.Clock.Timestamp.now(self.io, .awake).raw.toNanoseconds();
+        self.cancel.deadline_ns = if (ms == 0) now else now + ms * 1_000_000;
+    }
 
     pub fn lastError(self: *const Session) ?GlacierError {
         return self.last_error;
@@ -160,6 +207,9 @@ pub const Session = struct {
             .s3_region = self.s3_region,
             .gcs_token = self.gcs_token,
             .gcs_user_project = self.gcs_user_project,
+            .gcs_endpoint = self.gcs_endpoint,
+            .azure_token = self.azure_token,
+            .azure_endpoint = self.azure_endpoint,
         };
     }
 
@@ -283,6 +333,7 @@ pub const Session = struct {
     }
 
     pub fn close(self: *Session) void {
+        self.freeTemps();
         self.http.deinit();
         self.catalog_arena.deinit();
         self.* = undefined;
@@ -290,13 +341,30 @@ pub const Session = struct {
 
     pub fn execute(self: *Session, query_sql: []const u8) !Result {
         self.last_error = null;
-        return self.executeInner(query_sql) catch |err| {
+        return self.executeScript(query_sql) catch |err| {
             self.last_error = captureError(&self.error_buf, err);
             return err;
         };
     }
 
+    fn executeScript(self: *Session, query_sql: []const u8) !Result {
+        var parts: std.ArrayList([]const u8) = .empty;
+        defer parts.deinit(self.gpa);
+        try sql.splitStatements(self.gpa, query_sql, &parts);
+        if (parts.items.len == 0) return error.InvalidSyntax;
+        var i: usize = 0;
+        while (i + 1 < parts.items.len) : (i += 1) {
+            var done = try self.executeInner(parts.items[i]);
+            done.deinit();
+        }
+        return self.executeInner(parts.items[i]);
+    }
+
     fn executeInner(self: *Session, query_sql: []const u8) !Result {
+        const pending = self.armCancel();
+        defer self.endCancel();
+        if (pending) return error.QueryCanceled;
+        try physical.checkCancel();
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -363,6 +431,22 @@ pub const Session = struct {
             },
             .drop_table => |d| {
                 const batch = try self.executeDropTable(a, d);
+                return try self.wrapResult(&arena, batch, .{});
+            },
+            .compact_table => |c| {
+                const batch = try self.executeCompact(a, c);
+                return try self.wrapResult(&arena, batch, .{});
+            },
+            .expire_snapshots => |e| {
+                const batch = try self.executeExpire(a, e);
+                return try self.wrapResult(&arena, batch, .{});
+            },
+            .remove_orphans => |r| {
+                const batch = try self.executeRemoveOrphans(a, r);
+                return try self.wrapResult(&arena, batch, .{});
+            },
+            .explain => |ex| {
+                const batch = try self.executeExplain(a, ex);
                 return try self.wrapResult(&arena, batch, .{});
             },
         }
@@ -490,6 +574,37 @@ pub const Session = struct {
             var next: std.ArrayList(NamedBatch) = .empty;
             try next.appendSlice(a, env);
             for (query.ctes) |cte| {
+                if (cte.recursive and sql.usesTableName(cte.query, cte.name)) {
+                    const body = cte.query.*;
+                    const right = body.union_right orelse return error.UnsupportedSql;
+                    var anchor = stripUnion(body);
+                    anchor.ctes = &.{};
+                    if (sql.usesTableName(&anchor, cte.name)) return error.UnsupportedSql;
+                    var acc = try self.runQueryEnv(a, anchor, stats, next.items);
+                    var prev = acc;
+                    var guard: usize = 0;
+                    while (guard < 64) : (guard += 1) {
+                        var step = stripUnion(right.*);
+                        step.ctes = &.{};
+                        var step_env: std.ArrayList(NamedBatch) = .empty;
+                        try step_env.appendSlice(a, next.items);
+                        try step_env.append(a, .{ .name = cte.name, .batch = prev });
+                        var delta = try self.runQueryEnv(a, step, stats, step_env.items);
+                        if (delta.len == 0) break;
+                        if (delta.columns.len != acc.columns.len) return error.SchemaMismatch;
+                        const renamed = try a.alloc(Column, delta.columns.len);
+                        for (delta.columns, acc.columns, renamed) |col, src, *out| {
+                            out.* = col;
+                            out.name = src.name;
+                        }
+                        delta.columns = renamed;
+                        acc = try physical.concatUnion(a, acc, delta);
+                        if (!body.union_all) acc = try physical.distinctRows(a, acc);
+                        prev = delta;
+                    } else return error.UnsupportedSql;
+                    try next.append(a, .{ .name = cte.name, .batch = acc });
+                    continue;
+                }
                 if (sql.usesTableName(cte.query, cte.name)) return error.UnsupportedSql;
                 var body = cte.query.*;
                 body.ctes = &.{};
@@ -519,6 +634,9 @@ pub const Session = struct {
         stats: *ScanStats,
         env: []const NamedBatch,
     ) !Batch {
+        if (sql.hasCorrelation(&query)) {
+            return self.runCorrelated(a, query, stats, env);
+        }
         var q = try self.rewritePreds(a, query, stats, env);
         if (q.isNoFrom()) {
             return physical.execute(a, self.transport(), &.{}, q, null, stats, null);
@@ -538,6 +656,9 @@ pub const Session = struct {
         }
         if (q.from_sub != null or (q.from.len > 0 and findNamed(env, q.from) != null)) {
             const input = try self.resolveSource(a, q.from, q.from_sub, q.as_of, stats, env);
+            return physical.executeOnBatch(a, input, q);
+        }
+        if (try self.copyTemp(a, q.from)) |input| {
             return physical.executeOnBatch(a, input, q);
         }
         const as_of = toIcebergAsOf(q.as_of);
@@ -569,6 +690,7 @@ pub const Session = struct {
         if (try self.parseSystemSuffix(a, name)) |sys| {
             return self.executeSystem(a, sys, toIcebergAsOf(as_of));
         }
+        if (try self.copyTemp(a, name)) |input| return input;
         const iceberg_as_of = toIcebergAsOf(as_of);
         const files = try self.filesFor(a, name, iceberg_as_of);
         const fallback = self.schemaFallback(a, name, iceberg_as_of);
@@ -743,6 +865,550 @@ pub const Session = struct {
         }
     }
 
+    fn runCorrelated(
+        self: *Session,
+        a: std.mem.Allocator,
+        query: sql.Query,
+        stats: *ScanStats,
+        env: []const NamedBatch,
+    ) anyerror!Batch {
+        if (query.join) |j| {
+            if (j.sub) |sub| {
+                if (j.lateral or sql.isCorrelated(sub, &query)) {
+                    return self.runLateral(a, query, stats, env);
+                }
+            }
+        }
+        const having_corr = if (query.having) |h| sql.predicateIsCorrelated(h, &query) else false;
+        const items_corr = sql.itemsAreCorrelated(&query);
+        if (items_corr and (query.needsAgg() or query.hasWindow() or query.group_by.len > 0)) {
+            return error.UnsupportedSql;
+        }
+        const where_corr = if (query.where) |e| sql.predicateIsCorrelated(e, &query) else false;
+
+        var folded_items = query.items;
+        var folded_having = query.having;
+        if (!items_corr) {
+            var fold = query;
+            fold.where = null;
+            if (having_corr) fold.having = null;
+            const folded = try self.rewritePreds(a, fold, stats, env);
+            folded_items = folded.items;
+            folded_having = if (having_corr) null else folded.having;
+        }
+
+        const star = try a.alloc(sql.SelectItem, 1);
+        star[0] = .star;
+        var scan = query;
+        scan.items = star;
+        scan.where = if (where_corr) try uncorrelatedAnd(a, query.where.?, &query) else query.where;
+        scan.group_by = &.{};
+        scan.having = null;
+        scan.order_by = &.{};
+        scan.distinct = false;
+        scan.limit = null;
+        scan.offset = null;
+        if (sql.hasCorrelation(&scan)) return error.UnsupportedSql;
+        var input = try self.runLeafEnv(a, scan, stats, env);
+
+        if (where_corr) {
+            const keep = try a.alloc(bool, input.len);
+            for (0..input.len) |row| {
+                const pred = try self.groundPred(a, query.where.?, &query, input, row, stats, env);
+                keep[row] = try physical.rowMatches(a, input, row, pred, query);
+            }
+            input = try physical.takeRows(a, input, keep);
+        }
+
+        if (items_corr) {
+            input = try self.projectCorrelated(a, input, query, stats, env);
+        }
+
+        var tail = query;
+        tail.where = null;
+        tail.join = null;
+        tail.from_sub = null;
+        if (items_corr) {
+            tail.items = star;
+            tail.having = null;
+            tail.group_by = &.{};
+        } else {
+            tail.items = folded_items;
+            tail.having = folded_having;
+        }
+        const shown = tail.items.len;
+        if (having_corr and query.group_by.len > 0) {
+            var items: std.ArrayList(sql.SelectItem) = .empty;
+            try items.appendSlice(a, tail.items);
+            for (query.group_by) |g| {
+                const dot = std.mem.lastIndexOfScalar(u8, g, '.');
+                const name = if (dot) |d| g[d + 1 ..] else g;
+                const qual: ?[]const u8 = if (dot) |d| (if (d == 0) null else g[0..d]) else null;
+                try items.append(a, .{ .column = .{ .name = name, .qualifier = qual, .alias = null } });
+            }
+            tail.items = items.items;
+        }
+        var out = try physical.executeOnBatch(a, input, tail);
+        if (having_corr) {
+            const keep = try a.alloc(bool, out.len);
+            for (0..out.len) |row| {
+                const pred = try self.groundPred(a, query.having.?, &query, out, row, stats, env);
+                keep[row] = try physical.rowMatches(a, out, row, pred, query);
+            }
+            out = try physical.takeRows(a, out, keep);
+            if (out.columns.len > shown) out.columns = out.columns[0..shown];
+        }
+        return out;
+    }
+
+    fn runLateral(
+        self: *Session,
+        a: std.mem.Allocator,
+        query: sql.Query,
+        stats: *ScanStats,
+        env: []const NamedBatch,
+    ) !Batch {
+        const j = query.join orelse return error.InvalidSyntax;
+        const sub = j.sub orelse return error.InvalidSyntax;
+        var left_q = query;
+        left_q.join = null;
+        left_q.items = &.{.star};
+        left_q.where = null;
+        left_q.group_by = &.{};
+        left_q.grouping_sets = &.{};
+        left_q.having = null;
+        left_q.order_by = &.{};
+        left_q.distinct = false;
+        left_q.limit = null;
+        left_q.offset = null;
+        left_q.ctes = &.{};
+        if (sql.hasCorrelation(&left_q)) return error.UnsupportedSql;
+        const left = try self.runLeafEnv(a, left_q, stats, env);
+        if (left.len == 0) {
+            var empty_q = query;
+            empty_q.join = null;
+            return physical.executeOnBatch(a, left, empty_q);
+        }
+        const star = try a.alloc(sql.SelectItem, 1);
+        star[0] = .star;
+        var acc: ?Batch = null;
+        for (0..left.len) |row| {
+            const keep = try a.alloc(bool, left.len);
+            @memset(keep, false);
+            keep[row] = true;
+            const one = try physical.takeRows(a, left, keep);
+            const bound = try self.bindQuery(a, sub.*, &query, left, row, stats, env);
+            const right = try self.runQueryEnv(a, bound, stats, env);
+            var piece_q = query;
+            var jj = j;
+            jj.eqs = &.{};
+            jj.using = &.{};
+            jj.natural = false;
+            jj.lateral = false;
+            jj.sub = null;
+            piece_q.join = jj;
+            piece_q.items = star;
+            piece_q.where = null;
+            piece_q.group_by = &.{};
+            piece_q.grouping_sets = &.{};
+            piece_q.having = null;
+            piece_q.order_by = &.{};
+            piece_q.distinct = false;
+            piece_q.limit = null;
+            piece_q.offset = null;
+            const piece = try physical.joinAndTail(a, one, right, piece_q);
+            acc = if (acc) |prev| try physical.concatUnion(a, prev, piece) else piece;
+        }
+        const joined = acc orelse return physical.executeOnBatch(a, left, query);
+        var tail = query;
+        tail.join = null;
+        tail.from_sub = null;
+        tail.where = query.where;
+        return physical.executeOnBatch(a, joined, tail);
+    }
+
+    fn projectCorrelated(
+        self: *Session,
+        a: std.mem.Allocator,
+        input: Batch,
+        query: sql.Query,
+        stats: *ScanStats,
+        env: []const NamedBatch,
+    ) !Batch {
+        const columns = try a.alloc(Column, query.items.len);
+        for (query.items, 0..) |item, i| {
+            switch (item) {
+                .column => |c| {
+                    const name = try qualifiedName(a, c.qualifier, c.name);
+                    const idx = try input.lookup(name);
+                    var col = input.columns[idx];
+                    col.name = c.alias orelse c.name;
+                    columns[i] = col;
+                },
+                .literal => |lit| {
+                    const values = try a.alloc(sql.Literal, input.len);
+                    for (values) |*slot| slot.* = lit.value;
+                    columns[i] = try columnFromLiterals(a, lit.name, values);
+                },
+                .expr => |ex| {
+                    const values = try a.alloc(sql.Literal, input.len);
+                    for (0..input.len) |row| {
+                        const grounded = try self.groundValue(a, ex.expr, &query, input, row, stats, env);
+                        values[row] = switch (grounded.*) {
+                            .literal => |v| v,
+                            .column => |n| try literalAt(a, input, n, row),
+                            else => return error.UnsupportedSql,
+                        };
+                    }
+                    columns[i] = try columnFromLiterals(a, ex.alias orelse ex.sql_text, values);
+                },
+                else => return error.UnsupportedSql,
+            }
+        }
+        return .{ .columns = columns, .len = input.len };
+    }
+
+    fn groundPred(
+        self: *Session,
+        a: std.mem.Allocator,
+        expr: *sql.BoolExpr,
+        outer: *const sql.Query,
+        batch: Batch,
+        row: usize,
+        stats: *ScanStats,
+        env: []const NamedBatch,
+    ) !*sql.BoolExpr {
+        switch (expr.*) {
+            .@"and" => |b| {
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .@"and" = .{
+                    .left = try self.groundPred(a, b.left, outer, batch, row, stats, env),
+                    .right = try self.groundPred(a, b.right, outer, batch, row, stats, env),
+                } };
+                return node;
+            },
+            .@"or" => |b| {
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .@"or" = .{
+                    .left = try self.groundPred(a, b.left, outer, batch, row, stats, env),
+                    .right = try self.groundPred(a, b.right, outer, batch, row, stats, env),
+                } };
+                return node;
+            },
+            .exists => |p| {
+                const bound = try self.bindQuery(a, p.query.*, outer, batch, row, stats, env);
+                const got = try self.runQueryEnv(a, bound, stats, env);
+                const present = got.len > 0;
+                return constPred(a, if (p.negated) !present else present);
+            },
+            .in_query => |p| {
+                const bound = try self.bindQuery(a, p.query.*, outer, batch, row, stats, env);
+                const got = try self.runQueryEnv(a, bound, stats, env);
+                const values = try batchToLiterals(a, got);
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .in_list = .{ .left = p.left, .values = values, .negated = p.negated } };
+                return node;
+            },
+            .cmp_query => |p| {
+                const bound = try self.bindQuery(a, p.query.*, outer, batch, row, stats, env);
+                const got = try self.runQueryEnv(a, bound, stats, env);
+                if (got.columns.len != 1) return error.TypeMismatch;
+                if (got.len > 1) return error.SubqueryCardinality;
+                const lit: sql.Literal = if (got.len == 0) .null else try cellToLiteral(a, got.columns[0], 0);
+                const right = try a.create(sql.Expr);
+                right.* = .{ .literal = lit };
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .cmp = .{ .op = p.op, .left = p.left, .right = right } };
+                return node;
+            },
+            .cmp => |c| {
+                if (!valueHasSub(c.left) and !valueHasSub(c.right)) return expr;
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .cmp = .{
+                    .op = c.op,
+                    .left = try self.groundValue(a, c.left, outer, batch, row, stats, env),
+                    .right = try self.groundValue(a, c.right, outer, batch, row, stats, env),
+                } };
+                return node;
+            },
+            else => return expr,
+        }
+    }
+
+    fn groundValue(
+        self: *Session,
+        a: std.mem.Allocator,
+        expr: *sql.Expr,
+        outer: *const sql.Query,
+        batch: Batch,
+        row: usize,
+        stats: *ScanStats,
+        env: []const NamedBatch,
+    ) !*sql.Expr {
+        switch (expr.*) {
+            .subquery => |q| {
+                const bound = try self.bindQuery(a, q.*, outer, batch, row, stats, env);
+                const got = try self.runQueryEnv(a, bound, stats, env);
+                if (got.columns.len != 1) return error.TypeMismatch;
+                if (got.len > 1) return error.SubqueryCardinality;
+                const lit: sql.Literal = if (got.len == 0) .null else try cellToLiteral(a, got.columns[0], 0);
+                const out = try a.create(sql.Expr);
+                out.* = .{ .literal = lit };
+                return out;
+            },
+            else => return expr,
+        }
+    }
+
+    fn bindQuery(
+        self: *Session,
+        a: std.mem.Allocator,
+        query: sql.Query,
+        outer: *const sql.Query,
+        batch: Batch,
+        row: usize,
+        stats: *ScanStats,
+        env: []const NamedBatch,
+    ) anyerror!sql.Query {
+        var out = query;
+        if (query.where) |e| out.where = try self.bindBool(a, e, &query, outer, batch, row, stats, env);
+        if (query.having) |e| out.having = try self.bindBool(a, e, &query, outer, batch, row, stats, env);
+        if (query.items.len > 0) {
+            const items = try a.alloc(sql.SelectItem, query.items.len);
+            for (query.items, 0..) |item, i| {
+                items[i] = try self.bindItem(a, item, &query, outer, batch, row, stats, env);
+            }
+            out.items = items;
+        }
+        if (query.ctes.len > 0) {
+            const ctes = try a.alloc(sql.Cte, query.ctes.len);
+            for (query.ctes, 0..) |cte, i| {
+                const body = try a.create(sql.Query);
+                body.* = try self.bindQuery(a, cte.query.*, outer, batch, row, stats, env);
+                ctes[i] = .{ .name = cte.name, .query = body, .recursive = cte.recursive };
+            }
+            out.ctes = ctes;
+        }
+        if (query.from_sub) |s| {
+            const sub = try a.create(sql.Query);
+            sub.* = try self.bindQuery(a, s.*, outer, batch, row, stats, env);
+            out.from_sub = sub;
+        }
+        if (query.join) |j| {
+            var jj = j;
+            for (j.eqs) |eq| {
+                if (eq.left.qualifier) |qual| {
+                    if (sql.aliasIsOuter(qual, &query, outer)) return error.UnsupportedSql;
+                }
+                if (eq.right.qualifier) |qual| {
+                    if (sql.aliasIsOuter(qual, &query, outer)) return error.UnsupportedSql;
+                }
+            }
+            if (j.sub) |s| {
+                const sub = try a.create(sql.Query);
+                sub.* = try self.bindQuery(a, s.*, outer, batch, row, stats, env);
+                jj.sub = sub;
+            }
+            out.join = jj;
+        }
+        if (query.union_right) |r| {
+            const u = try a.create(sql.Query);
+            u.* = try self.bindQuery(a, r.*, outer, batch, row, stats, env);
+            out.union_right = u;
+        }
+        return out;
+    }
+
+    fn bindItem(
+        self: *Session,
+        a: std.mem.Allocator,
+        item: sql.SelectItem,
+        inner: *const sql.Query,
+        outer: *const sql.Query,
+        batch: Batch,
+        row: usize,
+        stats: *ScanStats,
+        env: []const NamedBatch,
+    ) !sql.SelectItem {
+        switch (item) {
+            .column => |c| {
+                if (c.qualifier) |q| {
+                    if (sql.aliasIsOuter(q, inner, outer)) {
+                        const lit = try literalAt(a, batch, try qualifiedName(a, q, c.name), row);
+                        return .{ .literal = .{ .value = lit, .name = c.alias orelse c.name } };
+                    }
+                }
+                return item;
+            },
+            .expr => |ex| {
+                var copied = ex;
+                copied.expr = try self.bindValue(a, ex.expr, inner, outer, batch, row, stats, env);
+                return .{ .expr = copied };
+            },
+            else => return item,
+        }
+    }
+
+    fn bindBool(
+        self: *Session,
+        a: std.mem.Allocator,
+        expr: *sql.BoolExpr,
+        inner: *const sql.Query,
+        outer: *const sql.Query,
+        batch: Batch,
+        row: usize,
+        stats: *ScanStats,
+        env: []const NamedBatch,
+    ) anyerror!*sql.BoolExpr {
+        switch (expr.*) {
+            .@"and" => |b| {
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .@"and" = .{
+                    .left = try self.bindBool(a, b.left, inner, outer, batch, row, stats, env),
+                    .right = try self.bindBool(a, b.right, inner, outer, batch, row, stats, env),
+                } };
+                return node;
+            },
+            .@"or" => |b| {
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .@"or" = .{
+                    .left = try self.bindBool(a, b.left, inner, outer, batch, row, stats, env),
+                    .right = try self.bindBool(a, b.right, inner, outer, batch, row, stats, env),
+                } };
+                return node;
+            },
+            .cmp => |c| {
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .cmp = .{
+                    .op = c.op,
+                    .left = try self.bindValue(a, c.left, inner, outer, batch, row, stats, env),
+                    .right = try self.bindValue(a, c.right, inner, outer, batch, row, stats, env),
+                } };
+                return node;
+            },
+            .exists => |p| {
+                const owned = try a.create(sql.Query);
+                owned.* = try self.bindQuery(a, p.query.*, outer, batch, row, stats, env);
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .exists = .{ .query = owned, .negated = p.negated } };
+                return node;
+            },
+            .in_query => |p| {
+                if (p.left == .column and sql.refersOuter(p.left.column, inner, outer)) {
+                    const bound = try self.bindQuery(a, p.query.*, outer, batch, row, stats, env);
+                    const got = try self.runQueryEnv(a, bound, stats, env);
+                    const lit = try literalAt(a, batch, p.left.column, row);
+                    if (lit == .null) return constPred(a, false);
+                    const values = try batchToLiterals(a, got);
+                    var found = false;
+                    for (values) |v| {
+                        if (try litsCmp(.eq, lit, v)) found = true;
+                    }
+                    return constPred(a, if (p.negated) !found else found);
+                }
+                const owned = try a.create(sql.Query);
+                owned.* = try self.bindQuery(a, p.query.*, outer, batch, row, stats, env);
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .in_query = .{ .left = p.left, .query = owned, .negated = p.negated } };
+                return node;
+            },
+            .cmp_query => |p| {
+                const left = try self.bindValue(a, p.left, inner, outer, batch, row, stats, env);
+                const owned = try a.create(sql.Query);
+                owned.* = try self.bindQuery(a, p.query.*, outer, batch, row, stats, env);
+                const node = try a.create(sql.BoolExpr);
+                node.* = .{ .cmp_query = .{ .op = p.op, .left = left, .query = owned } };
+                return node;
+            },
+            .isnull => |p| {
+                if (p.left == .column and sql.refersOuter(p.left.column, inner, outer)) {
+                    const lit = try literalAt(a, batch, p.left.column, row);
+                    const is_null = lit == .null;
+                    return constPred(a, if (p.negated) !is_null else is_null);
+                }
+                return expr;
+            },
+            .in_list => |p| {
+                if (p.left == .column and sql.refersOuter(p.left.column, inner, outer)) {
+                    const lit = try literalAt(a, batch, p.left.column, row);
+                    if (lit == .null) return constPred(a, false);
+                    var found = false;
+                    for (p.values) |v| {
+                        if (try litsCmp(.eq, lit, v)) found = true;
+                    }
+                    return constPred(a, if (p.negated) !found else found);
+                }
+                return expr;
+            },
+            .between => |p| {
+                if (p.left == .column and sql.refersOuter(p.left.column, inner, outer)) {
+                    const lit = try literalAt(a, batch, p.left.column, row);
+                    const inside = (try litsCmp(.ge, lit, p.lo)) and (try litsCmp(.le, lit, p.hi));
+                    return constPred(a, if (p.negated) !inside else inside);
+                }
+                return expr;
+            },
+            .like => |p| {
+                if (p.left == .column and sql.refersOuter(p.left.column, inner, outer)) return error.UnsupportedSql;
+                return expr;
+            },
+        }
+    }
+
+    fn bindValue(
+        self: *Session,
+        a: std.mem.Allocator,
+        expr: *sql.Expr,
+        inner: *const sql.Query,
+        outer: *const sql.Query,
+        batch: Batch,
+        row: usize,
+        stats: *ScanStats,
+        env: []const NamedBatch,
+    ) !*sql.Expr {
+        switch (expr.*) {
+            .column => |n| {
+                if (!sql.refersOuter(n, inner, outer)) return expr;
+                const out = try a.create(sql.Expr);
+                out.* = .{ .literal = try literalAt(a, batch, n, row) };
+                return out;
+            },
+            .subquery => |q| {
+                const owned = try a.create(sql.Query);
+                owned.* = try self.bindQuery(a, q.*, outer, batch, row, stats, env);
+                const out = try a.create(sql.Expr);
+                out.* = .{ .subquery = owned };
+                return out;
+            },
+            .binary => |b| {
+                const out = try a.create(sql.Expr);
+                out.* = .{ .binary = .{
+                    .op = b.op,
+                    .left = try self.bindValue(a, b.left, inner, outer, batch, row, stats, env),
+                    .right = try self.bindValue(a, b.right, inner, outer, batch, row, stats, env),
+                } };
+                return out;
+            },
+            .unary_minus => |arg| {
+                const out = try a.create(sql.Expr);
+                out.* = .{ .unary_minus = try self.bindValue(a, arg, inner, outer, batch, row, stats, env) };
+                return out;
+            },
+            .call => |c| {
+                const args = try a.alloc(*sql.Expr, c.args.len);
+                for (c.args, 0..) |arg, i| {
+                    args[i] = try self.bindValue(a, arg, inner, outer, batch, row, stats, env);
+                }
+                var call = c;
+                call.args = args;
+                const out = try a.create(sql.Expr);
+                out.* = .{ .call = call };
+                return out;
+            },
+            else => return expr,
+        }
+    }
+
     fn registerCatalog(
         self: *Session,
         name: []const u8,
@@ -800,9 +1466,17 @@ pub const Session = struct {
                 return self.showNamespaces(a, entry);
             },
             .tables => |t| {
-                const cat_name = t.catalog orelse self.default_catalog;
+                if (t.catalog) |cat_name| {
+                    if (std.ascii.eqlIgnoreCase(cat_name, "temp")) {
+                        if (t.namespace != null) return error.InvalidSyntax;
+                        return self.showTempTables(a);
+                    }
+                    const entry = self.findCatalog(cat_name) orelse return error.TableNotFound;
+                    return self.showTables(a, entry, t.namespace, false);
+                }
+                const cat_name = self.default_catalog;
                 const entry = self.findCatalog(cat_name) orelse return error.TableNotFound;
-                return self.showTables(a, entry, t.namespace);
+                return self.showTables(a, entry, t.namespace, true);
             },
         }
     }
@@ -843,7 +1517,7 @@ pub const Session = struct {
         return catalog.utf8Cols(a, &.{ "name", "catalog" }, &.{ names.items, cats.items });
     }
 
-    fn showTables(self: *Session, a: std.mem.Allocator, entry: catalog.Entry, namespace: ?[]const u8) !Batch {
+    fn showTables(self: *Session, a: std.mem.Allocator, entry: catalog.Entry, namespace: ?[]const u8, include_temps: bool) !Batch {
         var names: std.ArrayList([]const u8) = .empty;
         var cats: std.ArrayList([]const u8) = .empty;
         var nss: std.ArrayList([]const u8) = .empty;
@@ -914,6 +1588,7 @@ pub const Session = struct {
                 } else |_| {}
             },
         }
+        if (include_temps) try self.appendTempNames(a, &names, &cats, &nss);
         return catalog.utf8Cols(a, &.{ "name", "catalog", "namespace" }, &.{
             names.items, cats.items, nss.items,
         });
@@ -938,10 +1613,13 @@ pub const Session = struct {
             !iceberg.isTableDir(cat_a, self.transport(), src))
         {
             const missing = isMissingLocal(self.io, src);
-            if (glacier_catalog.isCatalog(cat_a, self.transport(), src) or
-                glacier_catalog.isEmptyDir(cat_a, self.transport(), src) or
-                missing)
-            {
+            if (glacier_catalog.isCatalog(cat_a, self.transport(), src)) {
+                try self.registerCatalog(att.name, .glacier, "", &.{}, null, &.{}, false, src);
+                return catalog.utf8Cols(a, &.{ "name", "type" }, &.{
+                    &.{att.name}, &.{catalog.Kind.glacier.label()},
+                });
+            }
+            if (glacier_catalog.isEmptyDir(cat_a, self.transport(), src) or missing) {
                 try glacier_catalog.ensure(cat_a, self.io, src);
                 try self.registerCatalog(att.name, .glacier, "", &.{}, null, &.{}, false, src);
                 return catalog.utf8Cols(a, &.{ "name", "type" }, &.{
@@ -967,6 +1645,10 @@ pub const Session = struct {
         if (ident.len == 0) return error.InvalidSyntax;
         if (try parseGlacierSystem(ident)) |sys| return describeSystem(a, sys.kind);
         if (try self.parseSystemSuffix(a, ident)) |sys| return describeSystem(a, sys.kind);
+        if (self.findTempIndex(ident)) |i| {
+            const fields = try fieldsFromBatch(a, self.temps.items[i].batch);
+            return describeFields(a, fields);
+        }
 
         if (std.mem.indexOfScalar(u8, ident, '.')) |dot| {
             const head = ident[0..dot];
@@ -1187,6 +1869,7 @@ pub const Session = struct {
     }
 
     fn executeCreateTable(self: *Session, a: std.mem.Allocator, ct: sql.CreateTable) !Batch {
+        if (ct.temporary) return self.executeCreateTemp(a, ct);
         try refuseWrite();
         const target = try self.resolveWrite(a, ct.ident);
         const fields = if (ct.as_select) |q| blk: {
@@ -1229,6 +1912,111 @@ pub const Session = struct {
         });
     }
 
+    fn executeCreateTemp(self: *Session, a: std.mem.Allocator, ct: sql.CreateTable) !Batch {
+        if (std.mem.indexOfScalar(u8, ct.ident, '.') != null) return error.InvalidSyntax;
+        if (ct.partition_by.len != 0) return error.UnsupportedSql;
+        if (self.findTempIndex(ct.ident) != null) return error.InvalidSyntax;
+        const built = if (ct.as_select) |q| blk: {
+            var stats: ScanStats = .{};
+            const input = try self.runQuery(a, q, &stats);
+            if (input.columns.len == 0) return error.InvalidSyntax;
+            break :blk input;
+        } else blk: {
+            if (ct.columns.len == 0) return error.InvalidSyntax;
+            const fields = try fieldsFromColDefs(a, ct.columns);
+            break :blk try emptyBatch(a, fields);
+        };
+        try self.storeTemp(ct.ident, built);
+        return catalog.utf8Cols(a, &.{ "name", "catalog", "namespace" }, &.{
+            &.{ct.ident}, &.{"temp"}, &.{""},
+        });
+    }
+
+    fn executeInsertTemp(self: *Session, a: std.mem.Allocator, ins: sql.Insert) !Batch {
+        const idx = self.findTempIndex(ins.ident) orelse return error.TableNotFound;
+        var stats: ScanStats = .{};
+        const input = try self.runQuery(a, ins.query, &stats);
+        const fields = try fieldsFromBatch(a, self.temps.items[idx].batch);
+        const aligned = try alignToFields(a, input, fields);
+        const merged = try physical.concatUnion(a, self.temps.items[idx].batch, aligned);
+        try self.storeTemp(self.temps.items[idx].name, merged);
+        return countCol(a, "inserted", @intCast(aligned.len));
+    }
+
+    fn executeDropTemp(self: *Session, a: std.mem.Allocator, ident: []const u8) !Batch {
+        const idx = self.findTempIndex(ident) orelse return error.TableNotFound;
+        const name = self.temps.items[idx].name;
+        const shown = try a.dupe(u8, name);
+        self.freeTempAt(idx);
+        return catalog.utf8Cols(a, &.{ "name", "catalog", "namespace" }, &.{
+            &.{shown}, &.{"temp"}, &.{""},
+        });
+    }
+
+    fn showTempTables(self: *Session, a: std.mem.Allocator) !Batch {
+        var names: std.ArrayList([]const u8) = .empty;
+        var cats: std.ArrayList([]const u8) = .empty;
+        var nss: std.ArrayList([]const u8) = .empty;
+        try self.appendTempNames(a, &names, &cats, &nss);
+        return catalog.utf8Cols(a, &.{ "name", "catalog", "namespace" }, &.{
+            names.items, cats.items, nss.items,
+        });
+    }
+
+    fn appendTempNames(
+        self: *Session,
+        a: std.mem.Allocator,
+        names: *std.ArrayList([]const u8),
+        cats: *std.ArrayList([]const u8),
+        nss: *std.ArrayList([]const u8),
+    ) !void {
+        for (self.temps.items) |t| {
+            try names.append(a, t.name);
+            try cats.append(a, "temp");
+            try nss.append(a, "");
+        }
+    }
+
+    fn findTempIndex(self: *const Session, name: []const u8) ?usize {
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '.') != null) return null;
+        for (self.temps.items, 0..) |t, i| {
+            if (std.ascii.eqlIgnoreCase(t.name, name)) return i;
+        }
+        return null;
+    }
+
+    fn copyTemp(self: *Session, a: std.mem.Allocator, name: []const u8) !?Batch {
+        const i = self.findTempIndex(name) orelse return null;
+        return try cloneBatch(a, self.temps.items[i].batch);
+    }
+
+    fn storeTemp(self: *Session, name: []const u8, batch: Batch) !void {
+        const owned = try cloneBatch(self.gpa, batch);
+        errdefer freeOwnedBatch(self.gpa, owned);
+        if (self.findTempIndex(name)) |i| {
+            freeOwnedBatch(self.gpa, self.temps.items[i].batch);
+            self.temps.items[i].batch = owned;
+            return;
+        }
+        const owned_name = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned_name);
+        try self.temps.append(self.gpa, .{ .name = owned_name, .batch = owned });
+    }
+
+    fn freeTempAt(self: *Session, idx: usize) void {
+        const t = self.temps.swapRemove(idx);
+        self.gpa.free(t.name);
+        freeOwnedBatch(self.gpa, t.batch);
+    }
+
+    fn freeTemps(self: *Session) void {
+        for (self.temps.items) |t| {
+            self.gpa.free(t.name);
+            freeOwnedBatch(self.gpa, t.batch);
+        }
+        self.temps.deinit(self.gpa);
+    }
+
     fn restCreateAndMaybeInsert(
         self: *Session,
         a: std.mem.Allocator,
@@ -1266,6 +2054,7 @@ pub const Session = struct {
     }
 
     fn executeInsert(self: *Session, a: std.mem.Allocator, ins: sql.Insert) !Batch {
+        if (self.findTempIndex(ins.ident) != null) return self.executeInsertTemp(a, ins);
         try refuseWrite();
         const target = try self.resolveWrite(a, ins.ident);
         var stats: ScanStats = .{};
@@ -1307,6 +2096,292 @@ pub const Session = struct {
         const columns = try a.alloc(Column, 1);
         columns[0] = try catalog.i64Col(a, "deleted", n);
         return .{ .columns = columns, .len = 1 };
+    }
+
+    fn executeCompact(self: *Session, a: std.mem.Allocator, c: sql.CompactTable) !Batch {
+        if (self.findTempIndex(c.ident) != null) return error.UnsupportedSql;
+        try refuseWrite();
+        const target = try self.resolveWrite(a, c.ident);
+        const shape = try self.icebergShape(a, target);
+        var stats: ScanStats = .{};
+        const q: sql.Query = .{
+            .items = try a.dupe(sql.SelectItem, &.{.star}),
+            .from = c.ident,
+            .where = null,
+            .group_by = &.{},
+            .having = null,
+            .order_by = &.{},
+            .distinct = false,
+            .limit = null,
+            .offset = null,
+        };
+        const input = try self.runQuery(a, q, &stats);
+        const already = shape.data <= 1 and shape.deletes == 0;
+        const rows: i64 = @intCast(input.len);
+        const files: i64 = if (already)
+            @intCast(shape.data)
+        else blk: {
+            const aligned = if (input.len == 0) input else try alignToFields(a, input, try self.writeSchema(a, target));
+            break :blk try self.replaceAligned(a, target, aligned);
+        };
+        const row_vals = try a.alloc(i64, 1);
+        const file_vals = try a.alloc(i64, 1);
+        row_vals[0] = rows;
+        file_vals[0] = files;
+        const columns = try a.alloc(Column, 2);
+        columns[0] = try catalog.i64Col(a, "rows", row_vals);
+        columns[1] = try catalog.i64Col(a, "files", file_vals);
+        return .{ .columns = columns, .len = 1 };
+    }
+
+    fn executeExpire(self: *Session, a: std.mem.Allocator, e: sql.ExpireSnapshots) !Batch {
+        if (self.findTempIndex(e.ident) != null) return error.UnsupportedSql;
+        try refuseWrite();
+        const target = try self.resolveWrite(a, e.ident);
+        if (target.dir.len == 0) return error.WriteUnsupported;
+        const table = try iceberg.openTable(a, self.transport(), target.dir);
+        const ids = try iceberg.nonCurrentSnapshotIds(a, table);
+        if (e.execute) try iceberg.expireOldSnapshots(a, self.transport(), table);
+        self.clearTableCache();
+        const columns = try a.alloc(Column, 1);
+        columns[0] = try catalog.i64Col(a, "snapshot_id", ids);
+        return .{ .columns = columns, .len = ids.len };
+    }
+
+    fn executeRemoveOrphans(self: *Session, a: std.mem.Allocator, r: sql.RemoveOrphans) !Batch {
+        if (self.findTempIndex(r.ident) != null) return error.UnsupportedSql;
+        try refuseWrite();
+        const target = try self.resolveWrite(a, r.ident);
+        if (target.dir.len == 0) return error.WriteUnsupported;
+        const paths = try iceberg.orphanFiles(a, self.transport(), target.dir, r.execute);
+        self.clearTableCache();
+        const columns = try a.alloc(Column, 1);
+        columns[0] = try catalog.utf8Col(a, "path", paths);
+        return .{ .columns = columns, .len = paths.len };
+    }
+
+    fn joinUsingList(self: *Session, a: std.mem.Allocator, names: []const []const u8) ![]const u8 {
+        _ = self;
+        var buf: std.ArrayList(u8) = .empty;
+        for (names, 0..) |name, i| {
+            if (i != 0) try buf.appendSlice(a, ", ");
+            try buf.appendSlice(a, name);
+        }
+        return buf.toOwnedSlice(a);
+    }
+
+    fn executeExplain(self: *Session, a: std.mem.Allocator, ex: sql.Explain) !Batch {
+        var buf: std.ArrayList(u8) = .empty;
+        try self.writeExplain(a, &buf, ex.query);
+        const text = try buf.toOwnedSlice(a);
+        const lines = try a.alloc([]const u8, 1);
+        lines[0] = text;
+        const columns = try a.alloc(Column, 1);
+        columns[0] = try catalog.utf8Col(a, "plan", lines);
+        return .{ .columns = columns, .len = 1 };
+    }
+
+    fn writeExplain(self: *Session, a: std.mem.Allocator, buf: *std.ArrayList(u8), query: sql.Query) anyerror!void {
+        try self.writeExplainInner(a, buf, query, true);
+    }
+
+    fn writeExplainInner(
+        self: *Session,
+        a: std.mem.Allocator,
+        buf: *std.ArrayList(u8),
+        query: sql.Query,
+        print_ctes: bool,
+    ) !void {
+        if (print_ctes) {
+            for (query.ctes) |cte| {
+                try buf.appendSlice(a, "cte ");
+                try buf.appendSlice(a, cte.name);
+                try buf.append(a, '\n');
+                try self.writeExplain(a, buf, cte.query.*);
+            }
+        }
+        if (query.union_right) |right| {
+            var left = query;
+            left.union_right = null;
+            try self.writeExplainInner(a, buf, left, false);
+            try buf.appendSlice(a, if (query.union_all) "union_all\n" else "union\n");
+            try self.writeExplainInner(a, buf, right.*, false);
+            return;
+        }
+        try self.writeExplainLeaf(a, buf, query);
+    }
+
+    fn writeExplainLeaf(self: *Session, a: std.mem.Allocator, buf: *std.ArrayList(u8), query: sql.Query) !void {
+        if (query.isNoFrom()) {
+            try buf.appendSlice(a, "project\n");
+            return;
+        }
+        if (query.join) |j| {
+            try self.writeExplainInput(a, buf, query.from, query.from_sub, query.as_of, query.ctes);
+            try self.writeExplainInput(a, buf, j.table, j.sub, null, query.ctes);
+            const line = if (j.using.len == 0)
+                try std.fmt.allocPrint(a, "hash_join {s}\n", .{@tagName(j.kind)})
+            else
+                try std.fmt.allocPrint(a, "hash_join {s} using {s}\n", .{ @tagName(j.kind), try self.joinUsingList(a, j.using) });
+            try buf.appendSlice(a, line);
+            try self.writeExplainTail(a, buf, query);
+            return;
+        }
+        if (query.from_sub) |sub| {
+            try self.writeExplain(a, buf, sub.*);
+            try buf.appendSlice(a, "scan memory\n");
+            try self.writeExplainTail(a, buf, query);
+            return;
+        }
+        if (try self.explainMemory(a, buf, query.from, query.ctes)) {
+            try self.writeExplainTail(a, buf, query);
+            return;
+        }
+        try self.appendFileScan(a, buf, query.from, query.as_of, query);
+        try self.writeExplainTail(a, buf, query);
+    }
+
+    fn writeExplainInput(
+        self: *Session,
+        a: std.mem.Allocator,
+        buf: *std.ArrayList(u8),
+        name: []const u8,
+        sub: ?*sql.Query,
+        as_of: ?sql.AsOf,
+        ctes: []const sql.Cte,
+    ) !void {
+        if (sub) |q| {
+            try self.writeExplain(a, buf, q.*);
+            try buf.appendSlice(a, "scan memory\n");
+            return;
+        }
+        if (try self.explainMemory(a, buf, name, ctes)) return;
+        try self.appendFileScan(a, buf, name, as_of, scanAll(name));
+    }
+
+    /// System tables, temps, and CTE names are scans of a batch already in memory.
+    fn explainMemory(
+        self: *Session,
+        a: std.mem.Allocator,
+        buf: *std.ArrayList(u8),
+        name: []const u8,
+        ctes: []const sql.Cte,
+    ) !bool {
+        if (try parseGlacierSystem(name)) |_| {
+            try appendScanMemory(a, buf, name);
+            return true;
+        }
+        if (name.len > 0) {
+            if (try self.parseSystemSuffix(a, name)) |_| {
+                try appendScanMemory(a, buf, name);
+                return true;
+            }
+        }
+        for (ctes) |cte| {
+            if (std.ascii.eqlIgnoreCase(cte.name, name)) {
+                try appendScanMemory(a, buf, name);
+                return true;
+            }
+        }
+        for (self.temps.items) |t| {
+            if (std.ascii.eqlIgnoreCase(t.name, name)) {
+                try appendScanMemory(a, buf, name);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn appendFileScan(
+        self: *Session,
+        a: std.mem.Allocator,
+        buf: *std.ArrayList(u8),
+        name: []const u8,
+        as_of: ?sql.AsOf,
+        shape: sql.Query,
+    ) !void {
+        const files = try self.filesFor(a, name, toIcebergAsOf(as_of));
+        var pruned: usize = 0;
+        if (shape.where) |expr| {
+            for (files) |file| {
+                if (iceberg.canSkipFile(file, expr)) pruned += 1;
+            }
+        }
+        const label = if (name.len == 0) self.table_name else name;
+        const mode = physical.explainScanMode(shape, files);
+        const line = try std.fmt.allocPrint(a, "scan {s} files={d} pruned={d} mode={s}", .{ label, files.len, pruned, mode });
+        try buf.appendSlice(a, line);
+        var deletes = false;
+        var has_parquet = false;
+        for (files) |file| {
+            if (file.deleted_pos.len > 0 or file.eq_deletes.len > 0) deletes = true;
+            if (file.format == .parquet) has_parquet = true;
+        }
+        if (deletes) try buf.appendSlice(a, " deletes");
+        if (shape.where != null and has_parquet) try buf.appendSlice(a, " row_group_filter");
+        try buf.append(a, '\n');
+    }
+
+    fn writeExplainTail(self: *Session, a: std.mem.Allocator, buf: *std.ArrayList(u8), query: sql.Query) !void {
+        _ = self;
+        if (query.where) |expr| {
+            try buf.appendSlice(a, "filter ");
+            try writePred(a, buf, expr);
+            try buf.append(a, '\n');
+        }
+        if (query.needsAgg() and query.group_by.len == 0) {
+            try buf.appendSlice(a, "aggregate\n");
+        } else if (query.needsAgg()) {
+            try buf.appendSlice(a, "hash_aggregate\n");
+        }
+        if (query.grouping_sets.len > 0) {
+            const line = try std.fmt.allocPrint(a, "grouping_sets {d}\n", .{query.grouping_sets.len});
+            try buf.appendSlice(a, line);
+        }
+        if (query.having != null) try buf.appendSlice(a, "having\n");
+        if (query.hasWindow()) try buf.appendSlice(a, "window\n");
+        if (query.distinct) try buf.appendSlice(a, "distinct\n");
+        if (query.order_by.len > 0) try buf.appendSlice(a, "order_by\n");
+        if (query.limit != null or query.offset != null) try buf.appendSlice(a, "limit\n");
+    }
+
+    fn icebergShape(self: *Session, a: std.mem.Allocator, target: WriteTarget) !struct { data: usize, deletes: usize } {
+        if (target.entry.kind == .iceberg_rest) {
+            const client = target.entry.rest orelse return error.WriteUnsupported;
+            const loaded = try client.loadTable(a, self.transport(), target.ns, target.name);
+            try self.applyCatalogConfig(loaded.config);
+            const table = try iceberg.openFromMetadata(
+                a,
+                self.transport(),
+                loaded.metadata,
+                rest_catalog.fileBase(loaded),
+            );
+            return .{ .data = table.files.len, .deletes = table.delete_files.len };
+        }
+        const table = try iceberg.openTable(a, self.transport(), target.dir);
+        return .{ .data = table.files.len, .deletes = table.delete_files.len };
+    }
+
+    fn replaceAligned(self: *Session, a: std.mem.Allocator, target: WriteTarget, live: Batch) !i64 {
+        const written: usize = if (target.entry.kind == .iceberg_rest) blk: {
+            const client = target.entry.rest orelse return error.WriteUnsupported;
+            const loaded = try client.loadTable(a, self.transport(), target.ns, target.name);
+            try self.applyCatalogConfig(loaded.config);
+            const table = try iceberg.openFromMetadata(
+                a,
+                self.transport(),
+                loaded.metadata,
+                rest_catalog.fileBase(loaded),
+            );
+            const appended = try iceberg.replaceWithBatch(a, self.transport(), table, live);
+            _ = try client.commitAppend(a, self.transport(), target.ns, target.name, table.metadata, appended);
+            break :blk appended.files_written;
+        } else blk: {
+            const appended = try iceberg.replaceBatch(a, self.io, target.dir, live);
+            break :blk appended.files_written;
+        };
+        self.clearTableCache();
+        return @intCast(written);
     }
 
     fn executeUpdate(self: *Session, a: std.mem.Allocator, upd: sql.Update) !Batch {
@@ -1570,6 +2645,7 @@ pub const Session = struct {
     }
 
     fn executeDropTable(self: *Session, a: std.mem.Allocator, d: sql.DropTable) !Batch {
+        if (self.findTempIndex(d.ident) != null) return self.executeDropTemp(a, d.ident);
         try refuseWrite();
         const target = try self.resolveWrite(a, d.ident);
         if (target.entry.kind == .iceberg_rest) {
@@ -1971,7 +3047,7 @@ pub const Session = struct {
                         } else |_| {}
                     }
                     if (!listed) {
-                        const part = try self.showTables(a, entry, null);
+                        const part = try self.showTables(a, entry, null, false);
                         var i: usize = 0;
                         while (i < part.len) : (i += 1) {
                             try names.append(a, part.columns[0].strAt(i));
@@ -1982,6 +3058,7 @@ pub const Session = struct {
                 },
             }
         }
+        try self.appendTempNames(a, &names, &cats, &nss);
         return catalog.utf8Cols(a, &.{ "name", "catalog", "namespace" }, &.{
             names.items, cats.items, nss.items,
         });
@@ -2119,6 +3196,128 @@ fn predHasSub(expr: ?*sql.BoolExpr) bool {
     };
 }
 
+fn uncorrelatedAnd(a: std.mem.Allocator, expr: *sql.BoolExpr, outer: *const sql.Query) !?*sql.BoolExpr {
+    var parts: std.ArrayList(*sql.BoolExpr) = .empty;
+    try collectPush(a, expr, outer, &parts);
+    if (parts.items.len == 0) return null;
+    var acc = parts.items[0];
+    for (parts.items[1..]) |n| {
+        const node = try a.create(sql.BoolExpr);
+        node.* = .{ .@"and" = .{ .left = acc, .right = n } };
+        acc = node;
+    }
+    return acc;
+}
+
+fn collectPush(
+    a: std.mem.Allocator,
+    expr: *sql.BoolExpr,
+    outer: *const sql.Query,
+    parts: *std.ArrayList(*sql.BoolExpr),
+) !void {
+    if (expr.* == .@"and") {
+        try collectPush(a, expr.@"and".left, outer, parts);
+        try collectPush(a, expr.@"and".right, outer, parts);
+        return;
+    }
+    if (!sql.predicateIsCorrelated(expr, outer)) try parts.append(a, expr);
+}
+
+fn constPred(a: std.mem.Allocator, ok: bool) !*sql.BoolExpr {
+    const left = try a.create(sql.Expr);
+    left.* = .{ .literal = .{ .int = 1 } };
+    const right = try a.create(sql.Expr);
+    right.* = .{ .literal = .{ .int = if (ok) 1 else 0 } };
+    const node = try a.create(sql.BoolExpr);
+    node.* = .{ .cmp = .{ .op = .eq, .left = left, .right = right } };
+    return node;
+}
+
+fn qualifiedName(a: std.mem.Allocator, qualifier: ?[]const u8, name: []const u8) ![]const u8 {
+    const q = qualifier orelse return name;
+    return std.fmt.allocPrint(a, "{s}.{s}", .{ q, name });
+}
+
+fn literalAt(a: std.mem.Allocator, batch: Batch, name: []const u8, row: usize) !sql.Literal {
+    const idx = try batch.lookup(name);
+    return cellToLiteral(a, batch.columns[idx], row);
+}
+
+fn litsCmp(op: sql.CmpOp, left: sql.Literal, right: sql.Literal) !bool {
+    if (left == .null or right == .null) return false;
+    const ord: std.math.Order = switch (left) {
+        .int => |l| switch (right) {
+            .int => |r| std.math.order(l, r),
+            .float => |r| std.math.order(@as(f64, @floatFromInt(l)), r),
+            else => return error.TypeMismatch,
+        },
+        .float => |l| switch (right) {
+            .float => |r| std.math.order(l, r),
+            .int => |r| std.math.order(l, @as(f64, @floatFromInt(r))),
+            else => return error.TypeMismatch,
+        },
+        .string => |l| switch (right) {
+            .string => |r| std.mem.order(u8, l, r),
+            else => return error.TypeMismatch,
+        },
+        .null => unreachable,
+    };
+    return switch (op) {
+        .eq => ord == .eq,
+        .ne => ord != .eq,
+        .lt => ord == .lt,
+        .le => ord != .gt,
+        .gt => ord == .gt,
+        .ge => ord != .lt,
+    };
+}
+
+fn columnFromLiterals(a: std.mem.Allocator, name: []const u8, values: []const sql.Literal) !Column {
+    var kind: ?std.meta.Tag(sql.Literal) = null;
+    for (values) |v| {
+        if (v == .null) continue;
+        if (kind == null) kind = v else if (kind.? != v) return error.TypeMismatch;
+    }
+    const tag = kind orelse .int;
+    var valid: []u8 = &.{};
+    var any_null = false;
+    for (values) |v| if (v == .null) {
+        any_null = true;
+    };
+    if (any_null) {
+        valid = try a.alloc(u8, values.len);
+        for (values, 0..) |v, i| valid[i] = if (v == .null) 0 else 1;
+    }
+    return switch (tag) {
+        .int, .null => blk: {
+            const nums = try a.alloc(i64, values.len);
+            for (values, 0..) |v, i| nums[i] = if (v == .int) v.int else 0;
+            break :blk .{ .name = name, .data_type = .int64, .len = values.len, .i64s = nums, .valid = valid };
+        },
+        .float => blk: {
+            const nums = try a.alloc(f64, values.len);
+            for (values, 0..) |v, i| nums[i] = if (v == .float) v.float else 0;
+            break :blk .{ .name = name, .data_type = .float64, .len = values.len, .f64s = nums, .valid = valid };
+        },
+        .string => blk: {
+            var bytes: std.ArrayList(u8) = .empty;
+            const offs = try a.alloc(u32, values.len + 1);
+            offs[0] = 0;
+            for (values, 0..) |v, i| {
+                if (v == .string) try bytes.appendSlice(a, v.string);
+                offs[i + 1] = @intCast(bytes.items.len);
+            }
+            break :blk .{
+                .name = name,
+                .data_type = .utf8,
+                .len = values.len,
+                .utf8 = .{ .offsets = offs, .bytes = try bytes.toOwnedSlice(a) },
+                .valid = valid,
+            };
+        },
+    };
+}
+
 fn batchToLiterals(a: std.mem.Allocator, batch: Batch) ![]const sql.Literal {
     if (batch.columns.len != 1) return error.TypeMismatch;
     const col = batch.columns[0];
@@ -2157,6 +3356,68 @@ const SystemTable = struct {
     kind: SystemKind,
     ident: []const u8,
 };
+
+fn appendScanMemory(a: std.mem.Allocator, buf: *std.ArrayList(u8), name: []const u8) !void {
+    if (name.len == 0) {
+        try buf.appendSlice(a, "scan memory\n");
+        return;
+    }
+    const line = try std.fmt.allocPrint(a, "scan memory {s}\n", .{name});
+    try buf.appendSlice(a, line);
+}
+
+fn writePred(a: std.mem.Allocator, buf: *std.ArrayList(u8), expr: *const sql.BoolExpr) !void {
+    switch (expr.*) {
+        .cmp => |c| {
+            try writePlanExpr(a, buf, c.left);
+            try buf.append(a, ' ');
+            try buf.appendSlice(a, switch (c.op) {
+                .eq => "=",
+                .ne => "<>",
+                .lt => "<",
+                .le => "<=",
+                .gt => ">",
+                .ge => ">=",
+            });
+            try buf.append(a, ' ');
+            try writePlanExpr(a, buf, c.right);
+        },
+        .@"and" => |b| {
+            try writePred(a, buf, b.left);
+            try buf.appendSlice(a, " AND ");
+            try writePred(a, buf, b.right);
+        },
+        .@"or" => |b| {
+            try writePred(a, buf, b.left);
+            try buf.appendSlice(a, " OR ");
+            try writePred(a, buf, b.right);
+        },
+        else => try buf.appendSlice(a, "predicate"),
+    }
+}
+
+fn writePlanExpr(a: std.mem.Allocator, buf: *std.ArrayList(u8), expr: *const sql.Expr) !void {
+    switch (expr.*) {
+        .column => |name| try buf.appendSlice(a, name),
+        .literal => |v| switch (v) {
+            .int => |n| {
+                const text = try std.fmt.allocPrint(a, "{d}", .{n});
+                try buf.appendSlice(a, text);
+            },
+            .float => |n| {
+                const text = try std.fmt.allocPrint(a, "{d}", .{n});
+                try buf.appendSlice(a, text);
+            },
+            .string => |s| {
+                try buf.append(a, '\'');
+                try buf.appendSlice(a, s);
+                try buf.append(a, '\'');
+            },
+            .null => try buf.appendSlice(a, "NULL"),
+        },
+        else => try buf.append(a, '?'),
+    }
+}
 
 fn parseGlacierSystem(from: []const u8) error{TableNotFound}!?SystemTable {
     if (!std.ascii.startsWithIgnoreCase(from, "glacier.")) return null;
@@ -2349,6 +3610,67 @@ fn fieldsFromBatch(a: std.mem.Allocator, input: Batch) ![]iceberg.SchemaField {
         };
     }
     return fields;
+}
+
+fn emptyBatch(a: std.mem.Allocator, fields: []const iceberg.SchemaField) !Batch {
+    const cols = try a.alloc(Column, fields.len);
+    for (fields, 0..) |f, i| {
+        const dt = try icebergNameDataType(f.type_name);
+        cols[i] = .{ .name = f.name, .data_type = dt, .len = 0 };
+    }
+    return .{ .columns = cols, .len = 0 };
+}
+
+fn cloneBatch(a: std.mem.Allocator, src: Batch) !Batch {
+    const cols = try a.alloc(Column, src.columns.len);
+    errdefer a.free(cols);
+    for (src.columns, 0..) |col, i| cols[i] = try cloneColumn(a, col);
+    return .{ .columns = cols, .len = src.len };
+}
+
+fn cloneColumn(a: std.mem.Allocator, src: Column) !Column {
+    var dst = src;
+    dst.name = try a.dupe(u8, src.name);
+    dst.bools = try ownedSlice(u8, a, src.bools);
+    dst.i32s = try ownedSlice(i32, a, src.i32s);
+    dst.i64s = try ownedSlice(i64, a, src.i64s);
+    dst.f32s = try ownedSlice(f32, a, src.f32s);
+    dst.f64s = try ownedSlice(f64, a, src.f64s);
+    dst.uuids = try ownedSlice([16]u8, a, src.uuids);
+    dst.i128s = try ownedSlice(i128, a, src.i128s);
+    dst.valid = try ownedSlice(u8, a, src.valid);
+    dst.utf8 = .{
+        .offsets = try ownedSlice(u32, a, src.utf8.offsets),
+        .bytes = try ownedSlice(u8, a, src.utf8.bytes),
+    };
+    return dst;
+}
+
+fn ownedSlice(comptime T: type, a: std.mem.Allocator, src: []const T) ![]T {
+    if (src.len == 0) return &.{};
+    return a.dupe(T, src);
+}
+
+fn freeOwnedBatch(a: std.mem.Allocator, batch: Batch) void {
+    for (batch.columns) |col| {
+        a.free(col.name);
+        freeOwned(a, col.bools);
+        freeOwned(a, col.i32s);
+        freeOwned(a, col.i64s);
+        freeOwned(a, col.f32s);
+        freeOwned(a, col.f64s);
+        freeOwned(a, col.uuids);
+        freeOwned(a, col.i128s);
+        freeOwned(a, col.valid);
+        freeOwned(a, col.utf8.offsets);
+        freeOwned(a, col.utf8.bytes);
+    }
+    a.free(batch.columns);
+}
+
+fn freeOwned(a: std.mem.Allocator, slice: anytype) void {
+    if (slice.len == 0) return;
+    a.free(slice);
 }
 
 fn dataTypeIcebergName(dt: DataType) []const u8 {
@@ -2711,6 +4033,7 @@ pub const Result = struct {
 };
 
 fn streamRowsFromEnv() usize {
+    if (comptime @import("builtin").cpu.arch == .wasm32) return 65536;
     const p = std.c.getenv("GLACIER_BATCH_ROWS") orelse return 65536;
     const n = std.fmt.parseInt(usize, std.mem.span(p), 10) catch return 65536;
     return if (n == 0) 65536 else n;
@@ -3023,6 +4346,134 @@ test "stream limit offset across parquet row groups" {
     }
 }
 
+test "parquet row group stats skip groups" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const ids = [_]i64{ 1, 2, 3, 100, 101, 102 };
+    const cats = "fruitfruitfruitdairydairydairy";
+    const offs = [_]u32{ 0, 5, 10, 15, 20, 25, 30 };
+    const cols = [_]parquet.WriteCol{
+        .{ .name = "id", .physical = 2, .logical = 0, .values = &ids, .n_rows = 6 },
+        .{
+            .name = "category",
+            .physical = 6,
+            .logical = 1,
+            .utf8_offsets = &offs,
+            .utf8_bytes = cats,
+            .n_rows = 6,
+        },
+    };
+    try parquet.writeColumnsGrouped("/tmp/glacier-rg-skip.parquet", &cols, 3);
+    {
+        var reader = try parquet.openPath(gpa, io, "/tmp/glacier-rg-skip.parquet");
+        defer reader.close();
+        try std.testing.expectEqual(@as(i32, 2), reader.numRowGroups());
+        const lo = try reader.columnStats(0, 0);
+        const hi = try reader.columnStats(1, 0);
+        try std.testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, lo.min_bytes[0..8], .little));
+        try std.testing.expectEqual(@as(i64, 3), std.mem.readInt(i64, lo.max_bytes[0..8], .little));
+        try std.testing.expectEqual(@as(i64, 100), std.mem.readInt(i64, hi.min_bytes[0..8], .little));
+        try std.testing.expectEqual(@as(i64, 102), std.mem.readInt(i64, hi.max_bytes[0..8], .little));
+    }
+
+    var session = try Session.open(gpa, io, "/tmp/glacier-rg-skip.parquet");
+    defer session.close();
+    {
+        var result = try session.execute("SELECT COUNT(*) WHERE id > 50");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.row_groups_pruned);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) WHERE category = 'fruit'");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.row_groups_pruned);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) WHERE id > 50 AND category = 'fruit'");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 0), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 2), result.scan_stats.row_groups_pruned);
+    }
+    {
+        var result = try session.execute("SELECT id WHERE id > 100 ORDER BY id");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 2), b.len);
+        try std.testing.expectEqual(@as(i64, 101), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 102), b.columns[0].i64s[1]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.row_groups_pruned);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) WHERE id > 0");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 6), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 0), result.scan_stats.row_groups_pruned);
+    }
+}
+
+test "EXPLAIN names the scan and the files a WHERE skips" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try iceberg.writePruneFixture(gpa, io, "/tmp/iceberg_prune");
+    var session = try Session.open(gpa, io, "/tmp/iceberg_prune");
+    defer session.close();
+
+    {
+        var result = try session.execute("EXPLAIN SELECT COUNT(*) FROM iceberg_prune WHERE price > 180");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        const plan = b.columns[0].strAt(0);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "scan iceberg_prune files=2 pruned=1 mode=aggregate") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "filter price > 180") != null);
+        try std.testing.expect(std.mem.endsWith(u8, plan, "aggregate\n"));
+        try std.testing.expect(std.mem.indexOf(u8, plan, "row_group_filter") != null);
+        try std.testing.expectEqual(@as(usize, 0), result.scan_stats.files_opened);
+    }
+    {
+        var result = try session.execute("EXPLAIN SELECT * FROM iceberg_prune WHERE price > 180");
+        defer result.deinit();
+        const plan = (result.nextBatch() orelse return error.EmptyResult).columns[0].strAt(0);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "scan iceberg_prune files=2 pruned=1 mode=stream") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "row_group_filter") != null);
+        try std.testing.expectEqual(@as(usize, 0), result.scan_stats.files_opened);
+    }
+    {
+        var result = try session.execute("EXPLAIN SELECT * FROM iceberg_prune");
+        defer result.deinit();
+        const plan = (result.nextBatch() orelse return error.EmptyResult).columns[0].strAt(0);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "files=2 pruned=0 mode=stream") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "filter ") == null);
+    }
+    {
+        var result = try session.execute("EXPLAIN SELECT 1");
+        defer result.deinit();
+        const plan = (result.nextBatch() orelse return error.EmptyResult).columns[0].strAt(0);
+        try std.testing.expectEqualStrings("project\n", plan);
+    }
+}
+
 test "iceberg prune does not open files outside bounds" {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer _ = da.deinit();
@@ -3044,6 +4495,14 @@ test "iceberg prune does not open files outside bounds" {
         try std.testing.expectEqual(@as(usize, 10), b.len);
         try std.testing.expectEqual(@as(usize, 2), result.scan_stats.files_opened);
         try std.testing.expectEqual(@as(usize, 0), result.scan_stats.files_pruned);
+    }
+
+    {
+        var result = try session.execute("SELECT id FROM iceberg_prune");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, b.columns[0].i64s[0..10]);
+        try std.testing.expectEqual(@as(usize, 2), result.scan_stats.files_opened);
     }
 
     {
@@ -3273,10 +4732,12 @@ test "GlacierError carries a message not the error name" {
         try std.testing.expectEqual(@as(usize, 10), b.len);
         try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
     }
-    try std.testing.expectError(
-        error.UnsupportedSql,
-        session.execute("SELECT * FROM sales a WHERE a.id IN (SELECT b.id FROM sales b WHERE a.id > 0)"),
-    );
+    {
+        var sub = try session.execute("SELECT * FROM sales a WHERE a.id IN (SELECT b.id FROM sales b WHERE a.id > 0)");
+        defer sub.deinit();
+        const b = sub.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 10), b.len);
+    }
 }
 
 test "distinct order by scalars" {
@@ -3959,6 +5420,291 @@ test "ATTACH Hadoop warehouse SHOW and SELECT ns.table" {
     }
 }
 
+test "s3 and gs warehouse list namespaces and tables" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_remote_wh";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try iceberg.writeWarehouseFixture(gpa, io, root);
+    var srv = try remote_test.spawnFileServer(io, root, "/glacier-list", true);
+    defer srv.child.kill(io);
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{srv.port});
+    defer gpa.free(endpoint);
+
+    const cases = [_]struct { url: []const u8, gs: bool }{
+        .{ .url = "s3://glacier-list", .gs = false },
+        .{ .url = "gs://glacier-list", .gs = true },
+    };
+    for (cases) |case| {
+        var session = try Session.openEmpty(gpa, io);
+        defer session.close();
+        if (case.gs) {
+            session.gcs_token = "glacier-test-token";
+            session.gcs_endpoint = endpoint;
+        } else {
+            session.s3_creds = .{
+                .access_key = "AKIATEST",
+                .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                .region = "us-east-1",
+            };
+            session.s3_endpoint = endpoint;
+            session.s3_region = "us-east-1";
+        }
+        const attach = try std.fmt.allocPrint(gpa, "ATTACH '{s}' AS lake", .{case.url});
+        defer gpa.free(attach);
+        {
+            var result = try session.execute(attach);
+            defer result.deinit();
+            const b = result.nextBatch() orelse return error.EmptyResult;
+            try std.testing.expectEqualStrings("iceberg_hadoop", b.columns[1].strAt(0));
+        }
+        {
+            var result = try session.execute("SHOW NAMESPACES FROM lake");
+            defer result.deinit();
+            const b = result.nextBatch() orelse return error.EmptyResult;
+            try std.testing.expectEqual(@as(usize, 2), b.len);
+            var sales = false;
+            var extra = false;
+            for (0..b.len) |i| {
+                if (std.mem.eql(u8, b.columns[0].strAt(i), "sales")) sales = true;
+                if (std.mem.eql(u8, b.columns[0].strAt(i), "extra")) extra = true;
+            }
+            try std.testing.expect(sales);
+            try std.testing.expect(extra);
+        }
+        {
+            var result = try session.execute("SHOW TABLES FROM lake.sales");
+            defer result.deinit();
+            const b = result.nextBatch() orelse return error.EmptyResult;
+            try std.testing.expectEqual(@as(usize, 1), b.len);
+            try std.testing.expectEqualStrings("prune", b.columns[0].strAt(0));
+        }
+        {
+            var result = try session.execute("SELECT COUNT(*) FROM lake.sales.prune");
+            defer result.deinit();
+            const b = result.nextBatch() orelse return error.EmptyResult;
+            try std.testing.expectEqual(@as(i64, 10), b.columns[0].i64s[0]);
+        }
+    }
+}
+
+test "s3 and gs multipart put reassembles the parts" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_multipart";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var srv = try remote_test.spawnFileServer(io, root, "/glacier-mp", true);
+    defer srv.child.kill(io);
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{srv.port});
+    defer gpa.free(endpoint);
+
+    const payload = "abcdefghij";
+    const cases = [_]struct { url: []const u8, gs: bool }{
+        .{ .url = "s3://glacier-mp/dir/obj.bin", .gs = false },
+        .{ .url = "gs://glacier-mp/dir/obj.bin", .gs = true },
+    };
+    for (cases) |case| {
+        std.Io.Dir.cwd().deleteFile(io, root ++ "/.multipart-log") catch {};
+        var session = try Session.openEmpty(gpa, io);
+        defer session.close();
+        var transport = session.transport();
+        transport.put_part = 4;
+        if (case.gs) {
+            session.gcs_token = "glacier-test-token";
+            session.gcs_endpoint = endpoint;
+            transport = session.transport();
+            transport.put_part = 4;
+        } else {
+            session.s3_creds = .{
+                .access_key = "AKIATEST",
+                .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                .region = "us-east-1",
+            };
+            session.s3_endpoint = endpoint;
+            session.s3_region = "us-east-1";
+            transport = session.transport();
+            transport.put_part = 4;
+        }
+        try vfs.putLocation(transport, case.url, payload);
+        const got = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/dir/obj.bin", gpa, .limited(1024));
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(payload, got);
+        const log = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/.multipart-log", gpa, .limited(4096));
+        defer gpa.free(log);
+        try std.testing.expect(std.mem.indexOf(u8, log, "INIT\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, log, "PART 1 4\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, log, "PART 2 4\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, log, "PART 3 2\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, log, "COMPLETE 10\n") != null);
+    }
+
+    std.Io.Dir.cwd().deleteFile(io, root ++ "/.multipart-log") catch {};
+    var session = try Session.openEmpty(gpa, io);
+    defer session.close();
+    session.s3_creds = .{
+        .access_key = "AKIATEST",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+    };
+    session.s3_endpoint = endpoint;
+    session.s3_region = "us-east-1";
+    try vfs.putLocation(session.transport(), "s3://glacier-mp/dir/one.bin", "hi");
+    const one = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/dir/one.bin", gpa, .limited(16));
+    defer gpa.free(one);
+    try std.testing.expectEqualStrings("hi", one);
+    const one_log = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/.multipart-log", gpa, .limited(4096));
+    defer gpa.free(one_log);
+    try std.testing.expect(std.mem.indexOf(u8, one_log, "INIT\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one_log, "PART 1 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one_log, "COMPLETE 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one_log, "PART 2 ") == null);
+}
+
+test "az block upload and delete round-trip" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_azure";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var srv = try remote_test.spawnFileServer(io, root, "/glacier-az", true);
+    defer srv.child.kill(io);
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{srv.port});
+    defer gpa.free(endpoint);
+
+    var session = try Session.openEmpty(gpa, io);
+    defer session.close();
+    session.azure_token = "glacier-test-token";
+    session.azure_endpoint = endpoint;
+    var transport = session.transport();
+    transport.put_part = 4;
+    try vfs.putLocation(transport, "az://glacier-az/dir/obj.bin", "abcdefghij");
+    const got = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/dir/obj.bin", gpa, .limited(64));
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("abcdefghij", got);
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/.multipart-log", gpa, .limited(4096));
+    defer gpa.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "BLOCK ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "BLOCKLIST 10\n") != null);
+    try vfs.deleteLocation(session.transport(), "az://glacier-az/dir/obj.bin");
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, root ++ "/dir/obj.bin", .{ .mode = .read_only }));
+}
+
+test "remote expire and orphan removal delete the object" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_expire_remote";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var session = try Session.openEmpty(gpa, io);
+    defer session.close();
+    {
+        var result = try session.execute("ATTACH '/tmp/glacier_expire_remote' AS lake");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE NAMESPACE lake.sales");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE TABLE lake.sales.t (id BIGINT, price BIGINT)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("INSERT INTO lake.sales.t VALUES (1, 10), (2, 20)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("INSERT INTO lake.sales.t VALUES (3, 30)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("COMPACT TABLE lake.sales.t");
+        defer result.deinit();
+    }
+    const before = try snapshotCount(&session, "lake.sales.t");
+    try std.testing.expect(before > 1);
+    const old_path = try firstDataPath(gpa, &session, "lake.sales.t");
+    defer gpa.free(old_path);
+
+    const now = std.Io.Timestamp.now(io, .real);
+    const bucket = try std.fmt.allocPrint(gpa, "glacier-exp-{d}", .{now.nanoseconds});
+    defer gpa.free(bucket);
+    const prefix = try std.fmt.allocPrint(gpa, "/{s}", .{bucket});
+    defer gpa.free(prefix);
+    var srv = try remote_test.spawnFileServer(io, root, prefix, true);
+    defer srv.child.kill(io);
+    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{srv.port});
+    defer gpa.free(endpoint);
+    var remote = try Session.openEmpty(gpa, io);
+    defer remote.close();
+    remote.s3_creds = .{
+        .access_key = "AKIATEST",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+    };
+    remote.s3_endpoint = endpoint;
+    remote.s3_region = "us-east-1";
+    {
+        const attach = try std.fmt.allocPrint(gpa, "ATTACH 's3://{s}' AS lake", .{bucket});
+        defer gpa.free(attach);
+        var result = try remote.execute(attach);
+        defer result.deinit();
+    }
+    {
+        var result = try remote.execute("EXPIRE SNAPSHOTS lake.sales.t EXECUTE");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expect(b.len >= 1);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try snapshotCount(&remote, "lake.sales.t"));
+    {
+        var result = try remote.execute("SELECT COUNT(*) FROM lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try remote.execute("REMOVE ORPHAN FILES lake.sales.t EXECUTE");
+        defer result.deinit();
+    }
+    {
+        var result = try remote.execute("SELECT COUNT(*) FROM lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+    var kept = try std.Io.Dir.cwd().openFile(io, old_path, .{ .mode = .read_only });
+    kept.close(io);
+}
+
 test "open Hadoop warehouse registers iceberg_hadoop catalog" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var da: std.heap.DebugAllocator(.{}) = .init;
@@ -4134,10 +5880,17 @@ pub const remote_test = if (@import("builtin").is_test) struct {
         const py =
             \\from http.server import BaseHTTPRequestHandler, HTTPServer
             \\from pathlib import Path
-            \\import sys
+            \\import os, sys
             \\ROOT = Path(sys.argv[1]).resolve()
             \\PREFIX = sys.argv[2].rstrip("/")
             \\AUTH = sys.argv[3] == "1"
+            \\UPLOADS = {}
+            \\BLOCKS = {}
+            \\def _note(line):
+            \\    if not ROOT.is_dir():
+            \\        return
+            \\    with (ROOT / ".multipart-log").open("a") as fh:
+            \\        fh.write(line + "\n")
             \\class H(BaseHTTPRequestHandler):
             \\    def log_message(self, *args):
             \\        pass
@@ -4145,7 +5898,9 @@ pub const remote_test = if (@import("builtin").is_test) struct {
             \\        if not AUTH:
             \\            return True
             \\        auth = self.headers.get("Authorization") or ""
-            \\        return auth.startswith("AWS4-HMAC-SHA256 ")
+            \\        if auth.startswith("AWS4-HMAC-SHA256 "):
+            \\            return True
+            \\        return auth == "Bearer glacier-test-token"
             \\    def _file(self):
             \\        p = self.path.split("?", 1)[0]
             \\        if PREFIX and not (p == PREFIX or p.startswith(PREFIX + "/")):
@@ -4193,6 +5948,47 @@ pub const remote_test = if (@import("builtin").is_test) struct {
             \\        self.end_headers()
             \\        if body:
             \\            self.wfile.write(data)
+            \\    def _list(self):
+            \\        from urllib.parse import urlparse, parse_qs, unquote
+            \\        u = urlparse(self.path)
+            \\        if PREFIX and not (u.path == PREFIX or u.path.startswith(PREFIX + "/")):
+            \\            self.send_response(404); self.end_headers(); return
+            \\        prefix = unquote(parse_qs(u.query).get("prefix", [""])[0])
+            \\        base = (ROOT / prefix).resolve() if prefix else ROOT
+            \\        if base != ROOT and ROOT not in base.parents:
+            \\            self.send_response(404); self.end_headers(); return
+            \\        qs = parse_qs(u.query)
+            \\        delim = "delimiter" in qs
+            \\        chunks = []
+            \\        def safe(s):
+            \\            return s.replace("&", "&amp;").replace("<", "&lt;")
+            \\        if base.is_dir() and delim:
+            \\            for child in sorted(base.iterdir()):
+            \\                if child.name.startswith(".") or not child.is_dir():
+            \\                    continue
+            \\                rel = prefix + child.name + "/"
+            \\                chunks.append("<CommonPrefixes><Prefix>%s</Prefix></CommonPrefixes>" % safe(rel))
+            \\                chunks.append("<BlobPrefix><Name>%s</Name></BlobPrefix>" % safe(rel))
+            \\        elif base.is_dir():
+            \\            for dirpath, dirnames, filenames in os.walk(base):
+            \\                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            \\                rel_dir = prefix + os.path.relpath(dirpath, base).replace(os.sep, "/")
+            \\                if rel_dir == prefix + ".":
+            \\                    rel_dir = prefix
+            \\                elif not rel_dir.endswith("/"):
+            \\                    rel_dir += "/"
+            \\                for name in sorted(filenames):
+            \\                    if name.startswith("."):
+            \\                        continue
+            \\                    rel = rel_dir + name
+            \\                    chunks.append("<Key>%s</Key>" % safe(rel))
+            \\                    chunks.append("<Blob><Name>%s</Name></Blob>" % safe(rel))
+            \\        body = ('<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><IsTruncated>false</IsTruncated>' + "".join(chunks) + "</ListBucketResult>").encode()
+            \\        self.send_response(200)
+            \\        self.send_header("Content-Type", "application/xml")
+            \\        self.send_header("Content-Length", str(len(body)))
+            \\        self.end_headers()
+            \\        self.wfile.write(body)
             \\    def do_HEAD(self):
             \\        if not self._ok():
             \\            self.send_response(403); self.end_headers(); return
@@ -4203,19 +5999,112 @@ pub const remote_test = if (@import("builtin").is_test) struct {
             \\    def do_GET(self):
             \\        if not self._ok():
             \\            self.send_response(403); self.end_headers(); return
+            \\        if "list-type=" in self.path or "comp=list" in self.path:
+            \\            self._list(); return
             \\        fp = self._file()
             \\        if fp is None:
             \\            self.send_response(404); self.end_headers(); return
             \\        self._send_file(fp, True)
-            \\    def do_PUT(self):
+            \\    def do_POST(self):
             \\        if not self._ok():
             \\            self.send_response(403); self.end_headers(); return
+            \\        from urllib.parse import urlparse, parse_qs
+            \\        import uuid
+            \\        q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            \\        n = int(self.headers.get("Content-Length") or 0)
+            \\        body = self.rfile.read(n)
+            \\        if "uploads" in q and "uploadId" not in q:
+            \\            uid = uuid.uuid4().hex
+            \\            UPLOADS[uid] = {}
+            \\            _note("INIT")
+            \\            xml = ('<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult><UploadId>%s</UploadId></InitiateMultipartUploadResult>' % uid).encode()
+            \\            self.send_response(200)
+            \\            self.send_header("Content-Type", "application/xml")
+            \\            self.send_header("Content-Length", str(len(xml)))
+            \\            self.end_headers()
+            \\            self.wfile.write(xml)
+            \\            return
+            \\        uid = (q.get("uploadId") or [None])[0]
+            \\        slot = UPLOADS.get(uid) if uid else None
+            \\        if slot is None:
+            \\            self.send_response(404); self.end_headers(); return
             \\        fp = self._dest()
             \\        if fp is None:
             \\            self.send_response(404); self.end_headers(); return
-            \\        n = int(self.headers.get("Content-Length") or 0)
+            \\        data = b"".join(slot[k] for k in sorted(slot))
             \\        fp.parent.mkdir(parents=True, exist_ok=True)
-            \\        fp.write_bytes(self.rfile.read(n))
+            \\        fp.write_bytes(data)
+            \\        del UPLOADS[uid]
+            \\        _note("COMPLETE %d" % len(data))
+            \\        self.send_response(200)
+            \\        self.send_header("Content-Length", "0")
+            \\        self.end_headers()
+            \\    def do_DELETE(self):
+            \\        if not self._ok():
+            \\            self.send_response(403); self.end_headers(); return
+            \\        from urllib.parse import urlparse, parse_qs
+            \\        q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            \\        uid = (q.get("uploadId") or [None])[0]
+            \\        if uid and uid in UPLOADS:
+            \\            del UPLOADS[uid]
+            \\            self.send_response(204)
+            \\            self.end_headers()
+            \\            return
+            \\        fp = self._dest()
+            \\        if fp is not None and fp.is_file():
+            \\            fp.unlink()
+            \\        self.send_response(204)
+            \\        self.end_headers()
+            \\    def do_PUT(self):
+            \\        if not self._ok():
+            \\            self.send_response(403); self.end_headers(); return
+            \\        from urllib.parse import urlparse, parse_qs
+            \\        u = urlparse(self.path)
+            \\        q = parse_qs(u.query, keep_blank_values=True)
+            \\        n = int(self.headers.get("Content-Length") or 0)
+            \\        body = self.rfile.read(n)
+            \\        comp = (q.get("comp") or [None])[0]
+            \\        if comp == "block":
+            \\            bid = (q.get("blockid") or [""])[0]
+            \\            BLOCKS.setdefault(u.path, {})[bid] = body
+            \\            _note("BLOCK %d" % len(body))
+            \\            self.send_response(201)
+            \\            self.send_header("Content-Length", "0")
+            \\            self.end_headers()
+            \\            return
+            \\        if comp == "blocklist":
+            \\            import re
+            \\            ids = re.findall(r"<Latest>(.*?)</Latest>", body.decode("utf-8", "replace"))
+            \\            slot = BLOCKS.get(u.path, {})
+            \\            data = b"".join(slot[i] for i in ids)
+            \\            fp = self._dest()
+            \\            if fp is None:
+            \\                self.send_response(404); self.end_headers(); return
+            \\            fp.parent.mkdir(parents=True, exist_ok=True)
+            \\            fp.write_bytes(data)
+            \\            _note("BLOCKLIST %d" % len(data))
+            \\            self.send_response(201)
+            \\            self.send_header("Content-Length", "0")
+            \\            self.end_headers()
+            \\            return
+            \\        if "uploadId" in q and "partNumber" in q:
+            \\            uid = q["uploadId"][0]
+            \\            num = int(q["partNumber"][0])
+            \\            slot = UPLOADS.get(uid)
+            \\            if slot is None:
+            \\                self.send_response(404); self.end_headers(); return
+            \\            slot[num] = body
+            \\            _note("PART %d %d" % (num, len(body)))
+            \\            self.send_response(200)
+            \\            self.send_header("ETag", '"part-%d"' % num)
+            \\            self.send_header("Content-Length", "0")
+            \\            self.end_headers()
+            \\            return
+            \\        fp = self._dest()
+            \\        if fp is None:
+            \\            self.send_response(404); self.end_headers(); return
+            \\        fp.parent.mkdir(parents=True, exist_ok=True)
+            \\        fp.write_bytes(body)
             \\        self.send_response(200)
             \\        self.send_header("Content-Length", "0")
             \\        self.end_headers()
@@ -4678,6 +6567,65 @@ test "Session opens s3 Iceberg via path-style mock" {
     }
 }
 
+test "public Firebolt nation Iceberg reads metadata avro and parquet from s3" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const nation = "s3://firebolt-core-us-east-1/test_data/tpch/iceberg/tpch.db/nation";
+    var session = try Session.open(gpa, io, nation);
+    defer session.close();
+    try std.testing.expect(session.files.len >= 1);
+    for (session.files) |f| {
+        try std.testing.expect(std.mem.startsWith(u8, f.path, "s3://"));
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*)");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 25), b.columns[0].i64s[0]);
+    }
+    for (session.files) |f| {
+        const cached = try cache.filePath(gpa, f.path);
+        defer gpa.free(cached);
+        const st = try std.Io.Dir.cwd().statFile(io, cached, .{});
+        try std.testing.expect(st.size > 0);
+    }
+    {
+        var result = try session.execute("SELECT n_nationkey, n_name ORDER BY n_nationkey LIMIT 3");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 3), b.len);
+        try std.testing.expectEqual(DataType.int32, b.columns[0].data_type);
+        try std.testing.expectEqual(@as(i32, 0), b.columns[0].i32s[0]);
+        try std.testing.expectEqualStrings("ALGERIA", b.columns[1].strAt(0));
+        try std.testing.expectEqual(@as(i32, 1), b.columns[0].i32s[1]);
+        try std.testing.expectEqualStrings("ARGENTINA", b.columns[1].strAt(1));
+        try std.testing.expectEqual(@as(i32, 2), b.columns[0].i32s[2]);
+        try std.testing.expectEqualStrings("BRAZIL", b.columns[1].strAt(2));
+    }
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const table = try iceberg.openTable(arena.allocator(), session.transport(), nation);
+    const snap = table.metadata.currentSnapshot() orelse return error.TestUnexpectedResult;
+    const manifest = try iceberg.relocatePath(arena.allocator(), table.dir, table.metadata.location, snap.manifest_list);
+    const manifest_cache = try cache.filePath(gpa, manifest);
+    defer gpa.free(manifest_cache);
+    const manifest_st = try std.Io.Dir.cwd().statFile(io, manifest_cache, .{});
+    try std.testing.expect(manifest_st.size > 0);
+    const hint = try vfs.joinLocation(gpa, nation, "metadata/version-hint.text");
+    defer gpa.free(hint);
+    const hint_cache = try cache.filePath(gpa, hint);
+    defer gpa.free(hint_cache);
+    const hint_st = try std.Io.Dir.cwd().statFile(io, hint_cache, .{});
+    try std.testing.expect(hint_st.size > 0);
+}
+
 test "parquet decimal uuid timestamp sql" {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer _ = da.deinit();
@@ -4974,6 +6922,492 @@ test "COPY FROM parquet into Iceberg catalog" {
         try std.testing.expect(saw_veg);
         try std.testing.expect(saw_dairy);
     }
+}
+
+test "INSERT column bounds prune the next snapshot" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_insert_bounds_wh";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var session = try Session.openEmpty(gpa, io);
+    defer session.close();
+    {
+        var result = try session.execute("ATTACH '/tmp/glacier_insert_bounds_wh' AS lake");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE NAMESPACE lake.sales");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "CREATE TABLE lake.sales.t (id BIGINT, price BIGINT, category STRING)",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "INSERT INTO lake.sales.t VALUES (1, 10, 'fruit'), (2, 20, 'fruit')",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "INSERT INTO lake.sales.t VALUES (3, 200, 'dairy'), (4, 300, 'dairy')",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 4), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 2), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 0), result.scan_stats.files_pruned);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.t WHERE price > 100");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_pruned);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.t WHERE category = 'fruit'");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_pruned);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.t WHERE id > 2");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_pruned);
+    }
+}
+
+test "COMPACT TABLE rewrites live rows and keeps the old snapshot" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_compact_wh";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var session = try Session.openEmpty(gpa, io);
+    defer session.close();
+    {
+        var result = try session.execute("ATTACH '/tmp/glacier_compact_wh' AS lake");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE NAMESPACE lake.sales");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "CREATE TABLE lake.sales.t (id BIGINT, price BIGINT, category STRING)",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("COMPACT TABLE lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 0), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 0), b.columns[1].i64s[0]);
+    }
+    {
+        var result = try session.execute(
+            "INSERT INTO lake.sales.t VALUES (1, 10, 'fruit'), (2, 20, 'fruit')",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "INSERT INTO lake.sales.t VALUES (3, 200, 'dairy'), (4, 300, 'dairy')",
+        );
+        defer result.deinit();
+    }
+    const pre_delete = try latestSnapshotId(&session, "lake.sales.t");
+    {
+        var result = try session.execute("DELETE FROM lake.sales.t WHERE id = 1");
+        defer result.deinit();
+    }
+    const post_delete = try latestSnapshotId(&session, "lake.sales.t");
+    const old_path = try firstDataPath(gpa, &session, "lake.sales.t");
+    defer gpa.free(old_path);
+    {
+        var result = try session.execute("COMPACT TABLE lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("rows", b.columns[0].name);
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+        try std.testing.expectEqualStrings("files", b.columns[1].name);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[1].i64s[0]);
+    }
+    {
+        var kept = try std.Io.Dir.cwd().openFile(io, old_path, .{ .mode = .read_only });
+        kept.close(io);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT path, content FROM lake.sales.t.files");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expectEqual(@as(i64, 0), b.columns[1].i64s[0]);
+    }
+    {
+        const q = try std.fmt.allocPrint(gpa, "SELECT COUNT(*) FROM lake.sales.t FOR SNAPSHOT {d}", .{pre_delete});
+        defer gpa.free(q);
+        var result = try session.execute(q);
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 4), b.columns[0].i64s[0]);
+    }
+    {
+        const q = try std.fmt.allocPrint(gpa, "SELECT COUNT(*) FROM lake.sales.t FOR SNAPSHOT {d}", .{post_delete});
+        defer gpa.free(q);
+        var result = try session.execute(q);
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.t WHERE price > 100");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 0), result.scan_stats.files_pruned);
+    }
+    const snaps_after = try snapshotCount(&session, "lake.sales.t");
+    {
+        var result = try session.execute("COMPACT TABLE lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[1].i64s[0]);
+    }
+    try std.testing.expectEqual(snaps_after, try snapshotCount(&session, "lake.sales.t"));
+    const compact_snap = try latestSnapshotId(&session, "lake.sales.t");
+
+    {
+        var result = try session.execute(
+            "CREATE TABLE lake.sales.p (id BIGINT, category STRING) PARTITIONED BY (category)",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "INSERT INTO lake.sales.p VALUES (1, 'fruit'), (2, 'dairy')",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("INSERT INTO lake.sales.p VALUES (3, 'fruit')");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("COMPACT TABLE lake.sales.p");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 2), b.columns[1].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.p WHERE category = 'fruit'");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_pruned);
+    }
+
+    {
+        var result = try session.execute("DELETE FROM lake.sales.t WHERE id > 0");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("COMPACT TABLE lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 0), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 0), b.columns[1].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 0), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT path FROM lake.sales.t.files");
+        defer result.deinit();
+        const left: usize = if (result.nextBatch()) |b| b.len else 0;
+        try std.testing.expectEqual(@as(usize, 0), left);
+    }
+    {
+        const q = try std.fmt.allocPrint(gpa, "SELECT COUNT(*) FROM lake.sales.t FOR SNAPSHOT {d}", .{compact_snap});
+        defer gpa.free(q);
+        var result = try session.execute(q);
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+}
+
+test "EXPIRE SNAPSHOTS and REMOVE ORPHAN FILES keep the live snapshot" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_expire_wh";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var session = try Session.openEmpty(gpa, io);
+    defer session.close();
+    {
+        var result = try session.execute("ATTACH '/tmp/glacier_expire_wh' AS lake");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE NAMESPACE lake.sales");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "CREATE TABLE lake.sales.t (id BIGINT, price BIGINT, category STRING)",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "INSERT INTO lake.sales.t VALUES (1, 10, 'fruit'), (2, 20, 'fruit')",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "INSERT INTO lake.sales.t VALUES (3, 200, 'dairy'), (4, 300, 'dairy')",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("DELETE FROM lake.sales.t WHERE id = 1");
+        defer result.deinit();
+    }
+    const old_id = try latestSnapshotId(&session, "lake.sales.t");
+    const old_path = try firstDataPath(gpa, &session, "lake.sales.t");
+    defer gpa.free(old_path);
+    {
+        var result = try session.execute("COMPACT TABLE lake.sales.t");
+        defer result.deinit();
+    }
+    const before = try snapshotCount(&session, "lake.sales.t");
+    try std.testing.expect(before > 1);
+    {
+        var result = try session.execute("EXPIRE SNAPSHOTS lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("snapshot_id", b.columns[0].name);
+        try std.testing.expect(b.len >= 1);
+        var listed = false;
+        for (b.columns[0].i64s[0..b.len]) |id| {
+            if (id == old_id) listed = true;
+        }
+        try std.testing.expect(listed);
+    }
+    try std.testing.expectEqual(before, try snapshotCount(&session, "lake.sales.t"));
+    {
+        const q = try std.fmt.allocPrint(gpa, "SELECT COUNT(*) FROM lake.sales.t FOR SNAPSHOT {d}", .{old_id});
+        defer gpa.free(q);
+        var result = try session.execute(q);
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("EXPIRE SNAPSHOTS lake.sales.t EXECUTE");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expect(b.len >= 1);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try snapshotCount(&session, "lake.sales.t"));
+    {
+        const q = try std.fmt.allocPrint(gpa, "SELECT COUNT(*) FROM lake.sales.t FOR SNAPSHOT {d}", .{old_id});
+        defer gpa.free(q);
+        try std.testing.expectError(error.SnapshotNotFound, session.execute(q));
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+    const old_base = std.fs.path.basename(old_path);
+    {
+        var result = try session.execute("REMOVE ORPHAN FILES lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("path", b.columns[0].name);
+        var listed = false;
+        for (0..b.len) |i| {
+            if (std.mem.endsWith(u8, b.columns[0].strAt(i), old_base)) listed = true;
+        }
+        try std.testing.expect(listed);
+    }
+    {
+        var kept = try std.Io.Dir.cwd().openFile(io, old_path, .{ .mode = .read_only });
+        kept.close(io);
+    }
+    {
+        var result = try session.execute("REMOVE ORPHAN FILES lake.sales.t EXECUTE");
+        defer result.deinit();
+    }
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, old_path, .{ .mode = .read_only }));
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+}
+
+test "EXPIRE SNAPSHOTS on the only snapshot lists nothing" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_expire_one";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var session = try Session.openEmpty(gpa, io);
+    defer session.close();
+    {
+        var result = try session.execute("ATTACH '/tmp/glacier_expire_one' AS lake");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE NAMESPACE lake.sales");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE TABLE lake.sales.t (id BIGINT, price BIGINT)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("INSERT INTO lake.sales.t VALUES (1, 10), (2, 20)");
+        defer result.deinit();
+    }
+    const live = try firstDataPath(gpa, &session, "lake.sales.t");
+    defer gpa.free(live);
+    {
+        var result = try session.execute("EXPIRE SNAPSHOTS lake.sales.t");
+        defer result.deinit();
+        const n = if (result.nextBatch()) |b| b.len else 0;
+        try std.testing.expectEqual(@as(usize, 0), n);
+    }
+    {
+        var result = try session.execute("EXPIRE SNAPSHOTS lake.sales.t EXECUTE");
+        defer result.deinit();
+        const n = if (result.nextBatch()) |b| b.len else 0;
+        try std.testing.expectEqual(@as(usize, 0), n);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try snapshotCount(&session, "lake.sales.t"));
+    {
+        var result = try session.execute("REMOVE ORPHAN FILES lake.sales.t EXECUTE");
+        defer result.deinit();
+        const b = result.nextBatch();
+        if (b) |rows| {
+            const base = std.fs.path.basename(live);
+            for (0..rows.len) |i| {
+                try std.testing.expect(!std.mem.endsWith(u8, rows.columns[0].strAt(i), base));
+            }
+        }
+    }
+    {
+        var kept = try std.Io.Dir.cwd().openFile(io, live, .{ .mode = .read_only });
+        kept.close(io);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+    }
+}
+
+fn latestSnapshotId(session: *Session, table: []const u8) !i64 {
+    const q = try std.fmt.allocPrint(session.gpa, "SELECT snapshot_id, sequence_number FROM {s}.snapshots", .{table});
+    defer session.gpa.free(q);
+    var result = try session.execute(q);
+    defer result.deinit();
+    const b = result.nextBatch() orelse return error.EmptyResult;
+    var best_seq: i64 = -1;
+    var best_id: i64 = 0;
+    for (0..b.len) |i| {
+        if (b.columns[1].i64s[i] > best_seq) {
+            best_seq = b.columns[1].i64s[i];
+            best_id = b.columns[0].i64s[i];
+        }
+    }
+    if (best_seq < 0) return error.EmptyResult;
+    return best_id;
+}
+
+fn snapshotCount(session: *Session, table: []const u8) !usize {
+    const q = try std.fmt.allocPrint(session.gpa, "SELECT snapshot_id FROM {s}.snapshots", .{table});
+    defer session.gpa.free(q);
+    var result = try session.execute(q);
+    defer result.deinit();
+    const b = result.nextBatch() orelse return 0;
+    return b.len;
+}
+
+fn firstDataPath(gpa: std.mem.Allocator, session: *Session, table: []const u8) ![]u8 {
+    const q = try std.fmt.allocPrint(gpa, "SELECT path, content FROM {s}.files", .{table});
+    defer gpa.free(q);
+    var result = try session.execute(q);
+    defer result.deinit();
+    const b = result.nextBatch() orelse return error.EmptyResult;
+    for (0..b.len) |i| {
+        if (b.columns[1].i64s[i] == 0) return gpa.dupe(u8, b.columns[0].strAt(i));
+    }
+    return error.EmptyResult;
 }
 
 test "DELETE FROM Iceberg equality deletes" {
@@ -5387,6 +7821,349 @@ test "JOIN COUNT star many-to-many uses key frequencies" {
         defer result.deinit();
         const b = result.nextBatch() orelse return error.EmptyResult;
         try std.testing.expectEqual(@as(i64, 8_000_000), b.columns[0].i64s[0]);
+    }
+}
+
+test "JOIN USING keeps one shared column" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const left_ids = [_]i64{ 1, 2, 3 };
+    const left_prices = [_]i64{ 10, 20, 30 };
+    const left_cats = [_][*:0]const u8{ "fruit", "veg", "dairy" };
+    try parquet.writeSalesRows("/tmp/glacier_using_left.parquet", &left_ids, &left_prices, &left_cats);
+
+    const right_ids = [_]i64{ 1, 1, 2, 9 };
+    const right_prices = [_]i64{ 100, 101, 200, 900 };
+    const right_cats = [_][*:0]const u8{ "x", "y", "z", "w" };
+    try parquet.writeSalesRows("/tmp/glacier_using_right.parquet", &right_ids, &right_prices, &right_cats);
+
+    const dim_ids = [_]i64{ 10, 11 };
+    const dim_prices = [_]i64{ 1, 2 };
+    const dim_cats = [_][*:0]const u8{ "fruit", "fruit" };
+    try parquet.writeSalesRows("/tmp/glacier_using_dim.parquet", &dim_ids, &dim_prices, &dim_cats);
+
+    var session = try Session.open(gpa, io, "/tmp/glacier_using_left.parquet");
+    defer session.close();
+
+    {
+        var result = try session.execute(
+            "SELECT id, a.price, b.price FROM glacier_using_left a JOIN '/tmp/glacier_using_right.parquet' b USING (id) ORDER BY id, b.price",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 3), b.len);
+        try std.testing.expectEqualStrings("id", b.columns[0].name);
+        try std.testing.expectEqualSlices(i64, &.{ 1, 1, 2 }, b.columns[0].i64s[0..3]);
+        try std.testing.expectEqualSlices(i64, &.{ 10, 10, 20 }, b.columns[1].i64s[0..3]);
+        try std.testing.expectEqualSlices(i64, &.{ 100, 101, 200 }, b.columns[2].i64s[0..3]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT * FROM glacier_using_left a JOIN '/tmp/glacier_using_right.parquet' b USING (id) ORDER BY id, b.price",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 5), b.columns.len);
+        try std.testing.expectEqualStrings("id", b.columns[0].name);
+        try std.testing.expectEqualStrings("a.price", b.columns[1].name);
+        try std.testing.expectEqualStrings("a.category", b.columns[2].name);
+        try std.testing.expectEqualStrings("b.price", b.columns[3].name);
+        try std.testing.expectEqualStrings("b.category", b.columns[4].name);
+        try std.testing.expect(b.columnIndex("a.id") == null);
+        try std.testing.expect(b.columnIndex("b.id") == null);
+    }
+    {
+        var result = try session.execute(
+            "SELECT COUNT(*) FROM glacier_using_left a JOIN '/tmp/glacier_using_right.parquet' b USING (id)",
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 3), (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT id, COUNT(*) FROM glacier_using_left a JOIN '/tmp/glacier_using_right.parquet' b USING (id) GROUP BY id ORDER BY id",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, b.columns[0].i64s[0..2]);
+        try std.testing.expectEqualSlices(i64, &.{ 2, 1 }, b.columns[1].i64s[0..2]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT id, a.price, b.price FROM glacier_using_left a LEFT JOIN '/tmp/glacier_using_right.parquet' b USING (id) ORDER BY id, b.price",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 4), b.len);
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[3]);
+        try std.testing.expectEqual(@as(i64, 30), b.columns[1].i64s[3]);
+        try std.testing.expect(b.columns[2].isNull(3));
+    }
+    {
+        var result = try session.execute(
+            "SELECT id, a.price, b.price FROM glacier_using_left a RIGHT JOIN '/tmp/glacier_using_right.parquet' b USING (id) ORDER BY id, b.price",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 4), b.len);
+        try std.testing.expectEqual(@as(i64, 9), b.columns[0].i64s[3]);
+        try std.testing.expect(b.columns[1].isNull(3));
+        try std.testing.expectEqual(@as(i64, 900), b.columns[2].i64s[3]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT COUNT(*) FROM glacier_using_left a FULL JOIN '/tmp/glacier_using_right.parquet' b USING (id)",
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 5), (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT id, a.price, b.price FROM glacier_using_left a FULL JOIN '/tmp/glacier_using_right.parquet' b USING (id) ORDER BY id, b.price",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 5), b.len);
+        try std.testing.expectEqualSlices(i64, &.{ 1, 1, 2, 3, 9 }, b.columns[0].i64s[0..5]);
+        try std.testing.expect(b.columns[1].isNull(4));
+        try std.testing.expect(b.columns[2].isNull(3));
+    }
+    {
+        var result = try session.execute(
+            "SELECT category, a.id, b.id FROM glacier_using_left a JOIN '/tmp/glacier_using_dim.parquet' b USING (category) ORDER BY b.id",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 2), b.len);
+        try std.testing.expectEqualStrings("category", b.columns[0].name);
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(0));
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(1));
+        try std.testing.expectEqual(@as(i64, 1), b.columns[1].i64s[0]);
+        try std.testing.expectEqualSlices(i64, &.{ 10, 11 }, b.columns[2].i64s[0..2]);
+    }
+    {
+        var result = try session.execute(
+            "EXPLAIN SELECT * FROM glacier_using_left a JOIN '/tmp/glacier_using_right.parquet' b USING (id)",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        const plan = b.columns[0].strAt(0);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "hash_join inner using id\n") != null);
+    }
+    try std.testing.expectError(
+        error.ColumnNotFound,
+        session.execute("SELECT * FROM glacier_using_left a JOIN '/tmp/glacier_using_right.parquet' b USING (missing)"),
+    );
+
+    try parquet.writeSalesFixture("/tmp/glacier_using_sales.parquet");
+    var sales = try Session.open(gpa, io, "/tmp/glacier_using_sales.parquet");
+    defer sales.close();
+    {
+        var result = try sales.execute("SELECT * FROM glacier_using_sales a JOIN glacier_using_sales b USING (id)");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 10), b.len);
+        try std.testing.expectEqual(@as(usize, 5), b.columns.len);
+        try std.testing.expect(b.columnIndex("id") != null);
+        try std.testing.expect(b.columnIndex("a.id") == null);
+        try std.testing.expect(b.columnIndex("b.id") == null);
+    }
+}
+
+test "GROUPING SETS nulls the columns a set leaves out" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try parquet.writeSalesFixture("/tmp/glacier_sets_sales.parquet");
+    var session = try Session.open(gpa, io, "/tmp/glacier_sets_sales.parquet");
+    defer session.close();
+
+    {
+        var result = try session.execute(
+            "SELECT category, COUNT(*) AS n FROM glacier_sets_sales GROUP BY GROUPING SETS ((category), ()) ORDER BY category",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 4), b.len);
+        try std.testing.expectEqualStrings("dairy", b.columns[0].strAt(0));
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(1));
+        try std.testing.expectEqualStrings("veg", b.columns[0].strAt(2));
+        try std.testing.expect(b.columns[0].isNull(3));
+        try std.testing.expectEqualSlices(i64, &.{ 2, 5, 3, 10 }, b.columns[1].i64s[0..4]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT category, COUNT(*) AS n FROM glacier_sets_sales GROUP BY GROUPING SETS ((category), ()) HAVING COUNT(*) > 3 ORDER BY category",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 2), b.len);
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(0));
+        try std.testing.expect(b.columns[0].isNull(1));
+        try std.testing.expectEqualSlices(i64, &.{ 5, 10 }, b.columns[1].i64s[0..2]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT category, id, COUNT(*) AS n FROM glacier_sets_sales GROUP BY GROUPING SETS ((category, id), (category), ()) ORDER BY category, id",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 14), b.len);
+        try std.testing.expect(b.columns[0].isNull(13));
+        try std.testing.expect(b.columns[1].isNull(13));
+        try std.testing.expectEqual(@as(i64, 10), b.columns[2].i64s[13]);
+        try std.testing.expectEqualStrings("dairy", b.columns[0].strAt(0));
+        try std.testing.expectEqual(@as(i64, 6), b.columns[1].i64s[0]);
+        try std.testing.expect(b.columns[1].isNull(2));
+        try std.testing.expectEqual(@as(i64, 2), b.columns[2].i64s[2]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT category, COUNT(*) AS n FROM glacier_sets_sales WHERE price < 0 GROUP BY GROUPING SETS ((category), ())",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expect(b.columns[0].isNull(0));
+        try std.testing.expectEqual(@as(i64, 0), b.columns[1].i64s[0]);
+    }
+    {
+        var result = try session.execute(
+            "EXPLAIN SELECT category, COUNT(*) FROM glacier_sets_sales GROUP BY GROUPING SETS ((category), ())",
+        );
+        defer result.deinit();
+        const plan = (result.nextBatch() orelse return error.EmptyResult).columns[0].strAt(0);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "grouping_sets 2\n") != null);
+    }
+    try std.testing.expectError(
+        error.InvalidSyntax,
+        session.execute("SELECT price, COUNT(*) FROM glacier_sets_sales GROUP BY GROUPING SETS ((category), ())"),
+    );
+    {
+        var result = try session.execute(
+            "SELECT category, ROW_NUMBER() OVER () AS rn FROM glacier_sets_sales GROUP BY GROUPING SETS ((category), ())",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 4), b.len);
+        var sum: i64 = 0;
+        for (b.columns[1].i64s[0..b.len]) |n| sum += n;
+        try std.testing.expectEqual(@as(i64, 10), sum);
+    }
+}
+
+test "ROLLUP and CUBE and GROUPING" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try parquet.writeSalesFixture("/tmp/glacier_rollup_sales.parquet");
+    var session = try Session.open(gpa, io, "/tmp/glacier_rollup_sales.parquet");
+    defer session.close();
+
+    {
+        var result = try session.execute(
+            "SELECT category, GROUPING(category), COUNT(*) AS n FROM glacier_rollup_sales GROUP BY ROLLUP (category) ORDER BY category",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 4), b.len);
+        try std.testing.expectEqualStrings("dairy", b.columns[0].strAt(0));
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(1));
+        try std.testing.expectEqualStrings("veg", b.columns[0].strAt(2));
+        try std.testing.expect(b.columns[0].isNull(3));
+        try std.testing.expectEqualSlices(i64, &.{ 0, 0, 0, 1 }, b.columns[1].i64s[0..4]);
+        try std.testing.expectEqualSlices(i64, &.{ 2, 5, 3, 10 }, b.columns[2].i64s[0..4]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT GROUPING(category), GROUPING(id), COUNT(*) FROM glacier_rollup_sales GROUP BY CUBE (category, id)",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 24), b.len);
+        var gcat: i64 = 0;
+        var gid: i64 = 0;
+        for (0..b.len) |i| {
+            gcat += b.columns[0].i64s[i];
+            gid += b.columns[1].i64s[i];
+        }
+        try std.testing.expectEqual(@as(i64, 11), gcat);
+        try std.testing.expectEqual(@as(i64, 4), gid);
+    }
+    {
+        var result = try session.execute(
+            "SELECT category, id, GROUPING(category), GROUPING(id), COUNT(*) FROM glacier_rollup_sales GROUP BY ROLLUP (category, id) ORDER BY category, id",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 14), b.len);
+        try std.testing.expectEqualStrings("dairy", b.columns[0].strAt(0));
+        try std.testing.expectEqual(@as(i64, 6), b.columns[1].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 0), b.columns[2].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 0), b.columns[3].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[4].i64s[0]);
+        try std.testing.expect(b.columns[1].isNull(2));
+        try std.testing.expectEqual(@as(i64, 0), b.columns[2].i64s[2]);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[3].i64s[2]);
+        try std.testing.expectEqual(@as(i64, 2), b.columns[4].i64s[2]);
+        try std.testing.expect(b.columns[1].isNull(8));
+        try std.testing.expectEqualStrings("fruit", b.columns[0].strAt(8));
+        try std.testing.expectEqual(@as(i64, 5), b.columns[4].i64s[8]);
+        try std.testing.expect(b.columns[0].isNull(13));
+        try std.testing.expect(b.columns[1].isNull(13));
+        try std.testing.expectEqual(@as(i64, 1), b.columns[2].i64s[13]);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[3].i64s[13]);
+        try std.testing.expectEqual(@as(i64, 10), b.columns[4].i64s[13]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT category, GROUPING(category), COUNT(*) FROM glacier_rollup_sales WHERE price < 0 GROUP BY ROLLUP (category)",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expect(b.columns[0].isNull(0));
+        try std.testing.expectEqual(@as(i64, 1), b.columns[1].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 0), b.columns[2].i64s[0]);
+    }
+    {
+        var result = try session.execute(
+            "EXPLAIN SELECT category, COUNT(*) FROM glacier_rollup_sales GROUP BY ROLLUP (category)",
+        );
+        defer result.deinit();
+        const plan = (result.nextBatch() orelse return error.EmptyResult).columns[0].strAt(0);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "grouping_sets 2\n") != null);
+    }
+    try std.testing.expectError(
+        error.InvalidSyntax,
+        session.execute("SELECT GROUPING(price), COUNT(*) FROM glacier_rollup_sales GROUP BY ROLLUP (category)"),
+    );
+    {
+        var result = try session.execute(
+            "SELECT category, ROW_NUMBER() OVER () AS rn FROM glacier_rollup_sales GROUP BY ROLLUP (category)",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 4), b.len);
+        var sum: i64 = 0;
+        for (b.columns[1].i64s[0..b.len]) |n| sum += n;
+        try std.testing.expectEqual(@as(i64, 10), sum);
     }
 }
 
@@ -6036,10 +8813,61 @@ test "FROM subquery IN subquery scalar CTE LEFT JOIN" {
         const b = result.nextBatch() orelse return error.EmptyResult;
         try std.testing.expectEqual(@as(i64, 6), b.columns[0].i64s[0]);
     }
-    try std.testing.expectError(
-        error.UnsupportedSql,
-        session.execute("SELECT * FROM glacier_sub_sales a WHERE a.id IN (SELECT b.id FROM glacier_sub_sales b WHERE a.id > 0)"),
-    );
+    {
+        var result = try session.execute("SELECT * FROM glacier_sub_sales a WHERE a.id IN (SELECT b.id FROM glacier_sub_sales b WHERE a.id > 0)");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 10), b.len);
+    }
+    {
+        var result = try session.execute(
+            "SELECT COUNT(*) FROM glacier_sub_sales a WHERE EXISTS (SELECT 1 FROM glacier_sub_sales b WHERE b.id = a.id AND b.price > 100)",
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 5),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var result = try session.execute(
+            "SELECT COUNT(*) FROM glacier_sub_sales a WHERE NOT EXISTS (SELECT 1 FROM glacier_sub_sales b WHERE b.id = a.id AND b.price > 100)",
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 5),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var result = try session.execute(
+            "SELECT COUNT(*) FROM glacier_sub_sales a WHERE a.price = (SELECT MAX(price) FROM glacier_sub_sales b WHERE b.category = a.category)",
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 3),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
+    {
+        var result = try session.execute(
+            "SELECT (SELECT MAX(price) FROM glacier_sub_sales b WHERE b.category = a.category) FROM glacier_sub_sales a WHERE a.id = 1",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expectEqual(@as(i64, 150), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute(
+            "SELECT COUNT(*) FROM glacier_sub_sales a WHERE EXISTS (SELECT 1 FROM glacier_sub_sales b WHERE b.id = a.id AND b.price > 100 AND EXISTS (SELECT 1 FROM glacier_sub_sales c WHERE c.id = b.id))",
+        );
+        defer result.deinit();
+        try std.testing.expectEqual(
+            @as(i64, 5),
+            (result.nextBatch() orelse return error.EmptyResult).columns[0].i64s[0],
+        );
+    }
     try std.testing.expectError(
         error.UnsupportedSql,
         session.execute("WITH t AS (SELECT * FROM t) SELECT * FROM t"),
@@ -6567,12 +9395,14 @@ test "stress mixed SQL surface and volume" {
         error.SubqueryCardinality,
         session.execute("SELECT (SELECT id FROM glacier_stress_sales)"),
     );
-    try std.testing.expectError(
-        error.UnsupportedSql,
-        session.execute(
+    {
+        var result = try session.execute(
             "SELECT * FROM glacier_stress_sales a WHERE EXISTS (SELECT 1 FROM glacier_stress_sales b WHERE a.id = b.id)",
-        ),
-    );
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 10), b.len);
+    }
 
     {
         var result = try session.execute(
@@ -7154,6 +9984,239 @@ test "CREATE INSERT PARTITIONED BY identity prunes on scan" {
     }
 }
 
+test "day bucket and truncate partitions survive insert and compact" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_part_tf";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var session = try Session.openEmpty(gpa, io);
+    defer session.close();
+    {
+        var result = try session.execute("ATTACH '/tmp/glacier_part_tf' AS lake");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE NAMESPACE lake.sales");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "CREATE TABLE lake.sales.days (id BIGINT, ts BIGINT) PARTITIONED BY (day(ts))",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute(
+            "INSERT INTO lake.sales.days VALUES (1, 0), (2, 86400000000), (3, 0)",
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.days WHERE ts = 0");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_pruned);
+    }
+    {
+        var result = try session.execute("SELECT path FROM lake.sales.days.files");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        var day0 = false;
+        var day1 = false;
+        for (0..b.len) |i| {
+            const path = b.columns[0].strAt(i);
+            if (std.mem.indexOf(u8, path, "ts_day=0") != null) day0 = true;
+            if (std.mem.indexOf(u8, path, "ts_day=1") != null) day1 = true;
+        }
+        try std.testing.expect(day0);
+        try std.testing.expect(day1);
+    }
+    {
+        var result = try session.execute("INSERT INTO lake.sales.days VALUES (4, 0)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("COMPACT TABLE lake.sales.days");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 4), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(i64, 2), b.columns[1].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.days");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 4), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.days WHERE ts = 86400000000");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_pruned);
+    }
+
+    const bucket_of_one = iceberg.icebergBucketI64(1, 4);
+    var other: i64 = 2;
+    while (iceberg.icebergBucketI64(other, 4) == bucket_of_one) other += 1;
+    {
+        var result = try session.execute(
+            "CREATE TABLE lake.sales.bk (id BIGINT) PARTITIONED BY (bucket(4, id))",
+        );
+        defer result.deinit();
+    }
+    const bucket_insert = try std.fmt.allocPrint(gpa, "INSERT INTO lake.sales.bk VALUES (1), ({d})", .{other});
+    defer gpa.free(bucket_insert);
+    {
+        var result = try session.execute(bucket_insert);
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.bk WHERE id = 1");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_pruned);
+    }
+    {
+        var result = try session.execute("SELECT path FROM lake.sales.bk.files");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        var saw = false;
+        for (0..b.len) |i| {
+            if (std.mem.indexOf(u8, b.columns[0].strAt(i), "id_bucket=") != null) saw = true;
+        }
+        try std.testing.expect(saw);
+    }
+
+    {
+        var result = try session.execute(
+            "CREATE TABLE lake.sales.tr (id BIGINT) PARTITIONED BY (truncate(10, id))",
+        );
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("INSERT INTO lake.sales.tr VALUES (3), (14)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.tr WHERE id = 14");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_opened);
+        try std.testing.expectEqual(@as(usize, 1), result.scan_stats.files_pruned);
+    }
+    {
+        var result = try session.execute("SELECT path FROM lake.sales.tr.files");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        var trunc0 = false;
+        var trunc10 = false;
+        for (0..b.len) |i| {
+            const path = b.columns[0].strAt(i);
+            if (std.mem.indexOf(u8, path, "id_trunc=0") != null) trunc0 = true;
+            if (std.mem.indexOf(u8, path, "id_trunc=10") != null) trunc10 = true;
+        }
+        try std.testing.expect(trunc0);
+        try std.testing.expect(trunc10);
+    }
+}
+
+test "comma natural lateral recursive window and correlated having" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_sql_more";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var session = try Session.openEmpty(gpa, io);
+    defer session.close();
+    {
+        var result = try session.execute("ATTACH '/tmp/glacier_sql_more' AS lake");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE NAMESPACE lake.sales");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE TABLE lake.sales.nums (id BIGINT, v BIGINT, g BIGINT)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("INSERT INTO lake.sales.nums VALUES (1, 10, 1), (1, 10, 1), (2, 5, 2)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.nums a, lake.sales.nums b WHERE a.id = b.id");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 5), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.nums a NATURAL JOIN lake.sales.nums b");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 5), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT SUM(n) FROM lake.sales.nums a, LATERAL (SELECT COUNT(*) AS n FROM lake.sales.nums b WHERE b.id = a.id) b");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 5), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("WITH RECURSIVE c AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT SUM(n) FROM c");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 6), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT SUM(s) FROM (SELECT SUM(v) OVER w AS s FROM lake.sales.nums WINDOW w AS (PARTITION BY g))");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 45), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT SUM(rn) FROM (SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn FROM lake.sales.nums GROUP BY GROUPING SETS ((id)))");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT SUM(s) FROM (SELECT SUM(v) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM lake.sales.nums)");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expect(b.columns[0].i64s[0] > 0);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM lake.sales.nums a GROUP BY a.id HAVING COUNT(*) = (SELECT COUNT(*) FROM lake.sales.nums b WHERE b.id = a.id)");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 2), b.len);
+    }
+}
+
 test "CREATE TABLE on files catalog is refused" {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer _ = da.deinit();
@@ -7171,6 +10234,176 @@ test "CREATE TABLE on files catalog is refused" {
     try std.testing.expectError(error.WriteUnsupported, session.execute("UPDATE t SET id = 2"));
     try std.testing.expectError(error.WriteUnsupported, session.execute("MERGE INTO t USING t s ON t.id = s.id WHEN MATCHED THEN DELETE"));
     try std.testing.expectError(error.WriteUnsupported, session.execute("ALTER TABLE t ADD COLUMN note STRING"));
+}
+
+test "CREATE TEMP TABLE stays in the session and joins a file" {
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try parquet.writeSalesFixture("/tmp/glacier_temp_sales.parquet");
+    var session = try Session.open(gpa, io, "/tmp/glacier_temp_sales.parquet");
+    defer session.close();
+
+    {
+        var result = try session.execute("CREATE TEMP TABLE hot AS SELECT id, price FROM glacier_temp_sales WHERE price > 100");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("hot", b.columns[0].strAt(0));
+        try std.testing.expectEqualStrings("temp", b.columns[1].strAt(0));
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM hot");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 5), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM hot h JOIN glacier_temp_sales s ON h.id = s.id");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 5), b.columns[0].i64s[0]);
+    }
+    {
+        var other = try Session.open(gpa, io, "/tmp/glacier_temp_sales.parquet");
+        defer other.close();
+        try std.testing.expectError(error.TableNotFound, other.execute("SELECT COUNT(*) FROM hot"));
+    }
+    {
+        var result = try session.execute("CREATE TEMP TABLE note (id BIGINT, label STRING)");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("note", b.columns[0].strAt(0));
+    }
+    {
+        var result = try session.execute("INSERT INTO note VALUES (3, 'ice'), (4, 'berg')");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT label FROM note WHERE id = 3");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expectEqualStrings("ice", b.columns[0].strAt(0));
+    }
+    {
+        var result = try session.execute("SHOW TABLES FROM temp");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 2), b.len);
+        try std.testing.expectEqualStrings("temp", b.columns[1].strAt(0));
+        try std.testing.expectEqualStrings("temp", b.columns[1].strAt(1));
+    }
+    {
+        var result = try session.execute("DESCRIBE note");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 2), b.len);
+        try std.testing.expectEqualStrings("id", b.columns[0].strAt(0));
+        try std.testing.expectEqualStrings("long", b.columns[1].strAt(0));
+        try std.testing.expectEqualStrings("label", b.columns[0].strAt(1));
+        try std.testing.expectEqualStrings("string", b.columns[1].strAt(1));
+    }
+    try std.testing.expectError(error.InvalidSyntax, session.execute("CREATE TEMP TABLE note (id BIGINT)"));
+    {
+        var result = try session.execute("DROP TABLE note");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("note", b.columns[0].strAt(0));
+        try std.testing.expectEqualStrings("temp", b.columns[1].strAt(0));
+    }
+    try std.testing.expectError(error.TableNotFound, session.execute("SELECT COUNT(*) FROM note"));
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM hot");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 5), b.columns[0].i64s[0]);
+    }
+}
+
+test "cancel stops a scan and the next statement still runs" {
+    var gpa_impl = std.heap.DebugAllocator(.{}){};
+    defer std.debug.assert(gpa_impl.deinit() == .ok);
+    const gpa = gpa_impl.allocator();
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = "/tmp/glacier-cancel-rgs.parquet";
+    try parquet.writeRowGroupsFixture(path);
+
+    var session = try Session.open(gpa, io, path);
+    defer session.close();
+
+    session.requestCancel();
+    try std.testing.expectError(error.QueryCanceled, session.execute("SELECT 1"));
+    {
+        var result = try session.execute("SELECT 1");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+    }
+
+    session.cancel.after = 2;
+    try std.testing.expectError(error.QueryCanceled, session.execute("SELECT id"));
+    {
+        var result = try session.execute("SELECT id");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4, 5, 6 }, b.columns[0].i64s[0..6]);
+    }
+
+    session.cancel.deadline_ns = 1;
+    try std.testing.expectError(error.QueryCanceled, session.execute("SELECT id"));
+    {
+        var result = try session.execute("SELECT COUNT(*)");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 6), b.columns[0].i64s[0]);
+    }
+}
+
+test "a script runs on one session and returns the last result" {
+    var gpa_impl = std.heap.DebugAllocator(.{}){};
+    defer std.debug.assert(gpa_impl.deinit() == .ok);
+    const gpa = gpa_impl.allocator();
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var session = try Session.openEmpty(gpa, io);
+    defer session.close();
+
+    {
+        var result = try session.execute(
+            \\CREATE TEMP TABLE note (id BIGINT, label STRING);
+            \\INSERT INTO note VALUES (3, 'ice');
+            \\SELECT label FROM note WHERE id = 3
+        );
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("ice", b.columns[0].strAt(0));
+    }
+    try std.testing.expectError(error.TableNotFound, session.execute("SELECT * FROM missing; SELECT 1"));
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM note");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("DROP TABLE note; SELECT 1");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    try std.testing.expectError(error.TableNotFound, session.execute("SELECT * FROM note"));
+    try std.testing.expectError(error.InvalidSyntax, session.execute(";;;"));
 }
 
 test "CREATE INSERT Iceberg Hadoop warehouse" {
