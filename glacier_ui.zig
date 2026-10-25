@@ -39,12 +39,19 @@ var elapsed_buf: [32]u8 = @splat(0);
 var elapsed_text: []const u8 = "";
 var query_error: bool = false;
 
-var headers: []const []const u8 = &.{};
-var types: []const []const u8 = &.{};
-var cells: []const []const u8 = &.{};
-var n_cols: usize = 0;
-var n_rows: usize = 0;
-var n_total: usize = 0;
+const Grid = struct {
+    title: []const u8,
+    headers: []const []const u8,
+    types: []const []const u8,
+    cells: []const []const u8,
+    n_cols: usize = 0,
+    n_rows: usize = 0,
+    n_total: usize = 0,
+    note: []const u8 = "",
+    failed: bool = false,
+};
+
+var grids: []const Grid = &.{};
 var files_opened: usize = 0;
 var files_pruned: usize = 0;
 var has_result: bool = false;
@@ -380,7 +387,7 @@ fn drawEditor() void {
             .gravity_y = 0.5,
             .color_text = .{ .color = ice_bright },
         });
-        dvui.label(@src(), "one statement  ·  Ctrl+Enter", .{}, .{
+        dvui.label(@src(), "script  ·  F5 / Ctrl+Enter", .{}, .{
             .gravity_y = 0.5,
             .color_text = .{ .color = ice },
         });
@@ -392,7 +399,7 @@ fn drawEditor() void {
     var sql_te = dvui.textEntry(@src(), .{
         .text = .{ .buffer = &sql_buf },
         .multiline = true,
-        .placeholder = "SQL against the catalog session",
+        .placeholder = "One or more statements, separated by ;",
     }, .{
         .expand = .both,
         .font = .theme(.mono),
@@ -426,63 +433,73 @@ fn drawResults() void {
                 .color_text = .{ .color = if (query_error) .fromHex("#e8b4ae") else ice_bright },
             });
             _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-            if (n_cols > 0 and dvui.button(@src(), "Copy", .{}, .{})) copyTsv();
+            if (gridCells() > 0 and dvui.button(@src(), "Copy", .{}, .{})) copyTsv();
         }
-    }
-
-    if (query_error) {
-        dvui.label(@src(), "{s}", .{status_buf[0..status_len]}, .{
-            .style = .err,
-            .expand = .horizontal,
-            .background = true,
-            .padding = .all(8),
-        });
-        return;
     }
 
     if (!has_result) {
-        dvui.label(@src(), "Pick a table in the session tree, or run SQL.\nF5 / Ctrl+Enter runs the statement in the editor.", .{}, .{
+        dvui.label(@src(), "Pick a table in the session tree, or run SQL.\nF5 / Ctrl+Enter runs every statement in the editor.", .{}, .{
             .color_text = .{ .color = ice },
         });
         return;
     }
 
-    if (n_cols == 0) {
-        dvui.label(@src(), "Statement finished. No result grid (DDL / empty).", .{}, .{
-            .color_text = .{ .color = ice },
+    var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false });
+    defer scroll.deinit();
+
+    for (grids, 0..) |g, si| {
+        const base: usize = si * 100_000;
+        dvui.label(@src(), "{s}", .{g.title}, .{
+            .id_extra = base,
+            .font = .theme(.heading),
+            .color_text = .{ .color = if (g.failed) .fromHex("#e8b4ae") else ice_bright },
         });
-        return;
-    }
-
-    var grid = dvui.grid(@src(), .{ .rows = n_rows }, .{ .expand = .both });
-    defer grid.deinit();
-
-    for (headers, 0..) |h, c| {
-        var hdr = grid.colHeader(.{ .col = c }, .{ .id_extra = c });
-        defer hdr.deinit();
-        var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .id_extra = c });
-        defer col.deinit();
-        dvui.label(@src(), "{s}", .{h}, .{ .id_extra = c, .font = .theme(.heading) });
-        if (c < types.len) {
-            dvui.label(@src(), "{s}", .{types[c]}, .{
-                .id_extra = c,
-                .font = .theme(.mono),
+        if (g.failed) {
+            dvui.label(@src(), "{s}", .{g.note}, .{
+                .id_extra = base + 1,
+                .style = .err,
+                .expand = .horizontal,
+                .background = true,
+                .padding = .all(8),
+            });
+            continue;
+        }
+        if (g.n_cols == 0) {
+            dvui.label(@src(), "{s}", .{if (g.note.len > 0) g.note else "done"}, .{
+                .id_extra = base + 1,
                 .color_text = .{ .color = ice },
             });
+            continue;
         }
-    }
-
-    var r: usize = 0;
-    while (r < n_rows) : (r += 1) {
-        var c: usize = 0;
-        while (c < n_cols) : (c += 1) {
-            const extra = r * n_cols + c;
-            var cell = grid.cell(.{ .col = c, .row = r }, .{ .id_extra = extra });
-            defer cell.deinit();
-            dvui.label(@src(), "{s}", .{cells[extra]}, .{
-                .id_extra = extra,
-                .font = .theme(.mono),
-            });
+        var grid = dvui.grid(@src(), .{ .rows = g.n_rows }, .{ .expand = .horizontal, .id_extra = base });
+        defer grid.deinit();
+        for (g.headers, 0..) |h, c| {
+            const extra = base + 1000 + c;
+            var hdr = grid.colHeader(.{ .col = c }, .{ .id_extra = extra });
+            defer hdr.deinit();
+            var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .id_extra = extra });
+            defer col.deinit();
+            dvui.label(@src(), "{s}", .{h}, .{ .id_extra = extra, .font = .theme(.heading) });
+            if (c < g.types.len) {
+                dvui.label(@src(), "{s}", .{g.types[c]}, .{
+                    .id_extra = extra,
+                    .font = .theme(.mono),
+                    .color_text = .{ .color = ice },
+                });
+            }
+        }
+        var r: usize = 0;
+        while (r < g.n_rows) : (r += 1) {
+            var c: usize = 0;
+            while (c < g.n_cols) : (c += 1) {
+                const extra = base + 2000 + r * g.n_cols + c;
+                var cell = grid.cell(.{ .col = c, .row = r }, .{ .id_extra = extra });
+                defer cell.deinit();
+                dvui.label(@src(), "{s}", .{g.cells[r * g.n_cols + c]}, .{
+                    .id_extra = extra,
+                    .font = .theme(.mono),
+                });
+            }
         }
     }
 }
@@ -515,15 +532,26 @@ var chrome_scratch: [256]u8 = undefined;
 var summary_scratch: [256]u8 = undefined;
 
 fn resultSummary() []const u8 {
-    const shown = if (n_total > n_rows)
-        std.fmt.bufPrint(&summary_scratch, "{d} rows ({d} shown)  {d} cols  {s}  opened {d}  pruned {d}", .{
-            n_total, n_rows, n_cols, elapsed_text, files_opened, files_pruned,
-        }) catch "rows"
-    else
-        std.fmt.bufPrint(&summary_scratch, "{d} rows  {d} cols  {s}  opened {d}  pruned {d}", .{
-            n_total, n_cols, elapsed_text, files_opened, files_pruned,
+    if (grids.len > 1) {
+        return std.fmt.bufPrint(&summary_scratch, "{d} statements  {s}  opened {d}  pruned {d}", .{
+            grids.len, elapsed_text, files_opened, files_pruned,
+        }) catch "statements";
+    }
+    const g = if (grids.len == 1) grids[0] else return "";
+    if (g.n_total > g.n_rows) {
+        return std.fmt.bufPrint(&summary_scratch, "{d} rows ({d} shown)  {d} cols  {s}  opened {d}  pruned {d}", .{
+            g.n_total, g.n_rows, g.n_cols, elapsed_text, files_opened, files_pruned,
         }) catch "rows";
-    return shown;
+    }
+    return std.fmt.bufPrint(&summary_scratch, "{d} rows  {d} cols  {s}  opened {d}  pruned {d}", .{
+        g.n_total, g.n_cols, elapsed_text, files_opened, files_pruned,
+    }) catch "rows";
+}
+
+fn gridCells() usize {
+    var n: usize = 0;
+    for (grids) |g| n += g.n_rows * g.n_cols;
+    return n;
 }
 
 fn trimText(s: []const u8) []const u8 {
@@ -682,8 +710,8 @@ fn runTextFmt(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn runSql() void {
-    const sql = sqlText();
-    if (sql.len == 0) {
+    const script = sqlText();
+    if (script.len == 0) {
         failStatus("type SQL", .{});
         return;
     }
@@ -691,23 +719,65 @@ fn runSql() void {
         failStatus("no session", .{});
         return;
     };
-    const t0 = std.Io.Clock.Timestamp.now(io, .awake);
-    var result = sess.execute(sql) catch |err| {
-        const ge = sess.lastError() orelse glacier.GlacierError.fromZig(err);
-        failStatus("{s}", .{ge.message});
-        clearGrid();
-        has_result = true;
-        refreshTree();
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(gpa);
+    glacier.sql.splitStatements(gpa, script, &parts) catch {
+        failStatus("script too large", .{});
         return;
     };
-    defer result.deinit();
+    if (parts.items.len == 0) {
+        failStatus("type SQL", .{});
+        return;
+    }
+
+    _ = result_arena.reset(.retain_capacity);
+    const a = result_arena.allocator();
+    var list: std.ArrayList(Grid) = .empty;
+    defer list.deinit(gpa);
+    const t0 = std.Io.Clock.Timestamp.now(io, .awake);
+    files_opened = 0;
+    files_pruned = 0;
+    query_error = false;
+    for (parts.items) |stmt| {
+        var result = sess.execute(stmt) catch |err| {
+            const ge = sess.lastError() orelse glacier.GlacierError.fromZig(err);
+            const note = a.dupe(u8, ge.message) catch "error";
+            list.append(gpa, .{
+                .title = clipSql(a, stmt),
+                .headers = &.{},
+                .types = &.{},
+                .cells = &.{},
+                .note = note,
+                .failed = true,
+            }) catch {};
+            query_error = true;
+            failStatus("{s}", .{note});
+            break;
+        };
+        defer result.deinit();
+        files_opened += result.scan_stats.files_opened;
+        files_pruned += result.scan_stats.files_pruned;
+        const grid = captureGrid(a, stmt, result.batch);
+        const failed = grid.failed;
+        list.append(gpa, grid) catch {
+            query_error = true;
+            failStatus("oom", .{});
+            break;
+        };
+        if (failed) {
+            query_error = true;
+            failStatus("{s}", .{grid.note});
+            break;
+        }
+    }
     const ns = t0.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toNanoseconds();
     elapsed_text = formatDuration(ns, &elapsed_buf) catch "";
-    files_opened = result.scan_stats.files_opened;
-    files_pruned = result.scan_stats.files_pruned;
-    query_error = false;
-    captureBatch(result.batch);
-    pushHistory(sql);
+    grids = a.dupe(Grid, list.items) catch &.{};
+    has_result = true;
+    if (!query_error) {
+        setStatus("{d} statements  {s}", .{ grids.len, elapsed_text });
+    }
+    pushHistory(script);
     refreshTree();
 }
 
@@ -792,33 +862,33 @@ fn loadTables(a: std.mem.Allocator, sess: *glacier.Session, cat: []const u8) []T
     return list;
 }
 
-fn clearGrid() void {
-    _ = result_arena.reset(.retain_capacity);
-    headers = &.{};
-    types = &.{};
-    cells = &.{};
-    n_cols = 0;
-    n_rows = 0;
-    n_total = 0;
+fn clipSql(a: std.mem.Allocator, stmt: []const u8) []const u8 {
+    var buf: [96]u8 = undefined;
+    var n: usize = 0;
+    for (stmt) |ch| {
+        if (n >= buf.len) break;
+        buf[n] = if (ch == '\n' or ch == '\r' or ch == '\t') ' ' else ch;
+        n += 1;
+    }
+    return a.dupe(u8, buf[0..n]) catch "sql";
 }
 
-fn captureBatch(batch: glacier.Batch) void {
-    _ = result_arena.reset(.retain_capacity);
-    const a = result_arena.allocator();
-    has_result = true;
-    n_cols = batch.columns.len;
-    n_total = batch.len;
-    n_rows = @min(batch.len, max_display_rows);
+fn captureGrid(a: std.mem.Allocator, stmt: []const u8, batch: glacier.Batch) Grid {
+    const n_cols = batch.columns.len;
+    const n_total = batch.len;
+    const n_rows = @min(batch.len, max_display_rows);
     if (n_cols == 0) {
-        headers = &.{};
-        types = &.{};
-        cells = &.{};
-        setStatus("{s}  {d} rows", .{ elapsed_text, n_total });
-        return;
+        return .{
+            .title = clipSql(a, stmt),
+            .headers = &.{},
+            .types = &.{},
+            .cells = &.{},
+            .note = "done",
+        };
     }
-    const hdrs = a.alloc([]const u8, n_cols) catch return oomGrid();
-    const typs = a.alloc([]const u8, n_cols) catch return oomGrid();
-    const vals = a.alloc([]const u8, n_rows * n_cols) catch return oomGrid();
+    const hdrs = a.alloc([]const u8, n_cols) catch return oomGrid(a, stmt);
+    const typs = a.alloc([]const u8, n_cols) catch return oomGrid(a, stmt);
+    const vals = a.alloc([]const u8, n_rows * n_cols) catch return oomGrid(a, stmt);
     for (batch.columns, 0..) |col, c| {
         hdrs[c] = a.dupe(u8, col.name) catch "?";
         typs[c] = a.dupe(u8, @tagName(col.data_type)) catch "?";
@@ -831,37 +901,55 @@ fn captureBatch(batch: glacier.Batch) void {
             vals[r * n_cols + c] = a.dupe(u8, clipCell(t, &clip)) catch "?";
         }
     }
-    headers = hdrs;
-    types = typs;
-    cells = vals;
-    setStatus("{s}  {d} rows  {d} cols", .{ elapsed_text, n_total, n_cols });
+    return .{
+        .title = clipSql(a, stmt),
+        .headers = hdrs,
+        .types = typs,
+        .cells = vals,
+        .n_cols = n_cols,
+        .n_rows = n_rows,
+        .n_total = n_total,
+    };
 }
 
-fn oomGrid() void {
-    n_cols = 0;
-    n_rows = 0;
-    failStatus("oom", .{});
+fn oomGrid(a: std.mem.Allocator, stmt: []const u8) Grid {
+    return .{
+        .title = clipSql(a, stmt),
+        .headers = &.{},
+        .types = &.{},
+        .cells = &.{},
+        .note = "oom",
+        .failed = true,
+    };
 }
 
 fn copyTsv() void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    for (headers, 0..) |h, c| {
-        if (c > 0) out.append(gpa, '\t') catch return;
-        out.appendSlice(gpa, h) catch return;
-    }
-    out.append(gpa, '\n') catch return;
-    var r: usize = 0;
-    while (r < n_rows) : (r += 1) {
-        var c: usize = 0;
-        while (c < n_cols) : (c += 1) {
+    var rows: usize = 0;
+    for (grids) |g| {
+        if (g.n_cols == 0) continue;
+        out.appendSlice(gpa, g.title) catch return;
+        out.append(gpa, '\n') catch return;
+        for (g.headers, 0..) |h, c| {
             if (c > 0) out.append(gpa, '\t') catch return;
-            out.appendSlice(gpa, cells[r * n_cols + c]) catch return;
+            out.appendSlice(gpa, h) catch return;
+        }
+        out.append(gpa, '\n') catch return;
+        var r: usize = 0;
+        while (r < g.n_rows) : (r += 1) {
+            var c: usize = 0;
+            while (c < g.n_cols) : (c += 1) {
+                if (c > 0) out.append(gpa, '\t') catch return;
+                out.appendSlice(gpa, g.cells[r * g.n_cols + c]) catch return;
+            }
+            out.append(gpa, '\n') catch return;
+            rows += 1;
         }
         out.append(gpa, '\n') catch return;
     }
     dvui.clipboardTextSet(out.items);
-    setStatus("copied {d} rows", .{n_rows});
+    setStatus("copied {d} rows", .{rows});
     query_error = false;
 }
 

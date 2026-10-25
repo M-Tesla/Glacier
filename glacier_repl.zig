@@ -20,7 +20,9 @@ const usage_text =
     \\  --oauth-client-id / --oauth-client-secret / --oauth-server / --oauth-scope
     \\  --sigv4-service   glue (default) or s3tables
     \\  --namespace NS    default namespace (default)
-    \\  -c, --command SQL run SQL and exit (repeatable)
+    \\  -c, --command SQL run SQL and exit (repeatable). Several statements
+    \\                    separated by ; each print a result
+    \\  -f, --file FILE   run that SQL script the same way
     \\                    SHOW / ATTACH / DESCRIBE / USE / DETACH work as catalog SQL
     \\                    CREATE / INSERT / COPY FROM / DELETE / UPDATE / MERGE / ALTER ADD COLUMN / DROP / PARTITIONED BY identity on glacier, Hadoop, REST
     \\                    FROM glacier.catalogs / glacier.tables / glacier.snapshots / glacier.files
@@ -57,6 +59,7 @@ const Args = struct {
     sigv4_service: []const u8 = "glue",
     namespace: []const u8 = "default",
     commands: []const []const u8 = &.{},
+    file: ?[]const u8 = null,
     timer: bool = true,
     tui: bool = true,
     help: bool = false,
@@ -200,9 +203,21 @@ pub fn main(init: std.process.Init) !void {
         .timer = &timer,
     };
 
-    if (args.commands.len > 0) {
+    if (args.commands.len > 0 or args.file != null) {
         for (args.commands) |sql| {
             switch (try handleLine(&session, &ctx, sql)) {
+                .ok => {},
+                .quit => return,
+                .fail => die(out),
+            }
+        }
+        if (args.file) |path| {
+            const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8 << 20)) catch {
+                try out.print("glacier: cannot read {s}\n", .{path});
+                die(out);
+            };
+            defer gpa.free(text);
+            switch (try handleLine(&session, &ctx, text)) {
                 .ok => {},
                 .quit => return,
                 .fail => die(out),
@@ -818,9 +833,25 @@ fn runTuiApp(session: *glacier.Session, ctx: *RunCtx) !void {
                             sql_len = 0;
                             continue;
                         }
+                        var parts: std.ArrayList([]const u8) = .empty;
+                        defer parts.deinit(ctx.gpa);
+                        glacier.sql.splitStatements(ctx.gpa, trimmed, &parts) catch {
+                            pane.deinit();
+                            try view.writer.writeAll("error: script too large\n");
+                            sql_len = 0;
+                            continue;
+                        };
+                        if (parts.items.len > 1) {
+                            pane.deinit();
+                            resetAlloc(&view, ctx.gpa);
+                            _ = runStatements(session, ctx, &view.writer, trimmed) catch {};
+                            sql_len = 0;
+                            continue;
+                        }
+                        const one = if (parts.items.len == 1) parts.items[0] else trimmed;
                         resetAlloc(&view, ctx.gpa);
                         const t0 = std.Io.Clock.Timestamp.now(ctx.io, .awake);
-                        const result = execLine(session, trimmed) catch |exec_err| {
+                        const result = execLine(session, one) catch |exec_err| {
                             pane.deinit();
                             const ge = session.lastError() orelse glacier.GlacierError.fromZig(exec_err);
                             try view.writer.print("error: {s}\n", .{ge.message});
@@ -938,21 +969,7 @@ fn runTuiCooked(session: *glacier.Session, ctx: *RunCtx) !void {
         }
 
         resetAlloc(&view, ctx.gpa);
-        const t0 = std.Io.Clock.Timestamp.now(ctx.io, .awake);
-        var result = execLine(session, trimmed) catch |exec_err| {
-            const ge = session.lastError() orelse glacier.GlacierError.fromZig(exec_err);
-            try view.writer.print("error: {s}\n", .{ge.message});
-            continue;
-        };
-        defer result.deinit();
-        const elapsed = t0.durationTo(std.Io.Clock.Timestamp.now(ctx.io, .awake));
-        const max_rows = @max(@as(usize, 5), @as(usize, size.rows) -| 8);
-        if (result.batch.len > 0 or result.batch.columns.len > 0) {
-            try printBatchBoxed(&view.writer, result.batch, max_rows, size.cols);
-        } else {
-            try view.writer.writeAll("(no rows)\n");
-        }
-        if (ctx.timer.*) try printStats(&view.writer, elapsed, result.scan_stats);
+        _ = try runStatements(session, ctx, &view.writer, trimmed);
     }
 }
 
@@ -1414,14 +1431,14 @@ fn numericAlign(dt: glacier.batch.DataType) bool {
     };
 }
 
-fn printResult(ctx: *RunCtx, batch: glacier.Batch) !void {
+fn printResultTo(ctx: *RunCtx, out: *std.Io.Writer, batch: glacier.Batch) !void {
     const tty = std.Io.File.stdout().isTty(ctx.io) catch false;
     if (tty) {
         const size = termSize();
         const max_rows = @max(@as(usize, 20), @as(usize, size.rows) -| 6);
-        try printBatchBoxed(ctx.out, batch, max_rows, size.cols);
+        try printBatchBoxed(out, batch, max_rows, size.cols);
     } else {
-        try printBatch(ctx.out, batch);
+        try printBatch(out, batch);
     }
 }
 
@@ -1843,11 +1860,41 @@ fn die(out: *std.Io.Writer) noreturn {
 
 fn handleLine(session: *glacier.Session, ctx: *RunCtx, line: []const u8) !LineResult {
     if (line.len > 0 and line[0] == '.') return handleDot(session, ctx, line);
+    return runStatements(session, ctx, ctx.out, line);
+}
 
+fn runStatements(session: *glacier.Session, ctx: *RunCtx, out: *std.Io.Writer, script: []const u8) !LineResult {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(ctx.gpa);
+    glacier.sql.splitStatements(ctx.gpa, script, &parts) catch return error.OutOfMemory;
+    if (parts.items.len == 0) {
+        try out.print("error: empty SQL\n", .{});
+        return .fail;
+    }
+    for (parts.items, 0..) |stmt, i| {
+        if (parts.items.len > 1) try out.print("-- {s}\n", .{stmtHead(stmt)});
+        switch (try runOne(session, ctx, out, stmt)) {
+            .ok => {},
+            .quit => return .quit,
+            .fail => return .fail,
+        }
+        if (parts.items.len > 1 and i + 1 < parts.items.len) try out.writeByte('\n');
+    }
+    return .ok;
+}
+
+fn stmtHead(stmt: []const u8) []const u8 {
+    const n = @min(stmt.len, 120);
+    const slice = stmt[0..n];
+    if (std.mem.indexOfAny(u8, slice, "\r\n")) |k| return std.mem.trim(u8, slice[0..k], " \t");
+    return slice;
+}
+
+fn runOne(session: *glacier.Session, ctx: *RunCtx, out: *std.Io.Writer, line: []const u8) !LineResult {
     const t0 = std.Io.Clock.Timestamp.now(ctx.io, .awake);
     var result = execLine(session, line) catch |err| {
         const ge = session.lastError() orelse glacier.GlacierError.fromZig(err);
-        try ctx.out.print("error: {s}\n", .{ge.message});
+        try out.print("error: {s}\n", .{ge.message});
         return .fail;
     };
     defer result.deinit();
@@ -1855,12 +1902,12 @@ fn handleLine(session: *glacier.Session, ctx: *RunCtx, line: []const u8) !LineRe
 
     const batch = result.batch;
     if (batch.len == 0 and batch.columns.len == 0) {
-        try ctx.out.print("(no rows)\n", .{});
-        if (ctx.timer.*) try printStats(ctx.out, elapsed, result.scan_stats);
+        try out.print("(no rows)\n", .{});
+        if (ctx.timer.*) try printStats(out, elapsed, result.scan_stats);
         return .ok;
     }
-    try printResult(ctx, batch);
-    if (ctx.timer.*) try printStats(ctx.out, elapsed, result.scan_stats);
+    try printResultTo(ctx, out, batch);
+    if (ctx.timer.*) try printStats(out, elapsed, result.scan_stats);
     return .ok;
 }
 
@@ -1929,6 +1976,10 @@ fn parseArgs(
             i += 1;
             if (i >= argv.len) return error.MissingCommand;
             try commands.append(gpa, argv[i]);
+        } else if (eql(a, "-f") or eql(a, "--file")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.file = argv[i];
         } else if (eql(a, "--catalog")) {
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
