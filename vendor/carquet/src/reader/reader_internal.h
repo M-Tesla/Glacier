@@ -281,6 +281,19 @@ carquet_status_t carquet_column_reader_seek_to_data_page(
     int64_t values_before_page,
     carquet_error_t* error);
 
+/**
+ * Build an offset index by walking data-page headers. Used when the file
+ * was written without a page index, so a row-range read can seek to a page
+ * instead of decompressing every preceding page. Flat columns only.
+ * Caller frees with carquet_offset_index_free().
+ */
+carquet_offset_index_t* carquet_column_synthesize_offset_index(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error);
+
+carquet_offset_index_t* carquet_offset_index_from_locations(
+    const carquet_page_location_t* locs, int32_t count);
+
 /* ============================================================================
  * Page Decompression (shared between page_reader and batch_reader)
  * ============================================================================

@@ -9,7 +9,7 @@ const parquetPath = join(here, "../../tests/formats/sales.parquet");
 
 const wasm = readFileSync(wasmPath);
 const g = await Glacier.instantiate(wasm);
-if (g.version() !== "0.6.1") throw new Error(`version ${g.version()}`);
+if (g.version() !== "0.6.2") throw new Error(`version ${g.version()}`);
 
 const empty = g.openEmpty();
 const r1 = g.query(empty, "select 1");

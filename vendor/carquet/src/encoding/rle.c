@@ -205,7 +205,30 @@ int64_t carquet_rle_decoder_get_batch(
             dec->run_remaining -= to_fill;
 
         } else {
-            /* Bit-packed run */
+            /* Bit-packed run. Unpack whole groups of 8 through the wide
+             * unpacker when the 8-value buffer is empty. The tail still
+             * goes through fill_bitpack_buffer so the decoder position
+             * stays aligned with the one-value API. */
+            while (read < count && dec->run_remaining >= 8 &&
+                   dec->bitpack_pos >= dec->bitpack_count &&
+                   dec->bit_width >= 1) {
+                int64_t groups = dec->run_remaining / 8;
+                int64_t room = (count - read) / 8;
+                if (room < groups) groups = room;
+                if (groups > 256) groups = 256;
+                if (groups < 1) break;
+                size_t nbytes = (size_t)groups * (size_t)dec->bit_width;
+                if (dec->pos + nbytes > dec->size) break;
+                uint32_t tmp[2048];
+                size_t used = carquet_bitunpack_32(
+                    dec->data + dec->pos, (size_t)groups * 8, dec->bit_width, tmp);
+                if (used == 0 || used > nbytes) break;
+                int64_t n = groups * 8;
+                memcpy(output + read, tmp, (size_t)n * sizeof(uint32_t));
+                dec->pos += used;
+                dec->run_remaining -= n;
+                read += n;
+            }
             while (read < count && dec->run_remaining > 0) {
                 if (dec->bitpack_pos >= dec->bitpack_count) {
                     if (!fill_bitpack_buffer(dec)) {
@@ -213,7 +236,6 @@ int64_t carquet_rle_decoder_get_batch(
                     }
                 }
 
-                /* Copy from buffer */
                 while (read < count && dec->bitpack_pos < dec->bitpack_count &&
                        dec->run_remaining > 0) {
                     output[read++] = dec->bitpack_buffer[dec->bitpack_pos++];

@@ -1927,8 +1927,15 @@ static carquet_status_t filter_load_offset_indexes(
         carquet_error_t local = CARQUET_ERROR_INIT;
         br->projected_offset_indexes[i] = carquet_reader_get_offset_index(
             br->reader, row_group_index, br->projected_columns[i], &local);
-        /* NULL is allowed (no offset index ⇒ fallback read-and-discard); the
-         * skip path is only taken for that column. */
+        /* A file written without a page index still gets one, built from
+         * the page headers, so a row-range split seeks instead of
+         * decompressing the prefix. NULL stays the read-and-discard path. */
+        if (!br->projected_offset_indexes[i] && br->col_readers &&
+            br->col_readers[i]) {
+            carquet_error_t syn = CARQUET_ERROR_INIT;
+            br->projected_offset_indexes[i] =
+                carquet_column_synthesize_offset_index(br->col_readers[i], &syn);
+        }
     }
     br->projected_oi_rg = row_group_index;
     return CARQUET_OK;

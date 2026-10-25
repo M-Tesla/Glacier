@@ -19,7 +19,7 @@ class TestQuery(unittest.TestCase):
             con.close()
 
     def test_version(self):
-        self.assertEqual(glacier.version(), "0.6.1")
+        self.assertEqual(glacier.version(), "0.6.2")
         self.assertEqual(glacier.api_version(), 2)
 
     def test_catalog_session(self):

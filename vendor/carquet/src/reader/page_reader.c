@@ -1808,8 +1808,18 @@ static carquet_status_t load_dictionary_page_mmap(
     const uint8_t* mmap_data = file_reader->mmap_data;
     const parquet_column_metadata_t* col_meta = reader->col_meta;
 
-    /* Parse page header directly from mmap */
-    int64_t dict_offset = col_meta->dictionary_page_offset;
+    /* Parse page header directly from mmap.
+     * Some writers (Spark) emit a dictionary page at data_page_offset and
+     * leave dictionary_page_offset unset. In that case the page we are
+     * about to read is the dictionary. */
+    int64_t dict_offset;
+    if (col_meta->has_dictionary_page_offset) {
+        dict_offset = col_meta->dictionary_page_offset;
+    } else if (!checked_add_i64(reader->data_start_offset, reader->current_page,
+                                &dict_offset)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset overflow");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
     if (dict_offset < 0 || (size_t)dict_offset >= file_reader->file_size) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset out of range");
         return CARQUET_ERROR_INVALID_PAGE;
@@ -1985,7 +1995,14 @@ static carquet_status_t load_dictionary_page_fread(
 
     carquet_reader_t* file_reader = reader->file_reader;
     const parquet_column_metadata_t* col_meta = reader->col_meta;
-    int64_t dict_offset = col_meta->dictionary_page_offset;
+    int64_t dict_offset;
+    if (col_meta->has_dictionary_page_offset) {
+        dict_offset = col_meta->dictionary_page_offset;
+    } else if (!checked_add_i64(reader->data_start_offset, reader->current_page,
+                                &dict_offset)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset overflow");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
 
     /* Read page header (from prebuffer cache or file) */
     parquet_page_header_t page_header;
@@ -2150,6 +2167,12 @@ static carquet_status_t load_next_page_mmap(
         return status;
     }
 
+    if (page_header.type == CARQUET_PAGE_DICTIONARY && !reader->has_dictionary) {
+        status = load_dictionary_page_mmap(reader, error);
+        if (status != CARQUET_OK) return status;
+        reader->current_page = 0;
+        return load_next_page_mmap(reader, error);
+    }
     if (page_header.type != CARQUET_PAGE_DATA && page_header.type != CARQUET_PAGE_DATA_V2) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Expected data page");
         return CARQUET_ERROR_INVALID_PAGE;
@@ -2390,6 +2413,12 @@ static carquet_status_t load_next_page_fread(
         return status;
     }
 
+    if (page_header.type == CARQUET_PAGE_DICTIONARY && !reader->has_dictionary) {
+        status = load_dictionary_page_fread(reader, error);
+        if (status != CARQUET_OK) return status;
+        reader->current_page = 0;
+        return load_next_page_fread(reader, error);
+    }
     if (page_header.type != CARQUET_PAGE_DATA && page_header.type != CARQUET_PAGE_DATA_V2) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Expected data page");
         return CARQUET_ERROR_INVALID_PAGE;
@@ -2667,6 +2696,98 @@ static carquet_status_t parse_header_at_offset(
     }
     return read_and_parse_page_header_fread(
         file_reader, offset, hdr, hdr_size, error);
+}
+
+carquet_offset_index_t* carquet_column_synthesize_offset_index(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+
+    if (!reader || !reader->col_meta || !reader->file_reader) return NULL;
+    if (reader->max_rep_level > 0) return NULL;
+
+    carquet_status_t st = carquet_column_ensure_dictionary_loaded(reader, error);
+    if (st != CARQUET_OK) return NULL;
+
+    const int64_t total = reader->col_meta->num_values;
+    if (total <= 0) return NULL;
+
+    int32_t cap = 64;
+    int32_t n = 0;
+    carquet_page_location_t* locs =
+        carquet_mem_malloc((size_t)cap * sizeof(*locs));
+    if (!locs) return NULL;
+
+    int64_t pos = reader->data_start_offset;
+    int64_t acc = 0;
+    const int64_t file_size = (int64_t)reader->file_reader->file_size;
+
+    while (acc < total) {
+        if (pos < 0 || pos >= file_size || n >= 1000000) {
+            carquet_mem_free(locs);
+            return NULL;
+        }
+        parquet_page_header_t hdr;
+        size_t hdr_size = 0;
+        st = parse_header_at_offset(reader->file_reader, pos, &hdr, &hdr_size, error);
+        if (st != CARQUET_OK) {
+            carquet_mem_free(locs);
+            return NULL;
+        }
+        if (hdr.type != CARQUET_PAGE_DATA && hdr.type != CARQUET_PAGE_DATA_V2) {
+            carquet_mem_free(locs);
+            return NULL;
+        }
+
+        int32_t rows = (hdr.type == CARQUET_PAGE_DATA_V2)
+            ? hdr.data_page_header_v2.num_rows
+            : hdr.data_page_header.num_values;
+        if (rows <= 0) {
+            rows = (hdr.type == CARQUET_PAGE_DATA_V2)
+                ? hdr.data_page_header_v2.num_values
+                : hdr.data_page_header.num_values;
+        }
+        if (rows <= 0) {
+            carquet_mem_free(locs);
+            return NULL;
+        }
+
+        if (n == cap) {
+            int32_t ncap = cap * 2;
+            carquet_page_location_t* grown = carquet_mem_realloc(
+                locs, (size_t)ncap * sizeof(*locs));
+            if (!grown) {
+                carquet_mem_free(locs);
+                return NULL;
+            }
+            locs = grown;
+            cap = ncap;
+        }
+
+        int64_t page_bytes = (int64_t)hdr_size + (int64_t)hdr.compressed_page_size;
+        if (page_bytes <= 0 || page_bytes > INT32_MAX) {
+            carquet_mem_free(locs);
+            return NULL;
+        }
+        locs[n].offset = pos;
+        locs[n].compressed_size = (int32_t)page_bytes;
+        locs[n].first_row_index = acc;
+        n++;
+        if (acc > INT64_MAX - rows) {
+            carquet_mem_free(locs);
+            return NULL;
+        }
+        acc += rows;
+        pos += page_bytes;
+    }
+
+    if (acc != total || n == 0) {
+        carquet_mem_free(locs);
+        return NULL;
+    }
+
+    carquet_offset_index_t* oi = carquet_offset_index_from_locations(locs, n);
+    carquet_mem_free(locs);
+    return oi;
 }
 
 carquet_status_t carquet_column_reader_seek_to_data_page(

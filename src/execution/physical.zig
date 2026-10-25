@@ -1959,6 +1959,9 @@ fn executeCapped(
     if (query.needsAgg() and query.group_by.len == 0 and query.grouping_sets.len == 0) {
         return executeGlobalAgg(allocator, t, files, query, fallback_schema, stats, wanted, vec_size);
     }
+    if (hashAggFast(query)) {
+        return executeHashAgg(allocator, t, files, query, fallback_schema, stats, wanted, vec_size);
+    }
 
     var tmp = try spill.Dir.init(t.allocator, t.io);
     defer tmp.deinit();
@@ -2063,6 +2066,14 @@ const CapCtx = struct {
         wanted: ?[]const []const u8,
         vec_size: i32,
     ) !void {
+        if (comptime builtin.cpu.arch != .wasm32 and !builtin.single_threaded) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+            defer scratch.deinit();
+            if (try parallelParquetScan(scratch.allocator(), t, file, wanted, self.query.where, self.stats, vec_size)) |batch| {
+                if (batch.columns.len > 0) try self.ingestVec(batch);
+                return;
+            }
+        }
         var reader = try parquet.openLocation(self.allocator, t, file.path);
         defer reader.close();
         const picked = try pickParquetColumns(self.allocator, reader, wanted);
@@ -2296,6 +2307,1256 @@ const CapCtx = struct {
     }
 };
 
+fn aggIsDistinct(query: sql.Query) bool {
+    for (query.items) |item| {
+        if (item == .agg and item.agg.distinct) return true;
+    }
+    return false;
+}
+
+fn hashAggFast(query: sql.Query) bool {
+    if (query.grouping_sets.len != 0 or query.group_by.len != 1 or query.hasWindow()) return false;
+    if (aggIsDistinct(query)) return false;
+    for (query.items) |item| {
+        switch (item) {
+            .agg, .column, .grouping => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+const SimplePred = struct {
+    name: []const u8,
+    op: sql.CmpOp,
+    lit: sql.Literal,
+};
+
+fn simplePred(expr: *const sql.BoolExpr) ?SimplePred {
+    if (expr.* != .cmp) return null;
+    const c = expr.cmp;
+    if (sql.asColumn(c.left)) |name| {
+        if (sql.asLiteral(c.right)) |lit| return .{ .name = name, .op = c.op, .lit = lit };
+    }
+    if (sql.asColumn(c.right)) |name| {
+        if (sql.asLiteral(c.left)) |lit| return .{ .name = name, .op = flipCmp(c.op), .lit = lit };
+    }
+    return null;
+}
+
+fn colSame(a: []const u8, b: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(a, b)) return true;
+    const at = if (std.mem.lastIndexOfScalar(u8, a, '.')) |d| a[d + 1 ..] else a;
+    const bt = if (std.mem.lastIndexOfScalar(u8, b, '.')) |d| b[d + 1 ..] else b;
+    return std.ascii.eqlIgnoreCase(at, bt);
+}
+
+fn arrowIsNull(nulls: ?[*]const u8, i: usize) bool {
+    const p = nulls orelse return false;
+    const bit: u8 = (p[i >> 3] >> @intCast(i & 7)) & 1;
+    return bit == 0;
+}
+
+fn bitmapHasNull(nulls: ?[*]const u8, n: usize) bool {
+    if (nulls == null or n == 0) return false;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (arrowIsNull(nulls, i)) return true;
+    }
+    return false;
+}
+
+fn cmpI64(op: sql.CmpOp, v: i64, lit: i64) bool {
+    return switch (op) {
+        .eq => v == lit,
+        .ne => v != lit,
+        .lt => v < lit,
+        .le => v <= lit,
+        .gt => v > lit,
+        .ge => v >= lit,
+    };
+}
+
+fn cmpF64(op: sql.CmpOp, v: f64, lit: f64) bool {
+    return switch (op) {
+        .eq => v == lit,
+        .ne => v != lit,
+        .lt => v < lit,
+        .le => v <= lit,
+        .gt => v > lit,
+        .ge => v >= lit,
+    };
+}
+
+fn predKeepI64(pred: ?SimplePred, v: i64) bool {
+    const p = pred orelse return true;
+    const lit = switch (p.lit) {
+        .int => |n| n,
+        .float => |f| blk: {
+            if (f < -(1 << 53) or f > (1 << 53)) return true;
+            break :blk @as(i64, @intFromFloat(f));
+        },
+        else => return true,
+    };
+    return cmpI64(p.op, v, lit);
+}
+
+const NumCol = struct {
+    nulls: ?[*]const u8 = null,
+    n: usize,
+    kind: enum { i32, i64, f32, f64 },
+    i32s: []const i32 = &.{},
+    i64s: []const i64 = &.{},
+    f32s: []const f32 = &.{},
+    f64s: []const f64 = &.{},
+    idx: []const u32 = &.{},
+    dict: bool = false,
+
+    fn atI64(self: NumCol, i: usize) ?i64 {
+        if (arrowIsNull(self.nulls, i)) return null;
+        if (self.dict) {
+            const ix = self.idx[i];
+            return switch (self.kind) {
+                .i32 => if (ix >= self.i32s.len) null else self.i32s[ix],
+                .i64 => if (ix >= self.i64s.len) null else self.i64s[ix],
+                .f32, .f64 => null,
+            };
+        }
+        return switch (self.kind) {
+            .i32 => self.i32s[i],
+            .i64 => self.i64s[i],
+            else => null,
+        };
+    }
+
+    fn atF64(self: NumCol, i: usize) ?f64 {
+        if (arrowIsNull(self.nulls, i)) return null;
+        if (self.dict) {
+            const ix = self.idx[i];
+            return switch (self.kind) {
+                .f64 => if (ix >= self.f64s.len) null else self.f64s[ix],
+                .f32 => if (ix >= self.f32s.len) null else self.f32s[ix],
+                .i32 => if (ix >= self.i32s.len) null else @floatFromInt(self.i32s[ix]),
+                .i64 => if (ix >= self.i64s.len) null else @floatFromInt(self.i64s[ix]),
+            };
+        }
+        return switch (self.kind) {
+            .f64 => self.f64s[i],
+            .f32 => self.f32s[i],
+            .i32 => @floatFromInt(self.i32s[i]),
+            .i64 => @floatFromInt(self.i64s[i]),
+        };
+    }
+};
+
+fn alignedSlice(comptime T: type, ptr: [*]const u8, n: usize) []const T {
+    const p: [*]const T = @ptrCast(@alignCast(ptr));
+    return p[0..n];
+}
+
+fn loadDictFixed(comptime T: type, dict: parquet.RowBatch.DictCol, alloc: std.mem.Allocator) ![]T {
+    const n: usize = @intCast(dict.dict_count);
+    const width = @sizeOf(T);
+    const out = try alloc.alloc(T, n);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const p = dict.dict_ptr + i * width;
+        out[i] = switch (T) {
+            i32 => std.mem.readInt(i32, p[0..4], .little),
+            i64 => std.mem.readInt(i64, p[0..8], .little),
+            f32 => @bitCast(std.mem.readInt(u32, p[0..4], .little)),
+            f64 => @bitCast(std.mem.readInt(u64, p[0..8], .little)),
+            else => @compileError("dict width"),
+        };
+    }
+    return out;
+}
+
+fn loadNumCol(
+    alloc: std.mem.Allocator,
+    reader: parquet.Reader,
+    rb: parquet.RowBatch,
+    picked_i: usize,
+    file_col: i32,
+) !?NumCol {
+    const meta = reader.column(file_col) orelse return error.ParquetOpenFailed;
+    const logical = parquet.columnLogical(reader, file_col);
+    const lid: parquet.LogicalId = @enumFromInt(logical.id);
+    if (lid == .decimal or lid == .timestamp or lid == .uuid) return null;
+    if (rb.columnDictionary(@intCast(picked_i))) |dict| {
+        if (dict.offsets != null) return null;
+        const n = dict.indices.len;
+        return switch (meta.physical_type) {
+            .int32 => .{ .n = n, .kind = .i32, .dict = true, .idx = dict.indices, .nulls = dict.nulls, .i32s = try loadDictFixed(i32, dict, alloc) },
+            .int64 => .{ .n = n, .kind = .i64, .dict = true, .idx = dict.indices, .nulls = dict.nulls, .i64s = try loadDictFixed(i64, dict, alloc) },
+            .float => .{ .n = n, .kind = .f32, .dict = true, .idx = dict.indices, .nulls = dict.nulls, .f32s = try loadDictFixed(f32, dict, alloc) },
+            .double => .{ .n = n, .kind = .f64, .dict = true, .idx = dict.indices, .nulls = dict.nulls, .f64s = try loadDictFixed(f64, dict, alloc) },
+            else => null,
+        };
+    }
+    const vals = rb.columnValues(@intCast(picked_i)) catch return null;
+    if (vals.n < 0) return null;
+    const n: usize = @intCast(vals.n);
+    if (n == 0) return .{ .n = 0, .kind = .i64 };
+    return switch (meta.physical_type) {
+        .int32 => .{ .n = n, .kind = .i32, .nulls = vals.nulls, .i32s = alignedSlice(i32, vals.ptr, n) },
+        .int64 => .{ .n = n, .kind = .i64, .nulls = vals.nulls, .i64s = alignedSlice(i64, vals.ptr, n) },
+        .float => .{ .n = n, .kind = .f32, .nulls = vals.nulls, .f32s = alignedSlice(f32, vals.ptr, n) },
+        .double => .{ .n = n, .kind = .f64, .nulls = vals.nulls, .f64s = alignedSlice(f64, vals.ptr, n) },
+        else => null,
+    };
+}
+
+fn findPicked(reader: parquet.Reader, picked: []const i32, name: []const u8) ?usize {
+    for (picked, 0..) |file_col, i| {
+        const meta = reader.column(file_col) orelse continue;
+        if (colSame(meta.name, name)) return i;
+    }
+    return null;
+}
+
+fn applyPartial(states: []AggState, query: sql.Query, n: u64, sum_f: f64, sum_i: i64, is_float: bool) void {
+    var si: usize = 0;
+    for (query.items) |item| {
+        if (item != .agg) continue;
+        const st = &states[si];
+        si += 1;
+        switch (item.agg.kind) {
+            .count => st.count += n,
+            .sum, .avg => {
+                st.count += n;
+                st.inited = true;
+                if (is_float) {
+                    st.is_float = true;
+                    st.sum_f += sum_f;
+                } else {
+                    st.sum_i += sum_i;
+                    st.sum_f = @floatFromInt(st.sum_i);
+                }
+            },
+            .min => if (n == 1) {
+                st.count += 1;
+                if (is_float) {
+                    st.is_float = true;
+                    if (!st.inited or sum_f < st.min_f) st.min_f = sum_f;
+                } else if (!st.inited or sum_i < st.min_i) st.min_i = sum_i;
+                st.inited = true;
+            },
+            .max => if (n == 1) {
+                st.count += 1;
+                if (is_float) {
+                    st.is_float = true;
+                    if (!st.inited or sum_f > st.max_f) st.max_f = sum_f;
+                } else if (!st.inited or sum_i > st.max_i) st.max_i = sum_i;
+                st.inited = true;
+            },
+        }
+    }
+}
+
+fn feedGlobalFast(
+    states: []AggState,
+    reader: parquet.Reader,
+    rb: parquet.RowBatch,
+    picked: []const i32,
+    query: sql.Query,
+) !bool {
+    if (aggIsDistinct(query)) return false;
+    const pred: ?SimplePred = if (query.where) |w| simplePred(w) orelse return false else null;
+    var arena = std.heap.ArenaAllocator.init(reader.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var value_i: ?usize = null;
+    var pred_i: ?usize = null;
+    var si: usize = 0;
+    for (query.items) |item| {
+        if (item != .agg) continue;
+        const agg = item.agg;
+        if (agg.kind != .count and agg.kind != .sum and agg.kind != .avg and agg.kind != .min and agg.kind != .max)
+            return false;
+        if (agg.arg) |arg| {
+            const pi = findPicked(reader, picked, arg) orelse return false;
+            if (value_i) |v| {
+                if (v != pi) return false;
+            } else value_i = pi;
+        } else if (agg.kind != .count) return false;
+        si += 1;
+    }
+    if (pred) |p| pred_i = findPicked(reader, picked, p.name) orelse return false;
+    if (value_i == null and pred_i == null) return false;
+
+    const nrows_src = value_i orelse pred_i.?;
+    const col = try loadNumCol(aa, reader, rb, nrows_src, picked[nrows_src]) orelse return false;
+    if (col.n == 0) return true;
+    var pred_col = col;
+    var val_col = col;
+    if (pred_i) |pi| {
+        if (value_i != null and pi != value_i.?) {
+            pred_col = try loadNumCol(aa, reader, rb, pi, picked[pi]) orelse return false;
+            if (pred_col.n != col.n) return false;
+        }
+    }
+    if (value_i) |pi| {
+        if (pi != nrows_src) {
+            val_col = try loadNumCol(aa, reader, rb, pi, picked[pi]) orelse return false;
+            if (val_col.n != col.n) return false;
+        }
+    }
+    const nullable = bitmapHasNull(col.nulls, col.n) or bitmapHasNull(pred_col.nulls, pred_col.n) or bitmapHasNull(val_col.nulls, val_col.n);
+
+    const fast_sum = !nullable and pred == null and value_i != null and val_col.kind == .f64 and val_col.dict and blk: {
+        var ok = true;
+        for (query.items) |item| {
+            if (item != .agg) continue;
+            if (item.agg.kind == .min or item.agg.kind == .max) ok = false;
+        }
+        break :blk ok;
+    };
+    if (fast_sum) {
+        var s: f64 = 0;
+        for (val_col.idx) |ix| {
+            if (ix >= val_col.f64s.len) return error.ParquetOpenFailed;
+            s += val_col.f64s[ix];
+        }
+        applyPartial(states, query, @intCast(val_col.n), s, 0, true);
+        return true;
+    }
+
+    if (!nullable and pred != null and value_i != null and val_col.dict and val_col.kind == .f64 and pred_col.dict and pred_col.kind == .i32) {
+        const p = pred.?;
+        const lit: i64 = switch (p.lit) {
+            .int => |iv| iv,
+            .float => |fv| @as(i64, @intFromFloat(fv)),
+            else => return false,
+        };
+        if (pred_col.idx.len != val_col.idx.len) return false;
+        var s: f64 = 0;
+        var matched: u64 = 0;
+        for (pred_col.idx, val_col.idx) |ki, vi| {
+            if (ki >= pred_col.i32s.len or vi >= val_col.f64s.len) return error.ParquetOpenFailed;
+            if (!cmpI64(p.op, pred_col.i32s[ki], lit)) continue;
+            s += val_col.f64s[vi];
+            matched += 1;
+        }
+        applyPartial(states, query, matched, s, 0, true);
+        return true;
+    }
+
+    if (nullable) return false;
+    const n = col.n;
+    var matched: u64 = 0;
+    var sum_f: f64 = 0;
+    var sum_i: i64 = 0;
+    var min_f: f64 = 0;
+    var max_f: f64 = 0;
+    var min_i: i64 = 0;
+    var max_i: i64 = 0;
+    var extreme = false;
+    const as_float = val_col.kind == .f32 or val_col.kind == .f64;
+    var row: usize = 0;
+    while (row < n) : (row += 1) {
+        if (pred) |p| {
+            if (pred_col.kind == .f32 or pred_col.kind == .f64) {
+                const v = pred_col.atF64(row) orelse continue;
+                const lit: f64 = switch (p.lit) {
+                    .int => |iv| @floatFromInt(iv),
+                    .float => |fv| fv,
+                    else => return false,
+                };
+                if (!cmpF64(p.op, v, lit)) continue;
+            } else {
+                const v = pred_col.atI64(row) orelse continue;
+                if (!predKeepI64(p, v)) continue;
+            }
+        }
+        matched += 1;
+        if (value_i != null) {
+            if (as_float) {
+                const v = val_col.atF64(row) orelse return false;
+                sum_f += v;
+                if (!extreme or v < min_f) min_f = v;
+                if (!extreme or v > max_f) max_f = v;
+                extreme = true;
+            } else {
+                const v = val_col.atI64(row) orelse return false;
+                sum_i += v;
+                if (!extreme or v < min_i) min_i = v;
+                if (!extreme or v > max_i) max_i = v;
+                extreme = true;
+            }
+        }
+    }
+    if (value_i == null) {
+        var csi: usize = 0;
+        for (query.items) |item| {
+            if (item != .agg) continue;
+            states[csi].count += matched;
+            csi += 1;
+        }
+        return true;
+    }
+    applyPartial(states, query, matched, sum_f, sum_i, as_float);
+    if (extreme) {
+        var msi: usize = 0;
+        for (query.items) |item| {
+            if (item != .agg) continue;
+            const st = &states[msi];
+            msi += 1;
+            if (item.agg.kind == .min) {
+                if (as_float) {
+                    st.is_float = true;
+                    if (!st.inited or min_f < st.min_f) st.min_f = min_f;
+                } else if (!st.inited or min_i < st.min_i) st.min_i = min_i;
+                st.inited = true;
+            } else if (item.agg.kind == .max) {
+                if (as_float) {
+                    st.is_float = true;
+                    if (!st.inited or max_f > st.max_f) st.max_f = max_f;
+                } else if (!st.inited or max_i > st.max_i) st.max_i = max_i;
+                st.inited = true;
+            }
+        }
+    }
+    return true;
+}
+
+const GroupAcc = struct {
+    alloc: std.mem.Allocator,
+    ints: std.AutoArrayHashMapUnmanaged(i64, []AggState) = .empty,
+    strs: std.StringArrayHashMapUnmanaged([]AggState) = .empty,
+    kind: enum { none, ints, strs } = .none,
+    key_dt: DataType = .int64,
+    sum_float: bool = false,
+
+    fn deinit(self: *GroupAcc) void {
+        var ii = self.ints.iterator();
+        while (ii.next()) |e| self.alloc.free(e.value_ptr.*);
+        self.ints.deinit(self.alloc);
+        var si = self.strs.iterator();
+        while (si.next()) |e| {
+            self.alloc.free(e.key_ptr.*);
+            self.alloc.free(e.value_ptr.*);
+        }
+        self.strs.deinit(self.alloc);
+    }
+
+    fn touchInt(self: *GroupAcc, key: i64, query: sql.Query) ![]AggState {
+        self.kind = .ints;
+        const gop = try self.ints.getOrPut(self.alloc, key);
+        if (!gop.found_existing) gop.value_ptr.* = try makeStates(self.alloc, query);
+        return gop.value_ptr.*;
+    }
+};
+
+fn mergeAggInto(dst: *AggState, src: AggState) void {
+    switch (dst.kind) {
+        .count => dst.count += src.count,
+        .sum, .avg => {
+            dst.count += src.count;
+            if (src.is_float or dst.is_float) {
+                const base: f64 = if (dst.is_float) dst.sum_f else @floatFromInt(dst.sum_i);
+                const add: f64 = if (src.is_float) src.sum_f else @floatFromInt(src.sum_i);
+                dst.sum_f = base + add;
+                dst.is_float = true;
+            } else {
+                dst.sum_i += src.sum_i;
+                dst.sum_f = @floatFromInt(dst.sum_i);
+            }
+            dst.inited = dst.inited or src.inited;
+        },
+        .min => {
+            dst.count += src.count;
+            if (!src.inited) return;
+            if (!dst.inited) {
+                dst.* = src;
+                dst.kind = .min;
+                return;
+            }
+            if (src.is_float or dst.is_float) {
+                const a: f64 = if (dst.is_float) dst.min_f else @floatFromInt(dst.min_i);
+                const b: f64 = if (src.is_float) src.min_f else @floatFromInt(src.min_i);
+                dst.min_f = @min(a, b);
+                dst.is_float = true;
+            } else if (src.min_i < dst.min_i) dst.min_i = src.min_i;
+            dst.inited = true;
+        },
+        .max => {
+            dst.count += src.count;
+            if (!src.inited) return;
+            if (!dst.inited) {
+                dst.* = src;
+                dst.kind = .max;
+                return;
+            }
+            if (src.is_float or dst.is_float) {
+                const a: f64 = if (dst.is_float) dst.max_f else @floatFromInt(dst.max_i);
+                const b: f64 = if (src.is_float) src.max_f else @floatFromInt(src.max_i);
+                dst.max_f = @max(a, b);
+                dst.is_float = true;
+            } else if (src.max_i > dst.max_i) dst.max_i = src.max_i;
+            dst.inited = true;
+        },
+    }
+}
+
+fn columnsHaveOffsetIndex(reader: parquet.Reader, picked: []const i32) bool {
+    if (picked.len == 0 or reader.numRowGroups() < 1) return false;
+    for (picked) |col| {
+        if (reader.hasOffsetIndex(0, col)) continue;
+        if (reader.columnRepeats(col)) return false;
+    }
+    return true;
+}
+
+fn numericFileCol(reader: parquet.Reader, file_col: i32) bool {
+    const meta = reader.column(file_col) orelse return false;
+    switch (meta.physical_type) {
+        .int32, .int64, .float, .double => {},
+        else => return false,
+    }
+    const logical = parquet.columnLogical(reader, file_col);
+    const lid: parquet.LogicalId = @enumFromInt(logical.id);
+    return lid != .decimal and lid != .timestamp and lid != .uuid;
+}
+
+const GSlice = struct {
+    path: []const u8,
+    query: sql.Query,
+    wanted: ?[]const []const u8,
+    vec_size: i32,
+    lo: i32,
+    hi: i32,
+    row_off: i64 = 0,
+    row_len: i64 = 0,
+    stats: ?*ScanStats,
+    cancel: ?*CancelState,
+    states: []AggState = &.{},
+    any: bool = false,
+    slow: bool = false,
+    err: ?anyerror = null,
+};
+
+fn globalSliceJob(job: *GSlice) error{Canceled}!void {
+    bindCancel(job.cancel);
+    defer bindCancel(null);
+    globalSliceJobInner(job) catch |err| switch (err) {
+        error.QueryCanceled => return error.Canceled,
+        else => job.err = err,
+    };
+}
+
+fn globalSliceJobInner(job: *GSlice) !void {
+    const heap = std.heap.smp_allocator;
+    job.states = try makeStates(heap, job.query);
+    var reader = try parquet.openLocalPath(heap, job.path);
+    defer reader.close();
+    const picked = try pickParquetColumns(heap, reader, job.wanted);
+    defer heap.free(picked);
+    const ranged = job.row_len > 0;
+    const nrg: usize = if (ranged) 0 else @intCast(@max(reader.numRowGroups(), 0));
+    var seen: []u8 = &.{};
+    if (!ranged and job.query.where != null) seen = try heap.alloc(u8, nrg);
+    defer if (seen.len > 0) heap.free(seen);
+    if (seen.len > 0) @memset(seen, 0);
+    var slice = RgSlice{
+        .lo = job.lo,
+        .hi = job.hi,
+        .where = job.query.where,
+        .stats = job.stats,
+        .seen = seen,
+    };
+    var hook = parquet.RgHook{ .keep = keepRowGroupSlice, .user = &slice };
+    var br = try reader.openBatchFilteredEx(picked, job.vec_size, if (ranged) null else &hook, true);
+    if (ranged) try br.setRowRange(job.row_off, job.row_len);
+    defer br.close();
+    while (try br.next()) |rb_val| {
+        try checkCancel();
+        var rb = rb_val;
+        defer rb.deinit();
+        if (rb.numRows() <= 0) continue;
+        if (!try feedGlobalFast(job.states, reader, rb, picked, job.query)) {
+            job.slow = true;
+            return;
+        }
+        job.any = true;
+    }
+}
+
+fn parallelParquetGlobal(
+    allocator: std.mem.Allocator,
+    t: vfs.Transport,
+    file: iceberg.DataFile,
+    query: sql.Query,
+    states: []AggState,
+    any: *bool,
+    sample: *?Batch,
+    stats: ?*ScanStats,
+    wanted: ?[]const []const u8,
+    vec_size: i32,
+) !bool {
+    if (comptime builtin.cpu.arch == .wasm32 or builtin.single_threaded) return false;
+    if (file.bytes != null or aws.isRemote(file.path)) return false;
+    const width = scanWidth();
+    if (width < 2 or aggIsDistinct(query)) return false;
+    if (query.where) |w| if (simplePred(w) == null) return false;
+
+    const plan = blk: {
+        var reader = try parquet.openLocation(allocator, t, file.path);
+        defer reader.close();
+        const n = reader.numRowGroups();
+        const picked = try pickParquetColumns(allocator, reader, wanted);
+        defer allocator.free(picked);
+        if (picked.len == 0) return false;
+        for (query.items) |item| {
+            if (item != .agg) continue;
+            switch (item.agg.kind) {
+                .count, .sum, .avg, .min, .max => {},
+            }
+            if (item.agg.arg) |arg| {
+                const pi = findPicked(reader, picked, arg) orelse return false;
+                if (!numericFileCol(reader, picked[pi])) return false;
+            } else if (item.agg.kind != .count) return false;
+        }
+        if (query.where) |w| {
+            if (simplePred(w)) |p| {
+                const pi = findPicked(reader, picked, p.name) orelse return false;
+                if (!numericFileCol(reader, picked[pi])) return false;
+            }
+        }
+        const nrows = reader.numRows();
+        const by_row = n < 2 and nrows >= 65536 and columnsHaveOffsetIndex(reader, picked);
+        if (n < 2 and !by_row) return false;
+        break :blk .{ .nrg = n, .nrows = nrows, .by_row = by_row };
+    };
+
+    const n: usize = if (plan.by_row) width else @min(width, @as(usize, @intCast(plan.nrg)));
+    const jobs = try allocator.alloc(GSlice, n);
+    defer allocator.free(jobs);
+    const heap = std.heap.smp_allocator;
+    defer for (jobs) |job| if (job.states.len > 0) heap.free(job.states);
+
+    if (plan.by_row) {
+        const base: i64 = @divFloor(plan.nrows, @as(i64, @intCast(n)));
+        var extra: i64 = @mod(plan.nrows, @as(i64, @intCast(n)));
+        var off: i64 = 0;
+        for (jobs) |*job| {
+            const span = base + if (extra > 0) blk: {
+                extra -= 1;
+                break :blk @as(i64, 1);
+            } else 0;
+            job.* = .{
+                .path = file.path,
+                .query = query,
+                .wanted = wanted,
+                .vec_size = vec_size,
+                .lo = 0,
+                .hi = 0,
+                .row_off = off,
+                .row_len = span,
+                .stats = stats,
+                .cancel = bound_cancel,
+            };
+            off += span;
+        }
+    } else {
+        const base: i32 = @intCast(@divFloor(plan.nrg, @as(i32, @intCast(n))));
+        var extra: i32 = @intCast(@mod(plan.nrg, @as(i32, @intCast(n))));
+        var lo: i32 = 0;
+        for (jobs) |*job| {
+            const span = base + if (extra > 0) blk: {
+                extra -= 1;
+                break :blk @as(i32, 1);
+            } else 0;
+            job.* = .{
+                .path = file.path,
+                .query = query,
+                .wanted = wanted,
+                .vec_size = vec_size,
+                .lo = lo,
+                .hi = lo + span,
+                .stats = stats,
+                .cancel = bound_cancel,
+            };
+            lo += span;
+        }
+    }
+
+    var group: std.Io.Group = .init;
+    var joined = false;
+    defer if (!joined) group.cancel(t.io);
+    for (jobs) |*job| {
+        group.concurrent(t.io, globalSliceJob, .{job}) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => try globalSliceJobInner(job),
+        };
+    }
+    group.await(t.io) catch |err| {
+        joined = true;
+        if (err == error.Canceled) return error.QueryCanceled;
+        return err;
+    };
+    joined = true;
+
+    for (jobs) |job| {
+        if (job.err) |e| return e;
+        if (job.slow) return false;
+    }
+    for (jobs) |job| {
+        for (states, job.states) |*dst, src| mergeAggInto(dst, src);
+        any.* = any.* or job.any;
+    }
+    if (any.* and sample.* == null) {
+        var reader = try parquet.openLocation(allocator, t, file.path);
+        defer reader.close();
+        const picked = try pickParquetColumns(allocator, reader, wanted);
+        defer allocator.free(picked);
+        sample.* = try emptyFromPicked(allocator, reader, picked);
+    }
+    return true;
+}
+
+const HSlice = struct {
+    path: []const u8,
+    query: sql.Query,
+    wanted: ?[]const []const u8,
+    vec_size: i32,
+    lo: i32,
+    hi: i32,
+    row_off: i64 = 0,
+    row_len: i64 = 0,
+    stats: ?*ScanStats,
+    cancel: ?*CancelState,
+    acc: GroupAcc = undefined,
+    slow: bool = false,
+    err: ?anyerror = null,
+};
+
+fn groupSliceJob(job: *HSlice) error{Canceled}!void {
+    bindCancel(job.cancel);
+    defer bindCancel(null);
+    groupSliceJobInner(job) catch |err| switch (err) {
+        error.QueryCanceled => return error.Canceled,
+        else => job.err = err,
+    };
+}
+
+fn groupSliceJobInner(job: *HSlice) !void {
+    const heap = std.heap.smp_allocator;
+    job.acc = .{ .alloc = heap };
+    var reader = try parquet.openLocalPath(heap, job.path);
+    defer reader.close();
+    const picked = try pickParquetColumns(heap, reader, job.wanted);
+    defer heap.free(picked);
+    const ranged = job.row_len > 0;
+    const nrg: usize = if (ranged) 0 else @intCast(@max(reader.numRowGroups(), 0));
+    var seen: []u8 = &.{};
+    if (!ranged and job.query.where != null) seen = try heap.alloc(u8, nrg);
+    defer if (seen.len > 0) heap.free(seen);
+    if (seen.len > 0) @memset(seen, 0);
+    var slice = RgSlice{
+        .lo = job.lo,
+        .hi = job.hi,
+        .where = job.query.where,
+        .stats = job.stats,
+        .seen = seen,
+    };
+    var hook = parquet.RgHook{ .keep = keepRowGroupSlice, .user = &slice };
+    var br = try reader.openBatchFilteredEx(picked, job.vec_size, if (ranged) null else &hook, true);
+    if (ranged) try br.setRowRange(job.row_off, job.row_len);
+    defer br.close();
+    var scratch = std.heap.ArenaAllocator.init(heap);
+    defer scratch.deinit();
+    while (try br.next()) |rb_val| {
+        try checkCancel();
+        var rb = rb_val;
+        defer rb.deinit();
+        if (rb.numRows() <= 0) continue;
+        if (!try foldGroupBatch(&job.acc, reader, rb, picked, job.query, scratch.allocator())) {
+            job.slow = true;
+            return;
+        }
+        _ = scratch.reset(.retain_capacity);
+    }
+}
+
+fn parallelParquetGroups(
+    allocator: std.mem.Allocator,
+    t: vfs.Transport,
+    file: iceberg.DataFile,
+    query: sql.Query,
+    acc: *GroupAcc,
+    stats: ?*ScanStats,
+    wanted: ?[]const []const u8,
+    vec_size: i32,
+) !bool {
+    if (comptime builtin.cpu.arch == .wasm32 or builtin.single_threaded) return false;
+    if (file.bytes != null or aws.isRemote(file.path)) return false;
+    if (!hashAggFast(query)) return false;
+    const width = scanWidth();
+    if (width < 2) return false;
+
+    const plan = blk: {
+        var reader = try parquet.openLocation(allocator, t, file.path);
+        defer reader.close();
+        const n = reader.numRowGroups();
+        const picked = try pickParquetColumns(allocator, reader, wanted);
+        defer allocator.free(picked);
+        const gi = findPicked(reader, picked, query.group_by[0]) orelse return false;
+        if (!numericFileCol(reader, picked[gi])) return false;
+        for (query.items) |item| {
+            if (item != .agg) continue;
+            if (item.agg.arg) |arg| {
+                const pi = findPicked(reader, picked, arg) orelse return false;
+                if (!numericFileCol(reader, picked[pi])) return false;
+            }
+        }
+        if (query.where) |w| {
+            if (simplePred(w)) |p| {
+                const pi = findPicked(reader, picked, p.name) orelse return false;
+                if (!numericFileCol(reader, picked[pi])) return false;
+            } else return false;
+        }
+        const nrows = reader.numRows();
+        const by_row = n < 2 and nrows >= 65536 and columnsHaveOffsetIndex(reader, picked);
+        if (n < 2 and !by_row) return false;
+        break :blk .{ .nrg = n, .nrows = nrows, .by_row = by_row };
+    };
+
+    const n: usize = if (plan.by_row) width else @min(width, @as(usize, @intCast(plan.nrg)));
+    const jobs = try allocator.alloc(HSlice, n);
+    defer allocator.free(jobs);
+    defer for (jobs) |*job| job.acc.deinit();
+
+    if (plan.by_row) {
+        const base: i64 = @divFloor(plan.nrows, @as(i64, @intCast(n)));
+        var extra: i64 = @mod(plan.nrows, @as(i64, @intCast(n)));
+        var off: i64 = 0;
+        for (jobs) |*job| {
+            const span = base + if (extra > 0) blk: {
+                extra -= 1;
+                break :blk @as(i64, 1);
+            } else 0;
+            job.* = .{
+                .path = file.path,
+                .query = query,
+                .wanted = wanted,
+                .vec_size = vec_size,
+                .lo = 0,
+                .hi = 0,
+                .row_off = off,
+                .row_len = span,
+                .stats = stats,
+                .cancel = bound_cancel,
+                .acc = .{ .alloc = std.heap.smp_allocator },
+            };
+            off += span;
+        }
+    } else {
+        const base: i32 = @intCast(@divFloor(plan.nrg, @as(i32, @intCast(n))));
+        var extra: i32 = @intCast(@mod(plan.nrg, @as(i32, @intCast(n))));
+        var lo: i32 = 0;
+        for (jobs) |*job| {
+            const span = base + if (extra > 0) blk: {
+                extra -= 1;
+                break :blk @as(i32, 1);
+            } else 0;
+            job.* = .{
+                .path = file.path,
+                .query = query,
+                .wanted = wanted,
+                .vec_size = vec_size,
+                .lo = lo,
+                .hi = lo + span,
+                .stats = stats,
+                .cancel = bound_cancel,
+                .acc = .{ .alloc = std.heap.smp_allocator },
+            };
+            lo += span;
+        }
+    }
+
+    var group: std.Io.Group = .init;
+    var joined = false;
+    defer if (!joined) group.cancel(t.io);
+    for (jobs) |*job| {
+        group.concurrent(t.io, groupSliceJob, .{job}) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => try groupSliceJobInner(job),
+        };
+    }
+    group.await(t.io) catch |err| {
+        joined = true;
+        if (err == error.Canceled) return error.QueryCanceled;
+        return err;
+    };
+    joined = true;
+
+    for (jobs) |job| {
+        if (job.err) |e| return e;
+        if (job.slow) return false;
+    }
+    for (jobs) |job| {
+        acc.sum_float = acc.sum_float or job.acc.sum_float;
+        if (job.acc.kind != .ints) continue;
+        acc.key_dt = job.acc.key_dt;
+        var it = job.acc.ints.iterator();
+        while (it.next()) |e| {
+            const dst = try acc.touchInt(e.key_ptr.*, query);
+            for (dst, e.value_ptr.*) |*d, s| mergeAggInto(d, s);
+        }
+    }
+    return true;
+}
+
+fn executeHashAgg(
+    allocator: std.mem.Allocator,
+    t: vfs.Transport,
+    files: []const iceberg.DataFile,
+    query: sql.Query,
+    fallback_schema: ?[]const iceberg.SchemaField,
+    stats: ?*ScanStats,
+    wanted: ?[]const []const u8,
+    vec_size: i32,
+) !Batch {
+    _ = fallback_schema;
+    try validateAgg(query);
+    var acc = GroupAcc{ .alloc = allocator };
+    defer acc.deinit();
+    var vec_aa = std.heap.ArenaAllocator.init(t.allocator);
+    defer vec_aa.deinit();
+
+    for (files) |file| {
+        try checkCancel();
+        if (query.where) |expr| {
+            if (iceberg.canSkipFile(file, expr)) {
+                if (stats) |s| s.files_pruned += 1;
+                continue;
+            }
+        }
+        if (stats) |s| s.files_opened += 1;
+        switch (file.format) {
+            .avro => return error.UnsupportedType,
+            .glacier => {
+                var reader = try native.Reader.openLocation(allocator, t, file.path);
+                defer reader.close();
+                while (try reader.nextPage(vec_aa.allocator(), wanted, query.where)) |page| {
+                    var vec = page;
+                    if (query.where) |expr| vec = try filterExpr(vec_aa.allocator(), vec, expr, null);
+                    if (vec.len == 0) {
+                        _ = vec_aa.reset(.retain_capacity);
+                        continue;
+                    }
+                    try ingestGroupRows(&acc, vec, query);
+                    _ = vec_aa.reset(.retain_capacity);
+                }
+            },
+            .parquet => {
+                if (try parallelParquetGroups(allocator, t, file, query, &acc, stats, wanted, vec_size))
+                    continue;
+                var reader = try parquet.openLocation(allocator, t, file.path);
+                defer reader.close();
+                const picked = try pickParquetColumns(allocator, reader, wanted);
+                if (picked.len == 0) return error.ColumnNotFound;
+                var rg_filter: RgFilter = .{ .preserve_dict = true };
+                defer rg_filter.deinit();
+                var br = try beginParquetBatch(reader, picked, vec_size, query.where, stats, &rg_filter);
+                defer br.close();
+                while (try br.next()) |rb_val| {
+                    var rb = rb_val;
+                    defer rb.deinit();
+                    if (rb.numRows() <= 0) continue;
+                    if (try foldGroupBatch(&acc, reader, rb, picked, query, vec_aa.allocator())) {
+                        _ = vec_aa.reset(.retain_capacity);
+                        continue;
+                    }
+                    var vec = try batchFromRowBatch(vec_aa.allocator(), reader, rb, picked);
+                    if (query.where) |expr| vec = try filterExpr(vec_aa.allocator(), vec, expr, null);
+                    if (vec.len > 0) try ingestGroupRows(&acc, vec, query);
+                    _ = vec_aa.reset(.retain_capacity);
+                }
+            },
+        }
+    }
+
+    var batch = try finishGroups(allocator, &acc, query);
+    if (query.having) |expr| batch = try filterExpr(allocator, batch, expr, query);
+    return applyTail(allocator, batch, query, .{ .where_done = true, .agg_done = true });
+}
+
+fn foldGroupBatch(
+    acc: *GroupAcc,
+    reader: parquet.Reader,
+    rb: parquet.RowBatch,
+    picked: []const i32,
+    query: sql.Query,
+    alloc: std.mem.Allocator,
+) !bool {
+    const gname = query.group_by[0];
+    const gi = findPicked(reader, picked, gname) orelse return false;
+    const pred: ?SimplePred = if (query.where) |w| simplePred(w) orelse return false else null;
+    const key = try loadNumCol(alloc, reader, rb, gi, picked[gi]) orelse return false;
+    if (key.kind != .i32 and key.kind != .i64) return false;
+    acc.key_dt = if (key.kind == .i32) .int32 else .int64;
+    if (acc.kind == .strs) return false;
+
+    var value_i: ?usize = null;
+    var value_name: ?[]const u8 = null;
+    var has_extreme = false;
+    for (query.items) |item| {
+        if (item != .agg) continue;
+        if (item.agg.kind == .min or item.agg.kind == .max) has_extreme = true;
+        if (item.agg.arg) |arg| {
+            const pi = findPicked(reader, picked, arg) orelse return false;
+            if (value_i) |v| {
+                if (v != pi) return false;
+            } else {
+                value_i = pi;
+                value_name = arg;
+            }
+        }
+    }
+    var val: ?NumCol = null;
+    if (value_i) |pi| {
+        const loaded = try loadNumCol(alloc, reader, rb, pi, picked[pi]) orelse return false;
+        if (loaded.n != key.n) return false;
+        if (loaded.kind == .f32 or loaded.kind == .f64) acc.sum_float = true;
+        val = loaded;
+    }
+    if (pred) |p| {
+        const on_key = colSame(p.name, gname);
+        const on_val = if (value_name) |vn| colSame(p.name, vn) else false;
+        if (!on_key and !on_val) return false;
+    }
+
+    const key_null = bitmapHasNull(key.nulls, key.n);
+    const val_null = if (val) |v| bitmapHasNull(v.nulls, v.n) else false;
+    const scatter = !has_extreme and !key_null and !val_null and key.dict and key.kind == .i32 and val != null and val.?.dict and val.?.kind == .f64 and (pred == null or colSame(pred.?.name, gname));
+    if (scatter) {
+        const kd = key.i32s;
+        const vd = val.?.f64s;
+        const counts = try alloc.alloc(u64, kd.len);
+        const sums = try alloc.alloc(f64, kd.len);
+        @memset(counts, 0);
+        @memset(sums, 0);
+        const lit_i: i32 = if (pred) |p| switch (p.lit) {
+            .int => |n| if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return false else @intCast(n),
+            else => return false,
+        } else 0;
+        for (key.idx, val.?.idx) |ki, vi| {
+            if (ki >= kd.len or vi >= vd.len) return error.ParquetOpenFailed;
+            if (pred) |p| if (!cmpI64(p.op, kd[ki], lit_i)) continue;
+            counts[ki] += 1;
+            sums[ki] += vd[vi];
+        }
+        for (kd, counts, sums) |k, c, s| {
+            if (c == 0) continue;
+            const sts = try acc.touchInt(k, query);
+            applyPartial(sts, query, c, s, 0, true);
+        }
+        return true;
+    }
+
+    if (key_null or val_null) return false;
+    var row: usize = 0;
+    while (row < key.n) : (row += 1) {
+        const kv = key.atI64(row) orelse continue;
+        if (pred) |p| {
+            if (colSame(p.name, gname)) {
+                if (!predKeepI64(p, kv)) continue;
+            } else if (val) |vc| {
+                if (vc.kind == .f32 or vc.kind == .f64) {
+                    const fv = vc.atF64(row) orelse continue;
+                    const lit: f64 = switch (p.lit) {
+                        .int => |iv| @floatFromInt(iv),
+                        .float => |f| f,
+                        else => return false,
+                    };
+                    if (!cmpF64(p.op, fv, lit)) continue;
+                } else {
+                    const iv = vc.atI64(row) orelse continue;
+                    if (!predKeepI64(p, iv)) continue;
+                }
+            }
+        }
+        const sts = try acc.touchInt(kv, query);
+        if (val) |vc| {
+            if (vc.kind == .f32 or vc.kind == .f64) {
+                const fv = vc.atF64(row) orelse continue;
+                applyPartial(sts, query, 1, fv, 0, true);
+            } else {
+                const iv = vc.atI64(row) orelse continue;
+                applyPartial(sts, query, 1, 0, iv, false);
+            }
+        } else {
+            applyPartial(sts, query, 1, 0, 0, false);
+        }
+    }
+    return true;
+}
+
+fn ingestGroupRows(acc: *GroupAcc, vec: Batch, query: sql.Query) !void {
+    const gname = query.group_by[0];
+    const gi = findBatchCol(vec, gname) orelse return error.ColumnNotFound;
+    const col = vec.columns[gi];
+    var row: usize = 0;
+    while (row < vec.len) : (row += 1) {
+        switch (col.data_type) {
+            .int32, .int64 => {
+                if (acc.kind == .strs) return error.TypeMismatch;
+                acc.key_dt = col.data_type;
+                if (col.isNull(row)) continue;
+                const key: i64 = if (col.data_type == .int32) col.i32s[row] else col.i64s[row];
+                const sts = try acc.touchInt(key, query);
+                try feedRow(sts, vec, query, row, acc.alloc);
+            },
+            .utf8 => {
+                if (acc.kind == .ints) return error.TypeMismatch;
+                acc.kind = .strs;
+                acc.key_dt = .utf8;
+                var buf: [512]u8 = undefined;
+                var heap: ?[]u8 = null;
+                const key: []const u8 = if (col.isNull(row)) blk: {
+                    buf[0] = 0;
+                    break :blk buf[0..1];
+                } else blk: {
+                    const s = col.strAt(row);
+                    if (s.len + 1 > buf.len) {
+                        const big = try acc.alloc.alloc(u8, s.len + 1);
+                        big[0] = 1;
+                        @memcpy(big[1..], s);
+                        heap = big;
+                        break :blk big;
+                    }
+                    buf[0] = 1;
+                    @memcpy(buf[1..][0..s.len], s);
+                    break :blk buf[0 .. s.len + 1];
+                };
+                if (acc.strs.getPtr(key)) |sts| {
+                    try feedRow(sts.*, vec, query, row, acc.alloc);
+                    if (heap) |h| acc.alloc.free(h);
+                } else {
+                    const owned = heap orelse try acc.alloc.dupe(u8, key);
+                    const sts = try makeStates(acc.alloc, query);
+                    try feedRow(sts, vec, query, row, acc.alloc);
+                    try acc.strs.put(acc.alloc, owned, sts);
+                }
+            },
+            else => return error.UnsupportedType,
+        }
+    }
+}
+
+fn findBatchCol(vec: Batch, name: []const u8) ?usize {
+    if (vec.columnIndex(name)) |i| return i;
+    const tail = if (std.mem.lastIndexOfScalar(u8, name, '.')) |d| name[d + 1 ..] else return null;
+    return vec.columnIndex(tail);
+}
+
+fn finishGroups(allocator: std.mem.Allocator, acc: *GroupAcc, query: sql.Query) !Batch {
+    const n: usize = switch (acc.kind) {
+        .none => 0,
+        .ints => acc.ints.count(),
+        .strs => acc.strs.count(),
+    };
+    const ncols = aggOutLen(query);
+    const out_cols = try allocator.alloc(Column, ncols);
+    var col_i: usize = 0;
+    var agg_i: usize = 0;
+    const int_keys = acc.ints.keys();
+    const int_vals = acc.ints.values();
+    const str_keys = acc.strs.keys();
+    const str_vals = acc.strs.values();
+    for (query.items) |item| {
+        switch (item) {
+            .window => {},
+            .column => |c| {
+                const name = c.alias orelse c.name;
+                out_cols[col_i] = try finishKeyColumn(allocator, acc, name, n, int_keys, str_keys);
+                col_i += 1;
+            },
+            .grouping => |g| {
+                out_cols[col_i] = try groupingColumn(allocator, g.alias orelse g.name, n, &.{});
+                col_i += 1;
+            },
+            .agg => |agg| {
+                const dummy: Column = .{
+                    .name = agg.arg orelse "",
+                    .data_type = if (acc.sum_float) .float64 else .int64,
+                    .len = 0,
+                };
+                const template: AggState = if (n == 0)
+                    .{ .kind = agg.kind, .is_float = acc.sum_float and (agg.kind == .sum or agg.kind == .avg or agg.kind == .min or agg.kind == .max) }
+                else switch (acc.kind) {
+                    .ints => int_vals[0][agg_i],
+                    .strs => str_vals[0][agg_i],
+                    .none => .{ .kind = agg.kind },
+                };
+                var col = try finalizeAgg(allocator, template, dummy, try aggName(allocator, agg), n);
+                if (n > 0) {
+                    switch (acc.kind) {
+                        .ints => for (int_vals, 0..) |sts, gi| try writeAggCell(&col, sts[agg_i], gi, allocator),
+                        .strs => for (str_vals, 0..) |sts, gi| try writeAggCell(&col, sts[agg_i], gi, allocator),
+                        .none => {},
+                    }
+                }
+                out_cols[col_i] = col;
+                col_i += 1;
+                agg_i += 1;
+            },
+            else => return error.UnsupportedSql,
+        }
+    }
+    return .{ .columns = out_cols, .len = n };
+}
+
+fn finishKeyColumn(
+    allocator: std.mem.Allocator,
+    acc: *GroupAcc,
+    name: []const u8,
+    n: usize,
+    int_keys: []i64,
+    str_keys: [][]const u8,
+) !Column {
+    var col: Column = .{ .name = name, .data_type = acc.key_dt, .len = n };
+    switch (acc.key_dt) {
+        .int32 => {
+            col.i32s = try allocator.alloc(i32, n);
+            for (int_keys, 0..) |k, i| col.i32s[i] = @intCast(k);
+        },
+        .int64 => {
+            col.i64s = try allocator.alloc(i64, n);
+            @memcpy(col.i64s, int_keys);
+        },
+        .utf8 => {
+            var nbytes: usize = 0;
+            for (str_keys) |k| {
+                if (k.len > 0 and k[0] == 1) nbytes += k.len - 1;
+            }
+            const bytes = try allocator.alloc(u8, nbytes);
+            const offs = try allocator.alloc(u32, n + 1);
+            const valid = try allocator.alloc(u8, n);
+            var off: u32 = 0;
+            var any_null = false;
+            for (str_keys, 0..) |k, i| {
+                offs[i] = off;
+                if (k.len == 0 or k[0] == 0) {
+                    valid[i] = 0;
+                    any_null = true;
+                } else {
+                    valid[i] = 1;
+                    const s = k[1..];
+                    if (s.len > 0) @memcpy(bytes[off..][0..s.len], s);
+                    off += @intCast(s.len);
+                }
+            }
+            offs[n] = off;
+            col.utf8 = .{ .offsets = offs, .bytes = bytes };
+            if (any_null) col.valid = valid else allocator.free(valid);
+        },
+        else => return error.UnsupportedType,
+    }
+    return col;
+}
+
 fn executeGlobalAgg(
     allocator: std.mem.Allocator,
     t: vfs.Transport,
@@ -2361,6 +3622,8 @@ fn executeGlobalAgg(
                 }
             },
             .parquet => {
+                if (try parallelParquetGlobal(allocator, t, file, query, states, &any, &sample, stats, wanted, vec_size))
+                    continue;
                 var reader = try parquet.openLocation(allocator, t, file.path);
                 defer reader.close();
                 const picked = try pickParquetColumns(allocator, reader, wanted);
@@ -2378,7 +3641,7 @@ fn executeGlobalAgg(
                     any = any or n > 0;
                     continue;
                 }
-                var rg_filter: RgFilter = .{};
+                var rg_filter: RgFilter = .{ .preserve_dict = true };
                 defer rg_filter.deinit();
                 var br = try beginParquetBatch(reader, picked, vec_size, query.where, stats, &rg_filter);
                 defer br.close();
@@ -2387,6 +3650,11 @@ fn executeGlobalAgg(
                     defer rb.deinit();
                     if (rb.numRows() <= 0) continue;
                     const va = vec_aa.allocator();
+                    if (try feedGlobalFast(states, reader, rb, picked, query)) {
+                        any = true;
+                        if (sample == null) sample = try emptyFromPicked(allocator, reader, picked);
+                        continue;
+                    }
                     var vec = try batchFromRowBatch(va, reader, rb, picked);
                     if (query.where) |expr| {
                         vec = try filterExpr(va, vec, expr, null);
@@ -2986,10 +4254,19 @@ const RgCtx = struct {
     seen: []u8,
 };
 
+const RgSlice = struct {
+    lo: i32,
+    hi: i32,
+    where: ?*const sql.BoolExpr,
+    stats: ?*ScanStats,
+    seen: []u8,
+};
+
 const RgFilter = struct {
     ctx: RgCtx = undefined,
     hook: parquet.RgHook = undefined,
     seen: []u8 = &.{},
+    preserve_dict: bool = false,
     allocator: std.mem.Allocator = if (builtin.cpu.arch == .wasm32)
         std.heap.wasm_allocator
     else
@@ -3020,9 +4297,29 @@ fn beginParquetBatch(
             .ctx = .{ .where = expr, .stats = stats, .seen = seen },
         };
         filter.hook = .{ .keep = keepRowGroup, .user = &filter.ctx };
-        return reader.openBatchFiltered(picked, batch_size, &filter.hook);
+        return reader.openBatchFilteredEx(picked, batch_size, &filter.hook, filter.preserve_dict);
     }
-    return reader.openBatch(picked, batch_size);
+    return reader.openBatchFilteredEx(picked, batch_size, null, filter.preserve_dict);
+}
+
+fn keepRowGroupSlice(reader: ?*anyopaque, rg: i32, user: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *RgSlice = @ptrCast(@alignCast(user orelse return 1));
+    if (rg < ctx.lo or rg >= ctx.hi) return 0;
+    const expr = ctx.where orelse return 1;
+    const handle = reader orelse return 1;
+    const keep = rgMayMatch(handle, rg, expr);
+    if (rg >= 0 and @as(usize, @intCast(rg)) < ctx.seen.len) {
+        const i: usize = @intCast(rg);
+        if (ctx.seen[i] == 0) {
+            ctx.seen[i] = 1;
+            if (!keep) {
+                if (ctx.stats) |s| {
+                    _ = @atomicRmw(usize, &s.row_groups_pruned, .Add, 1, .monotonic);
+                }
+            }
+        }
+    }
+    return if (keep) 1 else 0;
 }
 
 fn keepRowGroup(reader: ?*anyopaque, rg: i32, user: ?*anyopaque) callconv(.c) c_int {
@@ -3203,6 +4500,10 @@ fn scanParquetStream(
         }
     }
 
+    if (offset_left.* == 0 and limit_left.* == null and file.bytes == null) {
+        if (try parallelParquetScan(allocator, t, file, wanted, where, stats, 65536)) |batch| return batch;
+    }
+
     const batch_size = streamBatchSize(where != null, offset_left.*, limit_left.*);
     var rg_filter: RgFilter = .{};
     defer rg_filter.deinit();
@@ -3331,6 +4632,100 @@ fn scanNativeAll(
     return scanNativeStream(allocator, t, file, wanted, where, &offset, &limit);
 }
 
+fn expandDictColumn(
+    allocator: std.mem.Allocator,
+    reader: parquet.Reader,
+    file_col: i32,
+    name: []const u8,
+    dict: parquet.RowBatch.DictCol,
+) !Column {
+    const meta = reader.column(file_col) orelse return error.ParquetOpenFailed;
+    const logical = parquet.columnLogical(reader, file_col);
+    const lid: parquet.LogicalId = @enumFromInt(logical.id);
+    if (lid == .decimal or lid == .timestamp or lid == .uuid) return error.UnsupportedType;
+    const n = dict.indices.len;
+    switch (meta.physical_type) {
+        .int32 => {
+            const src = try loadDictFixed(i32, dict, allocator);
+            defer allocator.free(src);
+            const out = try allocator.alloc(i32, n);
+            for (dict.indices, out) |ix, *slot| {
+                if (ix >= src.len) return error.ParquetOpenFailed;
+                slot.* = src[ix];
+            }
+            var col: Column = .{ .name = name, .data_type = .int32, .len = n, .i32s = out };
+            col.valid = try copyArrowValid(allocator, dict.nulls, n);
+            return col;
+        },
+        .int64 => {
+            const src = try loadDictFixed(i64, dict, allocator);
+            defer allocator.free(src);
+            const out = try allocator.alloc(i64, n);
+            for (dict.indices, out) |ix, *slot| {
+                if (ix >= src.len) return error.ParquetOpenFailed;
+                slot.* = src[ix];
+            }
+            var col: Column = .{ .name = name, .data_type = .int64, .len = n, .i64s = out };
+            col.valid = try copyArrowValid(allocator, dict.nulls, n);
+            return col;
+        },
+        .float => {
+            const src = try loadDictFixed(f32, dict, allocator);
+            defer allocator.free(src);
+            const out = try allocator.alloc(f32, n);
+            for (dict.indices, out) |ix, *slot| {
+                if (ix >= src.len) return error.ParquetOpenFailed;
+                slot.* = src[ix];
+            }
+            var col: Column = .{ .name = name, .data_type = .float32, .len = n, .f32s = out };
+            col.valid = try copyArrowValid(allocator, dict.nulls, n);
+            return col;
+        },
+        .double => {
+            const src = try loadDictFixed(f64, dict, allocator);
+            defer allocator.free(src);
+            const out = try allocator.alloc(f64, n);
+            for (dict.indices, out) |ix, *slot| {
+                if (ix >= src.len) return error.ParquetOpenFailed;
+                slot.* = src[ix];
+            }
+            var col: Column = .{ .name = name, .data_type = .float64, .len = n, .f64s = out };
+            col.valid = try copyArrowValid(allocator, dict.nulls, n);
+            return col;
+        },
+        .byte_array => {
+            const offs = dict.offsets orelse return error.ParquetOpenFailed;
+            var nbytes: usize = 0;
+            for (dict.indices) |ix| {
+                if (ix >= @as(usize, @intCast(dict.dict_count))) return error.ParquetOpenFailed;
+                const at: usize = offs[ix];
+                const len = std.mem.readInt(u32, dict.dict_ptr[at..][0..4], .little);
+                nbytes += len;
+            }
+            const bytes = try allocator.alloc(u8, nbytes);
+            const offsets = try allocator.alloc(u32, n + 1);
+            var off: u32 = 0;
+            for (dict.indices, 0..) |ix, row| {
+                offsets[row] = off;
+                const at: usize = offs[ix];
+                const len = std.mem.readInt(u32, dict.dict_ptr[at..][0..4], .little);
+                if (len > 0) @memcpy(bytes[off..][0..len], dict.dict_ptr[at + 4 ..][0..len]);
+                off += len;
+            }
+            offsets[n] = off;
+            var col: Column = .{
+                .name = name,
+                .data_type = .utf8,
+                .len = n,
+                .utf8 = .{ .offsets = offsets, .bytes = bytes },
+            };
+            col.valid = try copyArrowValid(allocator, dict.nulls, n);
+            return col;
+        },
+        else => return error.UnsupportedType,
+    }
+}
+
 fn batchFromRowBatch(
     allocator: std.mem.Allocator,
     reader: parquet.Reader,
@@ -3344,6 +4739,10 @@ fn batchFromRowBatch(
         const name = try allocator.dupe(u8, meta.name);
         if (reader.columnRepLevel(file_col) > 0) {
             columns[out_i] = try fillListAsUtf8(allocator, reader, rb, @intCast(out_i), file_col, name);
+            continue;
+        }
+        if (rb.columnDictionary(@intCast(out_i))) |dict| {
+            columns[out_i] = try expandDictColumn(allocator, reader, file_col, name, dict);
             continue;
         }
         const vals = try rb.columnValues(@intCast(out_i));
@@ -3505,6 +4904,216 @@ fn addScanNamesFromBool(names: *std.ArrayList([]const u8), allocator: std.mem.Al
     }
 }
 
+const PScan = struct {
+    path: []const u8,
+    wanted: ?[]const []const u8,
+    where: ?*const sql.BoolExpr,
+    vec_size: i32,
+    lo: i32,
+    hi: i32,
+    row_off: i64 = 0,
+    row_len: i64 = 0,
+    stats: ?*ScanStats,
+    cancel: ?*CancelState,
+    batch: Batch = .{ .columns = &.{}, .len = 0 },
+    err: ?anyerror = null,
+};
+
+fn pScanJob(job: *PScan) error{Canceled}!void {
+    bindCancel(job.cancel);
+    bound_quiet = true;
+    defer {
+        bound_quiet = false;
+        bindCancel(null);
+    }
+    pScanJobInner(job) catch |err| switch (err) {
+        error.QueryCanceled => return error.Canceled,
+        else => job.err = err,
+    };
+}
+
+fn freeBatch(allocator: std.mem.Allocator, batch: Batch) void {
+    freeBatchBuffers(allocator, batch, true);
+}
+
+fn freeBatchBuffers(allocator: std.mem.Allocator, batch: Batch, free_names: bool) void {
+    if (batch.columns.len == 0) return;
+    for (batch.columns) |col| {
+        if (free_names and col.name.len > 0) allocator.free(col.name);
+        if (col.bools.len > 0) allocator.free(col.bools);
+        if (col.i32s.len > 0) allocator.free(col.i32s);
+        if (col.i64s.len > 0) allocator.free(col.i64s);
+        if (col.f32s.len > 0) allocator.free(col.f32s);
+        if (col.f64s.len > 0) allocator.free(col.f64s);
+        if (col.utf8.offsets.len > 0) allocator.free(col.utf8.offsets);
+        if (col.utf8.bytes.len > 0) allocator.free(col.utf8.bytes);
+        if (col.uuids.len > 0) allocator.free(col.uuids);
+        if (col.i128s.len > 0) allocator.free(col.i128s);
+        if (col.valid.len > 0) allocator.free(col.valid);
+    }
+    allocator.free(batch.columns);
+}
+
+fn pScanJobInner(job: *PScan) !void {
+    const heap = std.heap.smp_allocator;
+    var reader = try parquet.openLocalPath(heap, job.path);
+    defer reader.close();
+    const picked = try pickParquetColumns(heap, reader, job.wanted);
+    defer heap.free(picked);
+    const ranged = job.row_len > 0;
+    const nrg: usize = if (ranged) 0 else @intCast(@max(reader.numRowGroups(), 0));
+    var seen: []u8 = &.{};
+    if (!ranged and job.where != null) seen = try heap.alloc(u8, nrg);
+    defer if (seen.len > 0) heap.free(seen);
+    if (seen.len > 0) @memset(seen, 0);
+    var slice = RgSlice{
+        .lo = job.lo,
+        .hi = job.hi,
+        .where = job.where,
+        .stats = job.stats,
+        .seen = seen,
+    };
+    var hook = parquet.RgHook{ .keep = keepRowGroupSlice, .user = &slice };
+    var br = try reader.openBatchFilteredEx(picked, job.vec_size, if (ranged) null else &hook, false);
+    if (ranged) try br.setRowRange(job.row_off, job.row_len);
+    defer br.close();
+
+    var parts: std.ArrayList(Batch) = .empty;
+    var handed = false;
+    defer if (!handed) {
+        for (parts.items) |p| freeBatch(heap, p);
+        parts.deinit(heap);
+    };
+    while (try br.next()) |rb_val| {
+        try checkCancel();
+        var rb = rb_val;
+        defer rb.deinit();
+        if (rb.numRows() <= 0) continue;
+        const raw = try batchFromRowBatch(heap, reader, rb, picked);
+        var vec = raw;
+        if (job.where) |expr| {
+            vec = try filterExpr(heap, raw, expr, null);
+            if (vec.columns.ptr != raw.columns.ptr) freeBatchBuffers(heap, raw, false);
+        }
+        if (vec.len == 0) {
+            freeBatch(heap, vec);
+            continue;
+        }
+        try parts.append(heap, vec);
+    }
+    if (parts.items.len == 0) {
+        job.batch = try emptyFromPicked(heap, reader, picked);
+    } else if (parts.items.len == 1) {
+        job.batch = parts.items[0];
+    } else {
+        job.batch = try concatBatches(heap, parts.items);
+        for (parts.items) |p| freeBatch(heap, p);
+    }
+    handed = true;
+    parts.deinit(heap);
+}
+
+fn parallelParquetScan(
+    allocator: std.mem.Allocator,
+    t: vfs.Transport,
+    file: iceberg.DataFile,
+    wanted: ?[]const []const u8,
+    where: ?*const sql.BoolExpr,
+    stats: ?*ScanStats,
+    vec_size: i32,
+) !?Batch {
+    if (comptime builtin.cpu.arch == .wasm32 or builtin.single_threaded) return null;
+    if (file.bytes != null or aws.isRemote(file.path)) return null;
+    const width = scanWidth();
+    if (width < 2) return null;
+
+    const plan = blk: {
+        var reader = try parquet.openLocation(allocator, t, file.path);
+        defer reader.close();
+        const n = reader.numRowGroups();
+        const picked = try pickParquetColumns(allocator, reader, wanted);
+        defer allocator.free(picked);
+        if (picked.len == 0) return null;
+        const nrows = reader.numRows();
+        const by_row = n < 2 and nrows >= 65536 and columnsHaveOffsetIndex(reader, picked);
+        if (n < 2 and !by_row) return null;
+        break :blk .{ .nrg = n, .nrows = nrows, .by_row = by_row };
+    };
+
+    const n: usize = if (plan.by_row) width else @min(width, @as(usize, @intCast(plan.nrg)));
+    const jobs = try allocator.alloc(PScan, n);
+    defer allocator.free(jobs);
+    const heap = std.heap.smp_allocator;
+    defer for (jobs) |job| freeBatch(heap, job.batch);
+
+    if (plan.by_row) {
+        const base: i64 = @divFloor(plan.nrows, @as(i64, @intCast(n)));
+        var extra: i64 = @mod(plan.nrows, @as(i64, @intCast(n)));
+        var off: i64 = 0;
+        for (jobs) |*job| {
+            const span = base + if (extra > 0) blk: {
+                extra -= 1;
+                break :blk @as(i64, 1);
+            } else 0;
+            job.* = .{
+                .path = file.path,
+                .wanted = wanted,
+                .where = where,
+                .vec_size = vec_size,
+                .lo = 0,
+                .hi = 0,
+                .row_off = off,
+                .row_len = span,
+                .stats = stats,
+                .cancel = bound_cancel,
+            };
+            off += span;
+        }
+    } else {
+        const base: i32 = @intCast(@divFloor(plan.nrg, @as(i32, @intCast(n))));
+        const extra: i32 = @intCast(@mod(plan.nrg, @as(i32, @intCast(n))));
+        for (jobs, 0..) |*job, i| {
+            const span = base + if (i < @as(usize, @intCast(extra))) @as(i32, 1) else 0;
+            const lo: i32 = @as(i32, @intCast(i)) * base + @min(@as(i32, @intCast(i)), extra);
+            job.* = .{
+                .path = file.path,
+                .wanted = wanted,
+                .where = where,
+                .vec_size = vec_size,
+                .lo = lo,
+                .hi = lo + span,
+                .stats = stats,
+                .cancel = bound_cancel,
+            };
+        }
+    }
+
+    var group: std.Io.Group = .init;
+    var joined = false;
+    defer if (!joined) group.cancel(t.io);
+    for (jobs) |*job| {
+        group.concurrent(t.io, pScanJob, .{job}) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => try pScanJobInner(job),
+        };
+    }
+    group.await(t.io) catch |err| {
+        joined = true;
+        if (err == error.Canceled) return error.QueryCanceled;
+        return err;
+    };
+    joined = true;
+    for (jobs) |job| if (job.err) |e| return e;
+
+    var parts: std.ArrayList(Batch) = .empty;
+    defer parts.deinit(allocator);
+    for (jobs) |job| {
+        if (job.batch.columns.len == 0) continue;
+        try parts.append(allocator, job.batch);
+    }
+    if (parts.items.len == 0) return null;
+    return try concatBatches(allocator, parts.items);
+}
+
 fn scanParquet(
     allocator: std.mem.Allocator,
     t: vfs.Transport,
@@ -3513,6 +5122,9 @@ fn scanParquet(
     where: ?*const sql.BoolExpr,
     stats: ?*ScanStats,
 ) !Batch {
+    if (file.bytes == null) {
+        if (try parallelParquetScan(allocator, t, file, wanted, where, stats, 65536)) |batch| return batch;
+    }
     var reader = if (file.bytes) |b|
         try parquet.openMemory(allocator, b)
     else

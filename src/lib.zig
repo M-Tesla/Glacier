@@ -29,7 +29,7 @@ pub const Batch = batch.Batch;
 pub const Column = batch.Column;
 pub const GlacierError = err.GlacierError;
 
-pub const version = "0.6.1";
+pub const version = "0.6.2";
 
 comptime {
     _ = &c_api.glacier_open;

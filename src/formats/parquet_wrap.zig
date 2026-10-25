@@ -54,6 +54,9 @@ const c = struct {
         err_buf: [*]u8,
         err_len: usize,
     ) ?*anyopaque;
+    extern fn glacier_carquet_batch_set_row_range(br: ?*anyopaque, offset: i64, limit: i64) c_int;
+    extern fn glacier_carquet_has_offset_index(reader: ?*anyopaque, row_group: i32, column: i32) c_int;
+    extern fn glacier_carquet_column_repeats(reader: ?*anyopaque, column: i32) c_int;
     extern fn glacier_carquet_batch_next(br: ?*anyopaque, out_batch: *?*anyopaque) c_int;
     extern fn glacier_carquet_batch_close(br: ?*anyopaque) void;
     extern fn glacier_carquet_row_batch_free(batch: ?*anyopaque) void;
@@ -124,6 +127,26 @@ const c = struct {
         err_buf: [*]u8,
         err_len: usize,
     ) ?*anyopaque;
+    extern fn glacier_carquet_batch_open_filter_ex(
+        reader: ?*anyopaque,
+        cols: ?[*]const i32,
+        n_cols: i32,
+        batch_size: i32,
+        hook: ?*RgHook,
+        preserve_dict: i32,
+        err_buf: [*]u8,
+        err_len: usize,
+    ) ?*anyopaque;
+    extern fn glacier_carquet_rb_column_dict(
+        batch: ?*anyopaque,
+        index: i32,
+        indices: *?[*]const u32,
+        nulls: *?[*]const u8,
+        n: *i64,
+        dict: *?[*]const u8,
+        dict_count: *i32,
+        dict_offsets: *?[*]const u32,
+    ) c_int;
     extern fn glacier_carquet_row_group_matches(
         reader: ?*anyopaque,
         row_group: i32,
@@ -195,6 +218,14 @@ pub const Reader = struct {
         return c.glacier_carquet_num_row_groups(self.handle);
     }
 
+    pub fn hasOffsetIndex(self: Reader, row_group: i32, file_col: i32) bool {
+        return c.glacier_carquet_has_offset_index(self.handle, row_group, file_col) != 0;
+    }
+
+    pub fn columnRepeats(self: Reader, file_col: i32) bool {
+        return c.glacier_carquet_column_repeats(self.handle, file_col) != 0;
+    }
+
     pub fn column(self: Reader, index: i32) ?Column {
         const name_z = c.glacier_carquet_column_name(self.handle, index) orelse return null;
         return .{
@@ -242,14 +273,20 @@ pub const Reader = struct {
     }
 
     pub fn openBatchFiltered(self: Reader, columns: []const i32, batch_size: i32, hook: ?*RgHook) !BatchReader {
+        return self.openBatchFilteredEx(columns, batch_size, hook, false);
+    }
+
+    /// `preserve_dict` keeps dictionary indices instead of expanding every row.
+    pub fn openBatchFilteredEx(self: Reader, columns: []const i32, batch_size: i32, hook: ?*RgHook, preserve_dict: bool) !BatchReader {
         var err_buf: [256]u8 = undefined;
         @memset(&err_buf, 0);
-        const handle = c.glacier_carquet_batch_open_filter(
+        const handle = c.glacier_carquet_batch_open_filter_ex(
             self.handle,
             if (columns.len == 0) null else columns.ptr,
             @intCast(columns.len),
             batch_size,
             hook,
+            if (preserve_dict) 1 else 0,
             &err_buf,
             err_buf.len,
         ) orelse {
@@ -298,6 +335,47 @@ pub const RowBatch = struct {
 
     pub fn numRows(self: RowBatch) i64 {
         return c.glacier_carquet_rb_nrows(self.ptr);
+    }
+
+    pub const DictCol = struct {
+        indices: []const u32,
+        nulls: ?[*]const u8,
+        /// Raw dictionary bytes. Width is the physical type, or length-prefixed
+        /// entries when `offsets` is set. Lifetime is this batch.
+        dict_ptr: [*]const u8,
+        dict_count: i32,
+        offsets: ?[*]const u32,
+    };
+
+    /// Null when this projected column was materialized (plain, or dictionaries off).
+    pub fn columnDictionary(self: RowBatch, index: i32) ?DictCol {
+        var indices: ?[*]const u32 = null;
+        var nulls: ?[*]const u8 = null;
+        var n: i64 = 0;
+        var dict: ?[*]const u8 = null;
+        var dict_count: i32 = 0;
+        var offsets: ?[*]const u32 = null;
+        if (c.glacier_carquet_rb_column_dict(
+            self.ptr,
+            index,
+            &indices,
+            &nulls,
+            &n,
+            &dict,
+            &dict_count,
+            &offsets,
+        ) != 0) return null;
+        if (n < 0 or dict_count < 0) return null;
+        const ip = indices orelse return null;
+        const dp = dict orelse @as([*]const u8, @ptrCast(&.{}));
+        const aligned: [*]const u32 = @ptrCast(@alignCast(ip));
+        return .{
+            .indices = if (n == 0) &.{} else aligned[0..@intCast(n)],
+            .nulls = nulls,
+            .dict_ptr = dp,
+            .dict_count = dict_count,
+            .offsets = offsets,
+        };
     }
 
     pub fn columnValues(self: RowBatch, index: i32) !struct { ptr: [*]const u8, n: i64, nulls: ?[*]const u8 } {
@@ -357,6 +435,11 @@ pub const BatchReader = struct {
     pub fn close(self: *BatchReader) void {
         c.glacier_carquet_batch_close(self.handle);
         self.* = undefined;
+    }
+
+    pub fn setRowRange(self: *BatchReader, offset: i64, limit: i64) !void {
+        if (c.glacier_carquet_batch_set_row_range(self.handle, offset, limit) != 0)
+            return error.ParquetOpenFailed;
     }
 
     pub fn next(self: *BatchReader) !?RowBatch {

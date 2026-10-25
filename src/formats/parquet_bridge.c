@@ -95,6 +95,16 @@ GLACIER_INTERNAL void *glacier_carquet_batch_open(
     return glacier_carquet_batch_open_filter(reader, cols, n_cols, batch_size, NULL, err_buf, err_len);
 }
 
+GLACIER_INTERNAL void *glacier_carquet_batch_open_filter_ex(
+    void *reader,
+    const int32_t *cols,
+    int32_t n_cols,
+    int32_t batch_size,
+    glacier_rg_hook *hook,
+    int preserve_dict,
+    char *err_buf,
+    size_t err_len);
+
 GLACIER_INTERNAL void *glacier_carquet_batch_open_filter(
     void *reader,
     const int32_t *cols,
@@ -104,10 +114,25 @@ GLACIER_INTERNAL void *glacier_carquet_batch_open_filter(
     char *err_buf,
     size_t err_len)
 {
+    return glacier_carquet_batch_open_filter_ex(
+        reader, cols, n_cols, batch_size, hook, 0, err_buf, err_len);
+}
+
+GLACIER_INTERNAL void *glacier_carquet_batch_open_filter_ex(
+    void *reader,
+    const int32_t *cols,
+    int32_t n_cols,
+    int32_t batch_size,
+    glacier_rg_hook *hook,
+    int preserve_dict,
+    char *err_buf,
+    size_t err_len)
+{
     carquet_error_t err = CARQUET_ERROR_INIT;
     carquet_batch_reader_config_t cfg;
     carquet_batch_reader_config_init(&cfg);
     cfg.num_threads = 1;
+    cfg.preserve_dictionaries = preserve_dict != 0;
     if (batch_size > 0) cfg.batch_size = batch_size;
     if (cols && n_cols > 0) {
         cfg.column_indices = cols;
@@ -123,6 +148,27 @@ GLACIER_INTERNAL void *glacier_carquet_batch_open_filter(
         err_buf[err_len - 1] = 0;
     }
     return br;
+}
+
+GLACIER_INTERNAL int glacier_carquet_batch_set_row_range(void *br, int64_t offset, int64_t limit) {
+    if (!br) return -1;
+    return carquet_batch_reader_set_row_range((carquet_batch_reader_t *)br, offset, limit) == CARQUET_OK ? 0 : -1;
+}
+
+GLACIER_INTERNAL int glacier_carquet_has_offset_index(void *reader, int32_t row_group, int32_t column) {
+    carquet_column_chunk_metadata_t meta;
+    if (!reader) return 0;
+    if (carquet_reader_column_chunk_metadata((const carquet_reader_t *)reader, row_group, column, &meta) != CARQUET_OK)
+        return 0;
+    return meta.has_offset_index ? 1 : 0;
+}
+
+GLACIER_INTERNAL int glacier_carquet_column_repeats(void *reader, int32_t column) {
+    const carquet_schema_t *schema;
+    if (!reader || column < 0) return 1;
+    schema = carquet_reader_schema((const carquet_reader_t *)reader);
+    if (!schema) return 1;
+    return carquet_schema_max_rep_level(schema, column) > 0 ? 1 : 0;
 }
 
 GLACIER_INTERNAL int glacier_carquet_batch_next(void *br, void **out_batch) {
@@ -169,6 +215,34 @@ GLACIER_INTERNAL int glacier_carquet_rb_column(
         nulls ? nulls : &bitmap,
         n);
     return st == CARQUET_OK ? 0 : -1;
+}
+
+GLACIER_INTERNAL int glacier_carquet_rb_column_dict(
+    void *batch,
+    int32_t index,
+    const uint32_t **indices,
+    const uint8_t **nulls,
+    int64_t *n,
+    const uint8_t **dict,
+    int32_t *dict_count,
+    const uint32_t **dict_offsets)
+{
+    const uint8_t *bitmap = NULL;
+    const uint32_t *offs = NULL;
+    if (!indices || !n || !dict || !dict_count) return -1;
+    const carquet_status_t st = carquet_row_batch_column_dictionary(
+        (const carquet_row_batch_t *)batch,
+        index,
+        indices,
+        nulls ? nulls : &bitmap,
+        n,
+        dict,
+        dict_count,
+        dict_offsets ? dict_offsets : &offs);
+    if (st != CARQUET_OK) return -1;
+    if (nulls && !*nulls) *nulls = bitmap;
+    if (dict_offsets && !*dict_offsets) *dict_offsets = offs;
+    return 0;
 }
 
 GLACIER_INTERNAL int glacier_carquet_rb_column_list(

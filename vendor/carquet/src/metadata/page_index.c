@@ -1084,3 +1084,19 @@ void carquet_offset_index_free(carquet_offset_index_t* index) {
     carquet_mem_free(index->page_locations);
     carquet_mem_free(index);
 }
+
+carquet_offset_index_t* carquet_offset_index_from_locations(
+    const carquet_page_location_t* locs, int32_t count) {
+
+    if (!locs || count <= 0) return NULL;
+    struct carquet_offset_index* oi = carquet_mem_calloc(1, sizeof(*oi));
+    if (!oi) return NULL;
+    oi->page_locations = carquet_mem_malloc((size_t)count * sizeof(*locs));
+    if (!oi->page_locations) {
+        carquet_mem_free(oi);
+        return NULL;
+    }
+    memcpy(oi->page_locations, locs, (size_t)count * sizeof(*locs));
+    oi->num_pages = count;
+    return oi;
+}
