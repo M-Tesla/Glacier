@@ -16,6 +16,17 @@ pub const Grant = struct {
     name: []const u8,
     privilege: Privilege,
     principal: []const u8,
+    /// Predicate text AND-ed under the caller's SQL. Empty means no row filter.
+    filter: []const u8 = "",
+    /// Output column replaced by `mask_value`. Empty means no mask.
+    mask_column: []const u8 = "",
+    mask_value: []const u8 = "",
+};
+
+pub const Policy = struct {
+    filter: []const u8 = "",
+    mask_column: []const u8 = "",
+    mask_value: []const u8 = "",
 };
 
 pub fn filePath(allocator: std.mem.Allocator, warehouse: []const u8) ![]u8 {
@@ -39,13 +50,19 @@ pub fn grant(
     name: []const u8,
     privilege: Privilege,
     who: []const u8,
+    policy: Policy,
 ) !void {
     var http: std.http.Client = .{ .allocator = allocator, .io = io };
     defer http.deinit();
     const t = Transport{ .allocator = allocator, .io = io, .http = &http };
     const cur = try load(allocator, t, warehouse);
-    for (cur) |g| {
-        if (same(g, namespace, name, privilege, who)) return;
+    for (cur) |*g| {
+        if (!same(g.*, namespace, name, privilege, who)) continue;
+        g.filter = try allocator.dupe(u8, policy.filter);
+        g.mask_column = try allocator.dupe(u8, policy.mask_column);
+        g.mask_value = try allocator.dupe(u8, policy.mask_value);
+        try save(allocator, io, warehouse, cur);
+        return;
     }
     const next = try allocator.alloc(Grant, cur.len + 1);
     @memcpy(next[0..cur.len], cur);
@@ -54,6 +71,9 @@ pub fn grant(
         .name = try allocator.dupe(u8, name),
         .privilege = privilege,
         .principal = try allocator.dupe(u8, who),
+        .filter = try allocator.dupe(u8, policy.filter),
+        .mask_column = try allocator.dupe(u8, policy.mask_column),
+        .mask_value = try allocator.dupe(u8, policy.mask_value),
     };
     try save(allocator, io, warehouse, next);
 }
@@ -79,9 +99,9 @@ pub fn revoke(
     try save(allocator, io, warehouse, keep.items);
 }
 
-pub fn allows(items: []const Grant, namespace: []const u8, name: []const u8, write: bool) bool {
+pub fn allows(items: []const Grant, namespace: []const u8, name: []const u8, write: bool, who: []const u8) bool {
     for (items) |g| {
-        if (!std.ascii.eqlIgnoreCase(g.principal, principal)) continue;
+        if (!std.ascii.eqlIgnoreCase(g.principal, who)) continue;
         if (!std.ascii.eqlIgnoreCase(g.namespace, namespace)) continue;
         if (!std.ascii.eqlIgnoreCase(g.name, name)) continue;
         if (g.privilege == .all) return true;
@@ -90,12 +110,35 @@ pub fn allows(items: []const Grant, namespace: []const u8, name: []const u8, wri
     return false;
 }
 
-pub fn namespaceVisible(items: []const Grant, namespace: []const u8) bool {
+pub fn namespaceVisible(items: []const Grant, namespace: []const u8, who: []const u8) bool {
     for (items) |g| {
-        if (!std.ascii.eqlIgnoreCase(g.principal, principal)) continue;
+        if (!std.ascii.eqlIgnoreCase(g.principal, who)) continue;
         if (std.ascii.eqlIgnoreCase(g.namespace, namespace)) return true;
     }
     return false;
+}
+
+pub fn policyFor(items: []const Grant, namespace: []const u8, name: []const u8, who: []const u8) Policy {
+    var out: Policy = .{};
+    for (items) |g| {
+        if (!std.ascii.eqlIgnoreCase(g.principal, who)) continue;
+        if (!std.ascii.eqlIgnoreCase(g.namespace, namespace)) continue;
+        if (!std.ascii.eqlIgnoreCase(g.name, name)) continue;
+        if (g.privilege != .all and g.privilege != .select) continue;
+        if (g.filter.len > 0) out.filter = g.filter;
+        if (g.mask_column.len > 0) {
+            out.mask_column = g.mask_column;
+            out.mask_value = g.mask_value;
+        }
+    }
+    return out;
+}
+
+fn jsonStr(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+    return switch (obj.get(key) orelse .null) {
+        .string => |s| s,
+        else => "",
+    };
 }
 
 fn same(g: Grant, namespace: []const u8, name: []const u8, privilege: Privilege, who: []const u8) bool {
@@ -149,6 +192,9 @@ fn parse(allocator: std.mem.Allocator, json_text: []const u8) ![]Grant {
             .name = try allocator.dupe(u8, name),
             .privilege = privilege,
             .principal = try allocator.dupe(u8, who),
+            .filter = try allocator.dupe(u8, jsonStr(obj, "filter")),
+            .mask_column = try allocator.dupe(u8, jsonStr(obj, "mask_column")),
+            .mask_value = try allocator.dupe(u8, jsonStr(obj, "mask_value")),
         });
     }
     return out.items;
@@ -168,6 +214,16 @@ fn save(allocator: std.mem.Allocator, io: std.Io, warehouse: []const u8, items: 
         try appendJsonStr(&buf, allocator, if (g.privilege == .all) "all" else "select");
         try buf.appendSlice(allocator, ",\"principal\":");
         try appendJsonStr(&buf, allocator, g.principal);
+        if (g.filter.len > 0) {
+            try buf.appendSlice(allocator, ",\"filter\":");
+            try appendJsonStr(&buf, allocator, g.filter);
+        }
+        if (g.mask_column.len > 0) {
+            try buf.appendSlice(allocator, ",\"mask_column\":");
+            try appendJsonStr(&buf, allocator, g.mask_column);
+            try buf.appendSlice(allocator, ",\"mask_value\":");
+            try appendJsonStr(&buf, allocator, g.mask_value);
+        }
         try buf.append(allocator, '}');
     }
     try buf.appendSlice(allocator, "]}");
@@ -207,16 +263,17 @@ test "grant file roundtrip" {
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
     const t = Transport{ .allocator = gpa, .io = io, .http = &http };
-    try grant(gpa, io, root, "sales", "orders", .select, principal);
-    try grant(gpa, io, root, "sales", "orders", .select, principal);
-    try grant(gpa, io, root, "sales", "orders", .all, principal);
+    try grant(gpa, io, root, "sales", "orders", .select, principal, .{});
+    try grant(gpa, io, root, "sales", "orders", .select, principal, .{});
+    try grant(gpa, io, root, "sales", "orders", .all, principal, .{});
     const loaded = try load(gpa, t, root);
     try std.testing.expectEqual(@as(usize, 2), loaded.len);
-    try std.testing.expect(allows(loaded, "sales", "orders", false));
-    try std.testing.expect(allows(loaded, "sales", "orders", true));
-    try std.testing.expect(!allows(loaded, "sales", "other", false));
+    try std.testing.expect(allows(loaded, "sales", "orders", false, principal));
+    try std.testing.expect(allows(loaded, "sales", "orders", true, principal));
+    try std.testing.expect(!allows(loaded, "sales", "orders", false, "alice"));
+    try std.testing.expect(!allows(loaded, "sales", "other", false, principal));
     try revoke(gpa, io, root, "sales", "orders", .all, principal);
     const left = try load(gpa, t, root);
-    try std.testing.expect(allows(left, "sales", "orders", false));
-    try std.testing.expect(!allows(left, "sales", "orders", true));
+    try std.testing.expect(allows(left, "sales", "orders", false, principal));
+    try std.testing.expect(!allows(left, "sales", "orders", true, principal));
 }

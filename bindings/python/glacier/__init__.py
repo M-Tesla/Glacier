@@ -8,7 +8,7 @@ from typing import Any, Optional, Union
 
 from . import _native
 
-__version__ = "0.6.3"
+__version__ = "0.7.0"
 
 
 class GlacierError(Exception):

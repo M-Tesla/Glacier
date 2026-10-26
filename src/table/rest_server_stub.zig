@@ -51,3 +51,7 @@ pub fn parseListen(_: []const u8) !void {
 pub fn parseListenPort(_: []const u8, _: u16) !void {
     return error.WriteUnsupported;
 }
+
+pub fn parseListenPortTls(_: []const u8, _: u16, _: bool) !void {
+    return error.WriteUnsupported;
+}

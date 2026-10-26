@@ -390,6 +390,10 @@ pub const Query = struct {
     union_right: ?*Query = null,
     ctes: []const Cte = &.{},
     named_windows: []const NamedWindow = &.{},
+    /// Scan produced for a GRANT filter or mask. Do not wrap it again.
+    edge_sealed: bool = false,
+    /// Inner scan that applies the policy. The plan names it without the predicate or the file count.
+    edge_policy: bool = false,
 
     pub fn isStar(self: Query) bool {
         return self.items.len == 1 and self.items[0] == .star;
@@ -598,6 +602,9 @@ pub const Grant = struct {
     ident: []const u8,
     principal: []const u8,
     revoke: bool = false,
+    filter: []const u8 = "",
+    mask_column: []const u8 = "",
+    mask_value: []const u8 = "",
 };
 
 pub const Stmt = union(enum) {
@@ -1688,6 +1695,13 @@ fn parseBool(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8, allow
     return parseOr(allocator, lexer, sql, allow_agg);
 }
 
+pub fn parsePredicate(allocator: std.mem.Allocator, text: []const u8) !*BoolExpr {
+    var lexer: Lexer = .{ .sql = text };
+    const expr = try parseBool(allocator, &lexer, text, false);
+    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    return expr;
+}
+
 fn parseOr(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8, allow_agg: bool) ParseError!*BoolExpr {
     var left = try parseAnd(allocator, lexer, sql, allow_agg);
     while ((try lexer.peek()).kind == .@"or") {
@@ -1994,15 +2008,15 @@ pub fn parseStmt(allocator: std.mem.Allocator, sql: []const u8) !Stmt {
         return .{ .explain = .{ .query = try parseQuery(allocator, &lexer, sql, .eof) } };
     }
     if ((try lexer.peek()).kind == .ident and eqlKw((try lexer.peek()).slice(sql), "grant")) {
-        return .{ .grant = try parseGrant(&lexer, sql, false) };
+        return .{ .grant = try parseGrant(allocator, &lexer, sql, false) };
     }
     if ((try lexer.peek()).kind == .ident and eqlKw((try lexer.peek()).slice(sql), "revoke")) {
-        return .{ .grant = try parseGrant(&lexer, sql, true) };
+        return .{ .grant = try parseGrant(allocator, &lexer, sql, true) };
     }
     return .{ .query = try parseQuery(allocator, &lexer, sql, .eof) };
 }
 
-fn parseGrant(lexer: *Lexer, sql: []const u8, revoke: bool) !Grant {
+fn parseGrant(allocator: std.mem.Allocator, lexer: *Lexer, sql: []const u8, revoke: bool) !Grant {
     _ = try lexer.next();
     const priv_tok = try lexer.next();
     const privilege: GrantPrivilege = switch (priv_tok.kind) {
@@ -2019,12 +2033,41 @@ fn parseGrant(lexer: *Lexer, sql: []const u8, revoke: bool) !Grant {
         if (dir.kind != .from) return error.InvalidSyntax;
     } else if (dir.kind != .to) return error.InvalidSyntax;
     const who = try expect(lexer, .ident);
-    if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    var filter: []const u8 = "";
+    var mask_column: []const u8 = "";
+    var mask_value: []const u8 = "";
+    if (revoke) {
+        if ((try lexer.peek()).kind != .eof) return error.InvalidSyntax;
+    } else {
+        while ((try lexer.peek()).kind != .eof) {
+            const word = try lexer.next();
+            if (word.kind != .ident) return error.InvalidSyntax;
+            if (eqlKw(word.slice(sql), "filter")) {
+                _ = try expect(lexer, .lparen);
+                const begin = (try lexer.peek()).start;
+                _ = try parseBool(allocator, lexer, sql, false);
+                const rp = try expect(lexer, .rparen);
+                filter = std.mem.trim(u8, sql[begin..rp.start], " \t\r\n");
+            } else if (eqlKw(word.slice(sql), "mask")) {
+                _ = try expect(lexer, .lparen);
+                const col = try expect(lexer, .ident);
+                if ((try lexer.next()).kind != .comma) return error.InvalidSyntax;
+                const lit = try lexer.next();
+                if (lit.kind != .string) return error.InvalidSyntax;
+                _ = try expect(lexer, .rparen);
+                mask_column = col.slice(sql);
+                mask_value = unquote(sql, lit);
+            } else return error.InvalidSyntax;
+        }
+    }
     return .{
         .privilege = privilege,
         .ident = ident,
         .principal = who.slice(sql),
         .revoke = revoke,
+        .filter = filter,
+        .mask_column = mask_column,
+        .mask_value = mask_value,
     };
 }
 
@@ -4155,6 +4198,11 @@ test "parse GRANT and REVOKE" {
     try std.testing.expectEqualStrings("sales.orders", g.grant.ident);
     try std.testing.expectEqualStrings("bearer", g.grant.principal);
     try std.testing.expect(!g.grant.revoke);
+    const pol = try parseStmt(a, "GRANT SELECT ON TABLE sales.orders TO alice FILTER (id = 1) MASK (note, '***')");
+    try std.testing.expectEqualStrings("alice", pol.grant.principal);
+    try std.testing.expectEqualStrings("id = 1", pol.grant.filter);
+    try std.testing.expectEqualStrings("note", pol.grant.mask_column);
+    try std.testing.expectEqualStrings("***", pol.grant.mask_value);
     const r = try parseStmt(a, "REVOKE ALL ON TABLE lake.sales.orders FROM bearer");
     try std.testing.expectEqual(GrantPrivilege.all, r.grant.privilege);
     try std.testing.expectEqualStrings("lake.sales.orders", r.grant.ident);

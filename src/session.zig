@@ -157,6 +157,12 @@ pub const Session = struct {
     /// `CREATE TEMP TABLE`. Owned by `gpa`. Freed in `close`.
     temps: std.ArrayList(TempTable) = .empty,
     cancel: physical.CancelState = .{},
+    /// Flight or REST call that presented `--token` or a JWT. The local CLI
+    /// session leaves this false and stays the owner.
+    as_bearer: bool = false,
+    /// GRANT name for this call. Null on the owner session. `bearer` is the
+    /// shared `--token`. A JWT `sub` is a different name. Owned by `gpa`.
+    principal: ?[]u8 = null,
 
     pub fn requestCancel(self: *Session) void {
         self.cancel.flag.store(1, .release);
@@ -335,9 +341,20 @@ pub const Session = struct {
 
     pub fn close(self: *Session) void {
         self.freeTemps();
+        if (self.principal) |p| self.gpa.free(p);
+        self.principal = null;
         self.http.deinit();
         self.catalog_arena.deinit();
         self.* = undefined;
+    }
+
+    pub fn setPrincipal(self: *Session, name: ?[]const u8) !void {
+        if (self.principal) |old| self.gpa.free(old);
+        self.principal = null;
+        if (name) |n| {
+            if (n.len == 0) return;
+            self.principal = try self.gpa.dupe(u8, n);
+        }
     }
 
     pub fn execute(self: *Session, query_sql: []const u8) !Result {
@@ -474,6 +491,7 @@ pub const Session = struct {
     }
 
     fn executeCopy(self: *Session, a: std.mem.Allocator, c: sql.Copy) !Batch {
+        if (self.as_bearer) return error.AccessDenied;
         if (c.from_table) |ident| return self.executeCopyFrom(a, ident, c.path);
 
         const query: sql.Query = c.query orelse .{
@@ -575,6 +593,9 @@ pub const Session = struct {
         stats: *ScanStats,
         env: []const NamedBatch,
     ) anyerror!Batch {
+        if (self.principal != null and !query.edge_sealed) {
+            return self.runQueryEnv(a, try self.sealEdge(a, query), stats, env);
+        }
         if (query.ctes.len > 0) {
             var next: std.ArrayList(NamedBatch) = .empty;
             try next.appendSlice(a, env);
@@ -1515,6 +1536,7 @@ pub const Session = struct {
             .glacier => {
                 if (glacier_catalog.listNamespaces(a, self.transport(), entry.warehouse)) |nss| {
                     for (nss) |ns| {
+                        if (!self.bearerNsVisible(entry.warehouse, ns)) continue;
                         try names.append(a, ns);
                         try cats.append(a, entry.name);
                     }
@@ -1590,6 +1612,7 @@ pub const Session = struct {
                 const ns = namespace orelse self.default_namespace;
                 if (glacier_catalog.listTables(a, self.transport(), entry.warehouse, ns)) |idents| {
                     for (idents) |id| {
+                        if (!self.bearerVisible(entry.warehouse, id.namespace, id.name, false)) continue;
                         try names.append(a, id.name);
                         try cats.append(a, entry.name);
                         try nss.append(a, id.namespace);
@@ -1604,6 +1627,7 @@ pub const Session = struct {
     }
 
     fn executeAttach(self: *Session, a: std.mem.Allocator, att: sql.Attach) !Batch {
+        if (self.as_bearer) return error.AccessDenied;
         if (isRestUri(att.source) and !isParquetPath(att.source) and !isAvroPath(att.source) and !isGlacierPath(att.source)) {
             const cat_a = self.catalog_arena.allocator();
             const client_val = try rest_catalog.Client.connect(cat_a, self.transport(), .{ .endpoint = att.source });
@@ -1705,6 +1729,10 @@ pub const Session = struct {
     fn describeHadoop(self: *Session, a: std.mem.Allocator, entry: catalog.Entry, ident: []const u8) !Batch {
         if (ident.len == 0) return error.TableNotFound;
         const parts = rest_catalog.splitIdent(ident, self.default_namespace);
+        if (self.as_bearer) {
+            if (entry.kind != .glacier) return error.AccessDenied;
+            if (!self.bearerVisible(entry.warehouse, parts.ns, parts.name, false)) return error.AccessDenied;
+        }
         const dir = try hadoop_catalog.tablePath(a, entry.warehouse, parts.ns, parts.name);
         const table = try iceberg.openTable(a, self.transport(), dir);
         const schema = table.metadata.currentSchema() orelse return error.SchemaNotFound;
@@ -1745,6 +1773,7 @@ pub const Session = struct {
     }
 
     fn executeDetach(self: *Session, a: std.mem.Allocator, d: sql.Detach) !Batch {
+        if (self.as_bearer) return error.AccessDenied;
         const idx = self.findCatalogIndex(d.name) orelse return error.TableNotFound;
         const entry = self.catalogs[idx];
         const kind_label = entry.kind.label();
@@ -1822,10 +1851,15 @@ pub const Session = struct {
                 if (entry.warehouse.len == 0) return error.WriteUnsupported;
                 if (rest.len == 0) return error.InvalidSyntax;
                 const parts = rest_catalog.splitIdent(rest, self.default_namespace);
+                if (self.as_bearer) {
+                    if (entry.kind != .glacier) return error.AccessDenied;
+                    if (!self.bearerVisible(entry.warehouse, parts.ns, parts.name, true)) return error.AccessDenied;
+                }
                 const dir = try hadoop_catalog.tablePath(a, entry.warehouse, parts.ns, parts.name);
                 return .{ .entry = entry, .ns = parts.ns, .name = parts.name, .dir = dir };
             },
             .iceberg_rest => {
+                if (self.as_bearer) return error.AccessDenied;
                 if (entry.rest == null) return error.WriteUnsupported;
                 if (rest.len == 0) return error.InvalidSyntax;
                 const parts = rest_catalog.splitIdent(rest, self.default_namespace);
@@ -1860,8 +1894,9 @@ pub const Session = struct {
     }
 
     fn executeGrant(self: *Session, a: std.mem.Allocator, g: sql.Grant) !Batch {
+        if (self.as_bearer) return error.AccessDenied;
         try refuseWrite();
-        if (!std.ascii.eqlIgnoreCase(g.principal, grants.principal)) return error.GrantPrincipal;
+        if (g.principal.len == 0) return error.GrantPrincipal;
         const target = try self.resolveWrite(a, g.ident);
         if (target.entry.kind != .glacier) return error.ForeignGrant;
         const tables = try glacier_catalog.listTables(a, self.transport(), target.entry.warehouse, target.ns);
@@ -1875,17 +1910,22 @@ pub const Session = struct {
         if (!found) return error.TableNotFound;
         const privilege: grants.Privilege = if (g.privilege == .all) .all else .select;
         if (g.revoke) {
-            try grants.revoke(a, self.io, target.entry.warehouse, target.ns, target.name, privilege, grants.principal);
+            try grants.revoke(a, self.io, target.entry.warehouse, target.ns, target.name, privilege, g.principal);
         } else {
-            try grants.grant(a, self.io, target.entry.warehouse, target.ns, target.name, privilege, grants.principal);
+            try grants.grant(a, self.io, target.entry.warehouse, target.ns, target.name, privilege, g.principal, .{
+                .filter = g.filter,
+                .mask_column = g.mask_column,
+                .mask_value = g.mask_value,
+            });
         }
         const priv_name: []const u8 = if (g.privilege == .all) "all" else "select";
         return catalog.utf8Cols(a, &.{ "privilege", "table", "principal" }, &.{
-            &.{priv_name}, &.{g.ident}, &.{grants.principal},
+            &.{priv_name}, &.{g.ident}, &.{g.principal},
         });
     }
 
     fn executeCreateNamespace(self: *Session, a: std.mem.Allocator, n: sql.CreateNamespace) !Batch {
+        if (self.as_bearer) return error.AccessDenied;
         try refuseWrite();
         const target = try self.resolveNamespaceIdent(n.ident);
         if (target.entry.kind == .iceberg_rest) {
@@ -2092,6 +2132,7 @@ pub const Session = struct {
         if (self.findTempIndex(ins.ident) != null) return self.executeInsertTemp(a, ins);
         try refuseWrite();
         const target = try self.resolveWrite(a, ins.ident);
+        try self.refusePolicyRewrite(target);
         var stats: ScanStats = .{};
         const input = try self.runQuery(a, ins.query, &stats);
         const inserted = try self.appendAligned(a, target, input);
@@ -2105,6 +2146,7 @@ pub const Session = struct {
     fn executeDelete(self: *Session, a: std.mem.Allocator, del: sql.Delete) !Batch {
         try refuseWrite();
         const target = try self.resolveWrite(a, del.ident);
+        try self.refusePolicyRewrite(target);
         var stats: ScanStats = .{};
         const q: sql.Query = .{
             .items = try a.dupe(sql.SelectItem, &.{.star}),
@@ -2137,6 +2179,7 @@ pub const Session = struct {
         if (self.findTempIndex(c.ident) != null) return error.UnsupportedSql;
         try refuseWrite();
         const target = try self.resolveWrite(a, c.ident);
+        try self.refusePolicyRewrite(target);
         const shape = try self.icebergShape(a, target);
         var stats: ScanStats = .{};
         const q: sql.Query = .{
@@ -2173,6 +2216,7 @@ pub const Session = struct {
         if (self.findTempIndex(e.ident) != null) return error.UnsupportedSql;
         try refuseWrite();
         const target = try self.resolveWrite(a, e.ident);
+        try self.refusePolicyRewrite(target);
         if (target.dir.len == 0) return error.WriteUnsupported;
         const table = try iceberg.openTable(a, self.transport(), target.dir);
         const ids = try iceberg.nonCurrentSnapshotIds(a, table);
@@ -2187,6 +2231,7 @@ pub const Session = struct {
         if (self.findTempIndex(r.ident) != null) return error.UnsupportedSql;
         try refuseWrite();
         const target = try self.resolveWrite(a, r.ident);
+        try self.refusePolicyRewrite(target);
         if (target.dir.len == 0) return error.WriteUnsupported;
         const paths = try iceberg.orphanFiles(a, self.transport(), target.dir, r.execute);
         self.clearTableCache();
@@ -2206,8 +2251,12 @@ pub const Session = struct {
     }
 
     fn executeExplain(self: *Session, a: std.mem.Allocator, ex: sql.Explain) !Batch {
+        const query = if (self.principal != null and !ex.query.edge_sealed)
+            try self.sealEdge(a, ex.query)
+        else
+            ex.query;
         var buf: std.ArrayList(u8) = .empty;
-        try self.writeExplain(a, &buf, ex.query);
+        try self.writeExplain(a, &buf, query);
         const text = try buf.toOwnedSlice(a);
         const lines = try a.alloc([]const u8, 1);
         lines[0] = text;
@@ -2247,6 +2296,10 @@ pub const Session = struct {
     }
 
     fn writeExplainLeaf(self: *Session, a: std.mem.Allocator, buf: *std.ArrayList(u8), query: sql.Query) !void {
+        if (query.edge_policy) {
+            try buf.appendSlice(a, "scan policy\n");
+            return;
+        }
         if (query.isNoFrom()) {
             try buf.appendSlice(a, "project\n");
             return;
@@ -2422,6 +2475,7 @@ pub const Session = struct {
     fn executeUpdate(self: *Session, a: std.mem.Allocator, upd: sql.Update) !Batch {
         try refuseWrite();
         const target = try self.resolveWrite(a, upd.ident);
+        try self.refusePolicyRewrite(target);
         const schema = try self.writeSchema(a, target);
         var stats: ScanStats = .{};
         const q: sql.Query = .{
@@ -2447,6 +2501,7 @@ pub const Session = struct {
     fn executeMerge(self: *Session, a: std.mem.Allocator, mer: sql.Merge) !Batch {
         try refuseWrite();
         const target = try self.resolveWrite(a, mer.ident);
+        try self.refusePolicyRewrite(target);
         const schema = try self.writeSchema(a, target);
         const dest_qual = mer.alias orelse tableStem(mer.ident);
         const src_qual = mer.source_alias orelse tableStem(mer.source);
@@ -2556,6 +2611,7 @@ pub const Session = struct {
     fn executeAlterTable(self: *Session, a: std.mem.Allocator, alt: sql.AlterTable) !Batch {
         try refuseWrite();
         const target = try self.resolveWrite(a, alt.ident);
+        try self.refusePolicyRewrite(target);
         if (target.entry.kind == .iceberg_rest) {
             const client = target.entry.rest orelse return error.WriteUnsupported;
             const loaded = try client.loadTable(a, self.transport(), target.ns, target.name);
@@ -2683,6 +2739,7 @@ pub const Session = struct {
         if (self.findTempIndex(d.ident) != null) return self.executeDropTemp(a, d.ident);
         try refuseWrite();
         const target = try self.resolveWrite(a, d.ident);
+        try self.refusePolicyRewrite(target);
         if (target.entry.kind == .iceberg_rest) {
             const client = target.entry.rest orelse return error.WriteUnsupported;
             try client.dropTable(a, self.transport(), target.ns, target.name);
@@ -2759,7 +2816,200 @@ pub const Session = struct {
         return null;
     }
 
+    fn bearerVisible(self: *Session, warehouse: []const u8, namespace: []const u8, name: []const u8, write: bool) bool {
+        if (!self.as_bearer) return true;
+        const who = self.principal orelse return false;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const gs = grants.load(arena.allocator(), self.transport(), warehouse) catch return false;
+        return grants.allows(gs, namespace, name, write, who);
+    }
+
+    fn bearerNsVisible(self: *Session, warehouse: []const u8, namespace: []const u8) bool {
+        if (!self.as_bearer) return true;
+        const who = self.principal orelse return false;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const gs = grants.load(arena.allocator(), self.transport(), warehouse) catch return false;
+        return grants.namespaceVisible(gs, namespace, who);
+    }
+
+    fn sealEdge(self: *Session, a: std.mem.Allocator, query: sql.Query) anyerror!sql.Query {
+        if (query.edge_sealed) return query;
+        var q = query;
+        try self.sealItems(a, q.items);
+        if (q.where) |w| try self.sealBool(a, w);
+        if (q.having) |h| try self.sealBool(a, h);
+        if (q.from_sub) |sub| {
+            const inner = try a.create(sql.Query);
+            inner.* = try self.sealEdge(a, sub.*);
+            q.from_sub = inner;
+        }
+        if (q.join) |*j| {
+            if (j.sub) |sub| {
+                const inner = try a.create(sql.Query);
+                inner.* = try self.sealEdge(a, sub.*);
+                j.sub = inner;
+            } else if (try self.edgeWrap(a, j.table, null)) |inner| {
+                j.sub = inner;
+                j.table = "";
+            }
+        }
+        if (q.union_right) |right| {
+            const inner = try a.create(sql.Query);
+            inner.* = try self.sealEdge(a, right.*);
+            q.union_right = inner;
+        }
+        if (q.ctes.len > 0) {
+            const next = try a.alloc(sql.Cte, q.ctes.len);
+            for (q.ctes, next) |cte, *out| {
+                const body = try a.create(sql.Query);
+                body.* = try self.sealEdge(a, cte.query.*);
+                out.* = cte;
+                out.query = body;
+            }
+            q.ctes = next;
+        }
+        if (q.from_sub == null and q.from.len > 0) {
+            if (try self.edgeWrap(a, q.from, q.as_of)) |inner| {
+                q.from_sub = inner;
+                q.from = "";
+                q.as_of = null;
+            }
+        }
+        q.edge_sealed = true;
+        return q;
+    }
+
+    fn sealItems(self: *Session, a: std.mem.Allocator, items: []const sql.SelectItem) anyerror!void {
+        for (items) |item| switch (item) {
+            .expr => |ex| try self.sealExpr(a, ex.expr),
+            .case => |cs| for (cs.arms) |arm| try self.sealBool(a, arm.when),
+            else => {},
+        };
+    }
+
+    fn sealBool(self: *Session, a: std.mem.Allocator, e: *sql.BoolExpr) anyerror!void {
+        switch (e.*) {
+            .@"and", .@"or" => |b| {
+                try self.sealBool(a, b.left);
+                try self.sealBool(a, b.right);
+            },
+            .cmp => |c| {
+                try self.sealExpr(a, c.left);
+                try self.sealExpr(a, c.right);
+            },
+            .in_query => |*iq| {
+                const inner = try a.create(sql.Query);
+                inner.* = try self.sealEdge(a, iq.query.*);
+                iq.query = inner;
+            },
+            .cmp_query => |*cq| {
+                try self.sealExpr(a, cq.left);
+                const inner = try a.create(sql.Query);
+                inner.* = try self.sealEdge(a, cq.query.*);
+                cq.query = inner;
+            },
+            .exists => |*ex| {
+                const inner = try a.create(sql.Query);
+                inner.* = try self.sealEdge(a, ex.query.*);
+                ex.query = inner;
+            },
+            else => {},
+        }
+    }
+
+    fn sealExpr(self: *Session, a: std.mem.Allocator, e: *sql.Expr) anyerror!void {
+        switch (e.*) {
+            .subquery => |*sub| {
+                const inner = try a.create(sql.Query);
+                inner.* = try self.sealEdge(a, sub.*.*);
+                sub.* = inner;
+            },
+            .binary => |b| {
+                try self.sealExpr(a, b.left);
+                try self.sealExpr(a, b.right);
+            },
+            .unary_minus => |arg| try self.sealExpr(a, arg),
+            .call => |c| for (c.args) |arg| try self.sealExpr(a, arg),
+            else => {},
+        }
+    }
+
+    fn edgeWrap(self: *Session, a: std.mem.Allocator, from: []const u8, as_of: ?sql.AsOf) !?*sql.Query {
+        const who = self.principal orelse return null;
+        if (from.len == 0) return null;
+        const h = self.resolveHadoop(from) orelse return null;
+        const cat = self.findCatalog(h.cat) orelse return null;
+        if (cat.kind != .glacier or h.ident.len == 0) return null;
+        const ident = rest_catalog.splitIdent(h.ident, self.default_namespace);
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const gs = grants.load(arena.allocator(), self.transport(), h.warehouse) catch return null;
+        const policy = grants.policyFor(gs, ident.ns, ident.name, who);
+        if (policy.filter.len == 0 and policy.mask_column.len == 0) return null;
+        const filter_text = try a.dupe(u8, policy.filter);
+        const mask_col = try a.dupe(u8, policy.mask_column);
+        const mask_val = try a.dupe(u8, policy.mask_value);
+        const where = if (filter_text.len == 0) null else try sql.parsePredicate(a, filter_text);
+        var items: []const sql.SelectItem = &.{.star};
+        if (mask_col.len > 0) {
+            const dir = try hadoop_catalog.tablePath(a, h.warehouse, ident.ns, ident.name);
+            const table = try iceberg.openTable(a, self.transport(), dir);
+            const schema = table.metadata.currentSchema() orelse return error.SchemaNotFound;
+            var cols: std.ArrayList(sql.SelectItem) = .empty;
+            var found = false;
+            for (schema.fields) |f| {
+                if (std.ascii.eqlIgnoreCase(f.name, mask_col)) {
+                    found = true;
+                    try cols.append(a, .{ .literal = .{
+                        .value = .{ .string = mask_val },
+                        .name = try a.dupe(u8, f.name),
+                    } });
+                } else {
+                    try cols.append(a, .{ .column = .{
+                        .name = try a.dupe(u8, f.name),
+                        .alias = null,
+                    } });
+                }
+            }
+            if (!found) return error.ColumnNotFound;
+            items = try cols.toOwnedSlice(a);
+        }
+        const inner = try a.create(sql.Query);
+        inner.* = .{
+            .items = items,
+            .from = try a.dupe(u8, from),
+            .where = where,
+            .group_by = &.{},
+            .having = null,
+            .order_by = &.{},
+            .distinct = false,
+            .limit = null,
+            .offset = null,
+            .as_of = as_of,
+            .edge_sealed = true,
+            .edge_policy = true,
+        };
+        return inner;
+    }
+
+    fn enforceBearerRead(self: *Session, from: []const u8) !void {
+        if (!self.as_bearer or from.len == 0) return;
+        if (isParquetPath(from) or isAvroPath(from) or isGlacierPath(from)) return error.AccessDenied;
+        if (std.mem.indexOfScalar(u8, from, '/') != null or std.mem.indexOf(u8, from, "://") != null) return error.AccessDenied;
+        if (self.catalogFiles(from) != null) return error.AccessDenied;
+        if (self.resolveRest(from) != null) return error.AccessDenied;
+        if (self.resolveHadoop(from)) |h| {
+            const cat = self.findCatalog(h.cat) orelse return error.AccessDenied;
+            if (cat.kind != .glacier or h.ident.len == 0) return error.AccessDenied;
+            const ident = rest_catalog.splitIdent(h.ident, self.default_namespace);
+            if (!self.bearerVisible(h.warehouse, ident.ns, ident.name, false)) return error.AccessDenied;
+        }
+    }
+
     fn filesFor(self: *Session, arena: std.mem.Allocator, from: []const u8, as_of: ?iceberg.AsOf) ![]const iceberg.DataFile {
+        try self.enforceBearerRead(from);
         if (as_of != null) return self.filesForAsOf(arena, from, as_of.?);
         if (from.len == 0) return self.files;
         if (self.catalogFiles(from)) |files| return files;
@@ -2925,8 +3175,41 @@ pub const Session = struct {
         };
     }
 
+    fn allowFileIdent(self: *Session, ident: []const u8) !void {
+        if (!self.as_bearer) return;
+        const h = self.resolveHadoop(ident) orelse return error.AccessDenied;
+        const cat = self.findCatalog(h.cat) orelse return error.AccessDenied;
+        if (cat.kind != .glacier or h.ident.len == 0) return error.AccessDenied;
+        const parts = rest_catalog.splitIdent(h.ident, self.default_namespace);
+        if (!self.bearerVisible(h.warehouse, parts.ns, parts.name, false)) return error.AccessDenied;
+        if (self.tablePolicySealed(h.warehouse, parts.ns, parts.name)) return error.AccessDenied;
+    }
+
+    fn fileIdentListed(self: *Session, warehouse: []const u8, namespace: []const u8, name: []const u8) bool {
+        if (!self.as_bearer) return true;
+        if (!self.bearerVisible(warehouse, namespace, name, false)) return false;
+        return !self.tablePolicySealed(warehouse, namespace, name);
+    }
+
+    fn refusePolicyRewrite(self: *Session, target: WriteTarget) !void {
+        if (!self.as_bearer) return;
+        if (self.tablePolicySealed(target.entry.warehouse, target.ns, target.name)) return error.AccessDenied;
+    }
+
+    /// A row filter or column mask hides the raw file list. The count on the
+    /// file would be the unfiltered table.
+    fn tablePolicySealed(self: *Session, warehouse: []const u8, namespace: []const u8, name: []const u8) bool {
+        const who = self.principal orelse return false;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const gs = grants.load(arena.allocator(), self.transport(), warehouse) catch return true;
+        const policy = grants.policyFor(gs, namespace, name, who);
+        return policy.filter.len > 0 or policy.mask_column.len > 0;
+    }
+
     fn systemIcebergIdents(self: *Session, a: std.mem.Allocator, ident: []const u8) ![]const []const u8 {
         if (ident.len > 0) {
+            try self.allowFileIdent(ident);
             const one = try a.alloc([]const u8, 1);
             one[0] = ident;
             return one;
@@ -2936,6 +3219,7 @@ pub const Session = struct {
         for (self.catalogs) |entry| {
             switch (entry.kind) {
                 .iceberg_rest => {
+                    if (self.as_bearer) continue;
                     catalog_session = true;
                     const client = entry.rest orelse self.rest orelse continue;
                     const namespaces = client.listNamespaces(a, self.transport()) catch |err| {
@@ -2958,6 +3242,7 @@ pub const Session = struct {
                     }
                 },
                 .iceberg_hadoop => {
+                    if (self.as_bearer) continue;
                     if (entry.warehouse.len == 0) continue;
                     catalog_session = true;
                     const namespaces = hadoop_catalog.listNamespaces(a, self.transport(), entry.warehouse) catch continue;
@@ -2981,6 +3266,7 @@ pub const Session = struct {
                         const idents = glacier_catalog.listTables(a, self.transport(), entry.warehouse, ns) catch continue;
                         for (idents) |id| {
                             const ns_name = if (id.namespace.len > 0) id.namespace else ns;
+                            if (!self.fileIdentListed(entry.warehouse, ns_name, id.name)) continue;
                             const qn = if (ns_name.len == 0)
                                 id.name
                             else
@@ -3037,6 +3323,7 @@ pub const Session = struct {
         var cats: std.ArrayList([]const u8) = .empty;
         var nss: std.ArrayList([]const u8) = .empty;
         for (self.catalogs) |entry| {
+            if (self.as_bearer and entry.kind != .glacier) continue;
             switch (entry.kind) {
                 .files => {
                     if (entry.table_name.len == 0) continue;
@@ -3062,6 +3349,7 @@ pub const Session = struct {
                         for (namespaces) |ns| {
                             if (glacier_catalog.listTables(a, self.transport(), entry.warehouse, ns)) |idents| {
                                 for (idents) |id| {
+                                    if (!self.bearerVisible(entry.warehouse, id.namespace, id.name, false)) continue;
                                     try names.append(a, id.name);
                                     try cats.append(a, entry.name);
                                     try nss.append(a, id.namespace);
@@ -11120,7 +11408,10 @@ test "GRANT bearer on the native catalog" {
         try std.testing.expectEqualStrings("bearer", b.columns[2].strAt(0));
     }
     try std.testing.expect(try showNames(&session, "SELECT name FROM glacier.tables", "orders"));
-    try std.testing.expectError(error.GrantPrincipal, session.execute("GRANT SELECT ON TABLE sales.orders TO alice"));
+    {
+        var result = try session.execute("GRANT SELECT ON TABLE sales.orders TO alice");
+        defer result.deinit();
+    }
 
     const listed = try testHttp(gpa, io, .GET, tables_url, auth, null);
     defer gpa.free(listed.body);
@@ -11167,4 +11458,436 @@ test "GRANT bearer on the native catalog" {
         defer result.deinit();
     }
     try std.testing.expectError(error.ForeignGrant, session.execute("GRANT SELECT ON TABLE hop.sales.orders TO bearer"));
+}
+
+test "row filter and column mask survive client SQL" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_mask_wh";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var session = try Session.open(gpa, io, root);
+    defer session.close();
+    {
+        var result = try session.execute("CREATE NAMESPACE sales");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE TABLE sales.orders (id BIGINT, note STRING)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("INSERT INTO sales.orders VALUES (2, 'other')");
+        defer result.deinit();
+    }
+    var snap_old: i64 = 0;
+    {
+        var result = try session.execute("SELECT snapshot_id FROM sales.orders.snapshots");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        snap_old = b.columns[0].i64s[0];
+    }
+    {
+        var result = try session.execute("INSERT INTO sales.orders VALUES (1, 'secret')");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("GRANT SELECT ON TABLE sales.orders TO alice FILTER (id = 1) MASK (note, '***')");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("GRANT ALL ON TABLE sales.orders TO alice");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("CREATE TABLE sales.open (id BIGINT)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("INSERT INTO sales.open VALUES (1)");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("GRANT SELECT ON TABLE sales.open TO alice");
+        defer result.deinit();
+    }
+    try session.setPrincipal("alice");
+    session.as_bearer = true;
+
+    {
+        var result = try session.execute("SELECT note, id FROM sales.orders WHERE 1 = 1");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expectEqualStrings("***", b.columns[0].strAt(0));
+        try std.testing.expectEqual(@as(i64, 1), b.columns[1].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM sales.orders");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM (SELECT note FROM sales.orders) t");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM sales.orders WHERE id IN (SELECT id FROM sales.orders)");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT MIN(note) FROM sales.orders");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("***", b.columns[0].strAt(0));
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM sales.orders WHERE note = 'secret'");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 0), b.columns[0].i64s[0]);
+    }
+    {
+        const older = try std.fmt.allocPrint(gpa, "SELECT COUNT(*) FROM sales.orders FOR SNAPSHOT {d}", .{snap_old});
+        defer gpa.free(older);
+        var result = try session.execute(older);
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 0), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("EXPLAIN SELECT COUNT(*) FROM sales.orders");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        const plan = b.columns[0].strAt(0);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "scan policy") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "files=") == null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "id = 1") == null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "secret") == null);
+    }
+    {
+        var result = try session.execute("EXPLAIN SELECT id FROM sales.open");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expect(std.mem.indexOf(u8, b.columns[0].strAt(0), "files=") != null);
+    }
+    try std.testing.expectError(error.AccessDenied, session.execute("COMPACT TABLE sales.orders"));
+    try std.testing.expectError(error.AccessDenied, session.execute("EXPIRE SNAPSHOTS sales.orders"));
+    try std.testing.expectError(error.AccessDenied, session.execute("REMOVE ORPHAN FILES sales.orders"));
+    try std.testing.expectError(error.AccessDenied, session.execute("ALTER TABLE sales.orders ADD COLUMN extra BIGINT"));
+    try std.testing.expectError(error.AccessDenied, session.execute("DROP TABLE sales.orders"));
+
+    session.as_bearer = false;
+    try session.setPrincipal(null);
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM sales.orders");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT note FROM sales.orders WHERE id = 2");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("other", b.columns[0].strAt(0));
+    }
+    {
+        const older = try std.fmt.allocPrint(gpa, "SELECT note FROM sales.orders FOR SNAPSHOT {d}", .{snap_old});
+        defer gpa.free(older);
+        var result = try session.execute(older);
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("other", b.columns[0].strAt(0));
+    }
+
+    {
+        var result = try session.execute("GRANT SELECT ON TABLE sales.orders TO bearer FILTER (id = 1) MASK (note, '***')");
+        defer result.deinit();
+    }
+    {
+        var result = try session.execute("GRANT SELECT ON TABLE sales.open TO bearer");
+        defer result.deinit();
+    }
+    const rest_server = @import("table/rest_server.zig");
+    var h = try rest_server.bind(gpa, io, root, "127.0.0.1:0");
+    try h.setBearer("s3cret");
+    var fut = try io.concurrent(rest_server.serveLoop, .{&h});
+    defer {
+        h.stop();
+        _ = fut.cancel(io) catch {};
+        h.deinit();
+    }
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{h.port()});
+    defer gpa.free(base);
+    const orders_url = try std.fmt.allocPrint(gpa, "{s}/v1/namespaces/sales/tables/orders", .{base});
+    defer gpa.free(orders_url);
+    const open_url = try std.fmt.allocPrint(gpa, "{s}/v1/namespaces/sales/tables/open", .{base});
+    defer gpa.free(open_url);
+    const tables_url = try std.fmt.allocPrint(gpa, "{s}/v1/namespaces/sales/tables", .{base});
+    defer gpa.free(tables_url);
+    const auth = "Bearer s3cret";
+    const sealed = try testHttp(gpa, io, .GET, orders_url, auth, null);
+    defer gpa.free(sealed.body);
+    try std.testing.expectEqual(std.http.Status.forbidden, sealed.status);
+    try std.testing.expect(std.mem.indexOf(u8, sealed.body, "secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sealed.body, ".parquet") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sealed.body, "metadata-location") == null);
+    const posted = try testHttp(gpa, io, .POST, orders_url, auth, "{}");
+    defer gpa.free(posted.body);
+    try std.testing.expectEqual(std.http.Status.forbidden, posted.status);
+    const plain = try testHttp(gpa, io, .GET, open_url, auth, null);
+    defer gpa.free(plain.body);
+    try std.testing.expectEqual(std.http.Status.ok, plain.status);
+    try std.testing.expect(std.mem.indexOf(u8, plain.body, "metadata-location") != null);
+    const listed = try testHttp(gpa, io, .GET, tables_url, auth, null);
+    defer gpa.free(listed.body);
+    try std.testing.expectEqual(std.http.Status.ok, listed.status);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "orders") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "open") != null);
+}
+
+test "edge policy holds for writes and outward joins" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_mask_probe";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var session = try Session.open(gpa, io, root);
+    defer session.close();
+    const setup = [_][]const u8{
+        "CREATE NAMESPACE sales",
+        "CREATE TABLE sales.orders (id BIGINT, note STRING)",
+        "CREATE TABLE sales.hidden (id BIGINT, note STRING)",
+        "CREATE TABLE sales.open (id BIGINT)",
+        "CREATE TABLE sales.sink (id BIGINT, note STRING)",
+        "INSERT INTO sales.orders VALUES (1, 'secret'), (2, 'other')",
+        "INSERT INTO sales.hidden VALUES (9, 'buried')",
+        "INSERT INTO sales.open VALUES (1), (2), (3)",
+        "GRANT SELECT ON TABLE sales.orders TO alice FILTER (id = 1) MASK (note, '***')",
+        "GRANT ALL ON TABLE sales.orders TO alice",
+        "GRANT ALL ON TABLE sales.open TO alice",
+        "GRANT ALL ON TABLE sales.sink TO alice",
+    };
+    for (setup) |stmt| {
+        var result = try session.execute(stmt);
+        result.deinit();
+    }
+    try session.setPrincipal("alice");
+    session.as_bearer = true;
+
+    {
+        var result = try session.execute("SELECT MAX(id) FROM sales.orders");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT CASE WHEN note = 'secret' THEN 1 ELSE 0 END FROM sales.orders");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 0), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT SUM(id) FROM sales.open WHERE id NOT IN (SELECT id FROM sales.orders)");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 5), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT n.note FROM sales.open o RIGHT JOIN sales.orders n ON o.id = n.id");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expect(!batchLeaksRaw(b));
+    }
+    {
+        var result = try session.execute("SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) FROM sales.orders");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    try std.testing.expectError(error.AccessDenied, session.execute("SELECT 1; SELECT note FROM sales.hidden"));
+    try std.testing.expectError(error.AccessDenied, session.execute("DESCRIBE sales.hidden"));
+    try std.testing.expectError(error.AccessDenied, session.execute("COPY (SELECT note FROM sales.orders) TO '/tmp/glacier_mask_probe_out.glacier'"));
+    try std.testing.expectError(error.AccessDenied, session.execute("INSERT INTO sales.orders VALUES (3, 'nope')"));
+    try std.testing.expectError(error.AccessDenied, session.execute("DELETE FROM sales.orders WHERE id = 2"));
+    try std.testing.expectError(error.AccessDenied, session.execute("UPDATE sales.orders SET note = 'hello' WHERE id = 1"));
+    try std.testing.expectError(error.AccessDenied, session.execute("MERGE INTO sales.orders t USING sales.open s ON t.id = s.id WHEN MATCHED THEN DELETE"));
+    try std.testing.expect(!try showNames(&session, "SELECT name FROM glacier.tables", "hidden"));
+    try std.testing.expect(try showNames(&session, "SELECT name FROM glacier.tables", "orders"));
+
+    {
+        var result = try session.execute("INSERT INTO sales.sink SELECT id, note FROM sales.orders");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT note FROM sales.sink");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expectEqualStrings("***", b.columns[0].strAt(0));
+    }
+
+    session.as_bearer = false;
+    try session.setPrincipal(null);
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM sales.orders");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 2), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT note FROM sales.orders WHERE id = 1");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(usize, 1), b.len);
+        try std.testing.expectEqualStrings("secret", b.columns[0].strAt(0));
+    }
+    {
+        var result = try session.execute("SELECT note FROM sales.orders WHERE id = 2");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqualStrings("other", b.columns[0].strAt(0));
+    }
+}
+
+fn batchLeaksRaw(b: Batch) bool {
+    for (b.columns) |col| {
+        if (col.data_type != .utf8) continue;
+        var i: usize = 0;
+        while (i < b.len) : (i += 1) {
+            if (!col.isValid(i)) continue;
+            const s = col.strAt(i);
+            if (std.mem.indexOf(u8, s, "secret") != null) return true;
+            if (std.mem.indexOf(u8, s, "other") != null) return true;
+            if (std.mem.indexOf(u8, s, "buried") != null) return true;
+        }
+    }
+    return false;
+}
+
+test "client SQL cannot see past a filter or mask" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_mask_break";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var session = try Session.open(gpa, io, root);
+    defer session.close();
+    const setup = [_][]const u8{
+        "CREATE NAMESPACE sales",
+        "CREATE TABLE sales.orders (id BIGINT, note STRING)",
+        "CREATE TABLE sales.hidden (id BIGINT, note STRING)",
+        "INSERT INTO sales.orders VALUES (1, 'secret'), (2, 'other')",
+        "INSERT INTO sales.hidden VALUES (9, 'buried')",
+        "CREATE TABLE sales.open (id BIGINT)",
+        "INSERT INTO sales.open VALUES (1), (2), (3)",
+        "GRANT SELECT ON TABLE sales.orders TO alice FILTER (id = 1) MASK (note, '***')",
+        "GRANT SELECT ON TABLE sales.open TO alice",
+    };
+    for (setup) |stmt| {
+        var result = try session.execute(stmt);
+        result.deinit();
+    }
+    try session.setPrincipal("alice");
+    session.as_bearer = true;
+
+    const queries = [_][]const u8{
+        "SELECT note, id FROM sales.orders",
+        "SELECT * FROM sales.orders",
+        "SELECT lower(note) FROM sales.orders",
+        "SELECT note FROM sales.orders a",
+        "SELECT (SELECT note FROM sales.orders WHERE id = 2)",
+        "SELECT note FROM sales.orders WHERE EXISTS (SELECT 1 FROM sales.orders i WHERE i.note = 'secret')",
+        "SELECT note FROM sales.orders WHERE note = 'secret' OR note = 'other' OR id = 2",
+        "SELECT a.note FROM sales.orders a JOIN sales.orders b ON a.id = b.id",
+        "SELECT COUNT(*) FROM sales.orders a, sales.orders b",
+        "WITH t AS (SELECT note, id FROM sales.orders) SELECT note FROM t",
+        "SELECT note FROM sales.orders UNION ALL SELECT note FROM sales.orders",
+        "SELECT note FROM (SELECT note, id FROM sales.orders WHERE id = 2 UNION ALL SELECT note, id FROM sales.orders) u",
+        "SELECT SUM(id) FROM sales.orders",
+        "SELECT MIN(note) FROM sales.orders GROUP BY id",
+        "EXPLAIN SELECT note FROM sales.orders WHERE 1 = 1",
+        "CREATE TEMP TABLE leak AS SELECT note, id FROM sales.orders",
+        "SELECT note FROM leak",
+    };
+    for (queries) |q| {
+        var result = session.execute(q) catch |err| switch (err) {
+            error.AccessDenied, error.ColumnNotFound, error.UnsupportedSql, error.SubqueryCardinality => continue,
+            else => return err,
+        };
+        defer result.deinit();
+        if (result.nextBatch()) |b| {
+            try std.testing.expect(!batchLeaksRaw(b));
+        }
+    }
+
+    {
+        var result = try session.execute("SELECT SUM(id) FROM sales.orders");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT COUNT(*) FROM sales.orders a, sales.orders b");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 1), b.columns[0].i64s[0]);
+    }
+    try std.testing.expectError(error.AccessDenied, session.execute("SELECT note FROM sales.hidden"));
+    try std.testing.expectError(error.AccessDenied, session.execute("SELECT record_count FROM sales.hidden.files"));
+    try std.testing.expectError(error.AccessDenied, session.execute("SELECT manifest_list FROM sales.hidden.snapshots"));
+    try std.testing.expectError(error.AccessDenied, session.execute("SELECT record_count FROM sales.orders.files"));
+    try std.testing.expectError(error.AccessDenied, session.execute("SELECT manifest_list FROM sales.orders.snapshots"));
+    {
+        var result = try session.execute("SELECT SUM(record_count) FROM sales.open.files");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expectEqual(@as(i64, 3), b.columns[0].i64s[0]);
+    }
+    {
+        var result = try session.execute("SELECT path, record_count FROM glacier.files");
+        defer result.deinit();
+        const b = result.nextBatch() orelse return error.EmptyResult;
+        try std.testing.expect(!batchLeaksRaw(b));
+        var sum: i64 = 0;
+        var row: usize = 0;
+        while (row < b.len) : (row += 1) {
+            const path = b.columns[0].strAt(row);
+            try std.testing.expect(std.mem.indexOf(u8, path, "hidden") == null);
+            try std.testing.expect(std.mem.indexOf(u8, path, "orders") == null);
+            sum += b.columns[1].i64s[row];
+        }
+        try std.testing.expectEqual(@as(i64, 3), sum);
+    }
 }

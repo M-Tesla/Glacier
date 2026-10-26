@@ -14,8 +14,11 @@ const usage_text =
     \\                    omitted: TUI source picker (local / S3 / HTTP / empty)
     \\  --catalog URL     Iceberg REST Catalog
     \\  --warehouse NAME  warehouse query for GET /v1/config
-    \\  --token TOKEN     bearer token (or ICEBERG_TOKEN). With serve, REST
-    \\                    requires Authorization: Bearer TOKEN
+    \\  --token TOKEN     bearer token (or ICEBERG_TOKEN). With serve, that secret
+    \\                    is the GRANT principal bearer on REST and Flight
+    \\  --jwt-jwks FILE   one RS256 JWKS. sub is the GRANT principal
+    \\  --oidc-issuer URL expected iss, or the issuer to fetch when --jwt-jwks is omitted
+    \\  --oidc-audience AUD  required aud when a JWKS is configured
     \\  --header 'N: v'   extra catalog header (repeatable)
     \\  --auth MODE       auto, none, bearer, oauth2, sigv4 (default auto)
     \\  --oauth-client-id / --oauth-client-secret / --oauth-server / --oauth-scope
@@ -26,7 +29,8 @@ const usage_text =
     \\  -f, --file FILE   run that SQL script the same way
     \\                    SHOW / ATTACH / DESCRIBE / USE / DETACH work as catalog SQL
     \\                    CREATE / INSERT / COPY FROM / DELETE / UPDATE / MERGE / ALTER ADD COLUMN / DROP / PARTITIONED BY identity on glacier, Hadoop, REST
-    \\                    GRANT SELECT|ALL ON TABLE t TO bearer on the glacier catalog (REVOKE FROM bearer)
+    \\                    GRANT SELECT|ALL ON TABLE t TO name [FILTER (pred)] [MASK (col, 'lit')]
+    \\                    on the glacier catalog (REVOKE FROM name)
     \\                    FROM glacier.catalogs / glacier.tables / glacier.snapshots / glacier.files
     \\  --timer           print wall time + peak RSS after each query (default)
     \\  --no-timer        hide stats
@@ -36,7 +40,8 @@ const usage_text =
     \\  --listen HOST:PORT  REST bind (localhost only without TLS)
     \\  --tls-cert FILE     PEM certificate; with --tls-key, REST may bind a public address
     \\  --tls-key FILE      PEM private key for --tls-cert
-    \\  --flight HOST:PORT  Flight SQL bind, grpc:// (localhost only without TLS)
+    \\  --flight HOST:PORT  Flight SQL bind. Localhost without TLS. A public
+    \\                    address needs --tls-cert, --tls-key, and --token or --jwt-jwks
     \\  -h, --help        this help
     \\  -v, --version     print version
     \\
@@ -71,6 +76,9 @@ const Args = struct {
     flight: []const u8 = "127.0.0.1:8815",
     tls_cert: ?[]const u8 = null,
     tls_key: ?[]const u8 = null,
+    jwt_jwks: ?[]const u8 = null,
+    oidc_issuer: ?[]const u8 = null,
+    oidc_audience: ?[]const u8 = null,
 };
 
 var cli_flag: ?*std.atomic.Value(u8) = null;
@@ -148,9 +156,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.serve) {
         const warehouse = args.path orelse ".";
-        flight_server.run(gpa, io, warehouse, args.listen, args.flight, out, args.tls_cert, args.tls_key, args.token) catch |err| {
+        flight_server.run(gpa, io, warehouse, args.listen, args.flight, out, args.tls_cert, args.tls_key, args.token, args.jwt_jwks, args.oidc_issuer, args.oidc_audience) catch |err| {
             switch (err) {
                 error.TlsRequired => try out.print("glacier serve: bind outside localhost needs TLS\n", .{}),
+                error.TokenRequired => try out.print("glacier serve: public Flight needs --token or --jwt-jwks\n", .{}),
                 error.InvalidAddress => try out.print("glacier serve: invalid --listen / --flight\n", .{}),
                 else => try out.print("glacier serve failed: {s}\n", .{glacier.err.staticMessage(err)}),
             }
@@ -1994,6 +2003,18 @@ fn parseArgs(
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
             out.token = argv[i];
+        } else if (eql(a, "--jwt-jwks")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.jwt_jwks = argv[i];
+        } else if (eql(a, "--oidc-issuer")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.oidc_issuer = argv[i];
+        } else if (eql(a, "--oidc-audience")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            out.oidc_audience = argv[i];
         } else if (eql(a, "--header")) {
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;

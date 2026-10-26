@@ -17,6 +17,11 @@ pub fn build(b: *std.Build) void {
         .flags = &tls_flags,
         .language = .c,
     });
+    glacier_mod.addCSourceFile(.{
+        .file = b.path("src/table/jwt_rsa.c"),
+        .flags = &tls_flags,
+        .language = .c,
+    });
     glacier_mod.linkSystemLibrary("ssl", .{});
     glacier_mod.linkSystemLibrary("crypto", .{});
     addNanoarrow(b, glacier_mod);

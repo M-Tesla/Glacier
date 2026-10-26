@@ -12,6 +12,13 @@ const arrow_ipc = glacier.arrow_ipc;
 const rest_server = glacier.rest_server;
 const glacier_catalog = glacier.glacier_catalog;
 
+extern fn glacier_tls_server(cert: [*:0]const u8, key: [*:0]const u8) ?*anyopaque;
+extern fn glacier_tls_free(box: ?*anyopaque) void;
+extern fn glacier_tls_accept(box: *anyopaque, fd: c_int) ?*anyopaque;
+extern fn glacier_tls_read(ssl: *anyopaque, buf: [*]u8, n: c_int) c_int;
+extern fn glacier_tls_write(ssl: *anyopaque, buf: [*]const u8, n: c_int) c_int;
+extern fn glacier_tls_close(ssl: ?*anyopaque) void;
+
 const svc = "/arrow.flight.protocol.FlightService/";
 const sql_query_url = "type.googleapis.com/arrow.flight.protocol.sql.CommandStatementQuery";
 
@@ -20,6 +27,10 @@ pub const Handle = struct {
     io: std.Io,
     warehouse: []u8,
     server: net.Server,
+    tls: ?*anyopaque = null,
+    token: ?[]u8 = null,
+    /// Not owned. One RS256 provider. Null means the shared token, or no auth.
+    keys: ?*const glacier.jwt.Set = null,
     closed: bool = false,
 
     pub fn port(self: Handle) u16 {
@@ -35,6 +46,8 @@ pub const Handle = struct {
     pub fn deinit(self: *Handle) void {
         self.stop();
         self.gpa.free(self.warehouse);
+        if (self.token) |tok| self.gpa.free(tok);
+        if (self.tls) |ctx| glacier_tls_free(ctx);
     }
 };
 
@@ -44,15 +57,52 @@ pub fn bind(
     warehouse: []const u8,
     listen: []const u8,
 ) !Handle {
-    var addr = try rest_server.parseListenPort(listen, 8815);
+    return bindDoor(gpa, io, warehouse, listen, null, null, null, null);
+}
+
+fn bindDoor(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    warehouse: []const u8,
+    listen: []const u8,
+    cert: ?[]const u8,
+    key: ?[]const u8,
+    bearer: ?[]const u8,
+    keys: ?*const glacier.jwt.Set,
+) !Handle {
+    if ((cert == null) != (key == null)) return error.TlsRequired;
+    var addr = try rest_server.parseListenPortTls(listen, 8815, cert != null);
+    const has_secret = bearer != null and bearer.?.len > 0;
+    if (!addrIsLoopback(addr) and !has_secret and keys == null) return error.TokenRequired;
     try glacier_catalog.ensure(gpa, io, warehouse);
+    var tls: ?*anyopaque = null;
+    if (cert) |c| {
+        const c_cert = try gpa.dupeZ(u8, c);
+        defer gpa.free(c_cert);
+        const c_key = try gpa.dupeZ(u8, key.?);
+        defer gpa.free(c_key);
+        tls = glacier_tls_server(c_cert.ptr, c_key.ptr) orelse return error.TlsRequired;
+    }
     var server = try addr.listen(io, .{ .reuse_address = true });
     errdefer server.deinit(io);
+    errdefer if (tls) |ctx| glacier_tls_free(ctx);
+    const token = if (bearer) |tok| try gpa.dupe(u8, tok) else null;
+    errdefer if (token) |tok| gpa.free(tok);
     return .{
         .gpa = gpa,
         .io = io,
         .warehouse = try gpa.dupe(u8, warehouse),
         .server = server,
+        .tls = tls,
+        .token = token,
+        .keys = keys,
+    };
+}
+
+fn addrIsLoopback(addr: net.IpAddress) bool {
+    return switch (addr) {
+        .ip4 => |a| a.bytes[0] == 127,
+        .ip6 => |a| a.bytes[0] == 0 and a.bytes[15] == 1 and std.mem.allEqual(u8, a.bytes[1..15], 0),
     };
 }
 
@@ -66,17 +116,31 @@ pub fn run(
     tls_cert: ?[]const u8,
     tls_key: ?[]const u8,
     bearer: ?[]const u8,
+    jwks_path: ?[]const u8,
+    oidc_issuer: ?[]const u8,
+    oidc_audience: ?[]const u8,
 ) !void {
+    var keys_store: ?glacier.jwt.Set = null;
+    defer if (keys_store) |*k| k.deinit();
+    if (jwks_path) |p| {
+        keys_store = try glacier.jwt.loadPath(gpa, io, p, oidc_issuer orelse "", oidc_audience orelse "");
+    } else if (oidc_issuer) |iss| {
+        keys_store = try glacier.jwt.loadIssuer(gpa, io, iss, oidc_audience orelse "");
+    }
+    const keys: ?*const glacier.jwt.Set = if (keys_store) |*k| k else null;
     var rest = try rest_server.bindTls(gpa, io, warehouse, listen, tls_cert, tls_key);
     if (bearer) |tok| try rest.setBearer(tok);
+    if (keys) |k| rest.setKeys(k);
     defer rest.deinit();
-    var fl = try bind(gpa, io, warehouse, flight);
+    var fl = try bindDoor(gpa, io, warehouse, flight, tls_cert, tls_key, bearer, keys);
     defer fl.deinit();
-    const scheme: []const u8 = if (rest.tls != null) "https" else "http";
-    try out.print("Iceberg REST  {s}://{f}\n", .{ scheme, rest.server.socket.address });
-    try out.print("Arrow Flight  grpc://{f}\n", .{fl.server.socket.address});
+    const rest_scheme: []const u8 = if (rest.tls != null) "https" else "http";
+    const flight_scheme: []const u8 = if (fl.tls != null) "grpcs" else "grpc";
+    try out.print("Iceberg REST  {s}://{f}\n", .{ rest_scheme, rest.server.socket.address });
+    try out.print("Arrow Flight  {s}://{f}\n", .{ flight_scheme, fl.server.socket.address });
     try out.print("warehouse     {s}\n", .{warehouse});
-    if (bearer != null) try out.print("REST auth     bearer\n", .{});
+    if (bearer != null) try out.print("auth          bearer\n", .{});
+    if (keys != null) try out.print("auth          jwt\n", .{});
     try out.flush();
     var rest_fut = try io.concurrent(rest_server.serveLoop, .{&rest});
     defer _ = rest_fut.cancel(io) catch {};
@@ -94,6 +158,10 @@ pub fn serveLoop(self: *Handle) std.Io.Cancelable!void {
 }
 
 fn serveConn(self: *Handle, stream: net.Stream) void {
+    if (self.tls) |ctx| {
+        serveConnTls(self, stream, ctx);
+        return;
+    }
     const io = self.io;
     defer {
         var copy = stream;
@@ -103,12 +171,86 @@ fn serveConn(self: *Handle, stream: net.Stream) void {
     var recv_buffer: [16 * 1024]u8 = undefined;
     var connection_reader = stream.reader(io, &recv_buffer);
     var connection_writer = stream.writer(io, &send_buffer);
-    var conn = h2.Conn.init(self.gpa, &connection_reader.interface, &connection_writer.interface);
+    serveH2(self, &connection_reader.interface, &connection_writer.interface);
+}
+
+fn serveConnTls(self: *Handle, stream: net.Stream, ctx: *anyopaque) void {
+    const io = self.io;
+    defer {
+        var copy = stream;
+        copy.close(io);
+    }
+    const ssl = glacier_tls_accept(ctx, stream.socket.handle) orelse return;
+    defer glacier_tls_close(ssl);
+    var pipe: TlsPipe = .{ .ssl = ssl };
+    pipe.reader = .{
+        .vtable = &tls_reader_vt,
+        .buffer = &pipe.rbuf,
+        .seek = 0,
+        .end = 0,
+    };
+    pipe.writer = .{
+        .vtable = &tls_writer_vt,
+        .buffer = &.{},
+        .end = 0,
+    };
+    serveH2(self, &pipe.reader, &pipe.writer);
+}
+
+const TlsPipe = struct {
+    ssl: *anyopaque,
+    rbuf: [16 * 1024]u8 = undefined,
+    reader: std.Io.Reader = undefined,
+    writer: std.Io.Writer = undefined,
+};
+
+const tls_reader_vt = std.Io.Reader.VTable{ .stream = tlsStream };
+const tls_writer_vt = std.Io.Writer.VTable{ .drain = tlsDrain };
+
+fn tlsStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    const pipe: *TlsPipe = @alignCast(@fieldParentPtr("reader", r));
+    const cap = limit.minInt(4096);
+    if (cap == 0) return 0;
+    var tmp: [4096]u8 = undefined;
+    const n = glacier_tls_read(pipe.ssl, &tmp, @intCast(cap));
+    if (n == 0) return error.EndOfStream;
+    if (n < 0) return error.ReadFailed;
+    w.writeAll(tmp[0..@intCast(n)]) catch return error.WriteFailed;
+    return @intCast(n);
+}
+
+fn tlsDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    const pipe: *TlsPipe = @alignCast(@fieldParentPtr("writer", w));
+    if (data.len == 0) return 0;
+    var total: usize = 0;
+    for (data[0 .. data.len - 1]) |chunk| {
+        sslWriteAll(pipe.ssl, chunk) catch return error.WriteFailed;
+        total += chunk.len;
+    }
+    const last = data[data.len - 1];
+    for (0..splat) |_| {
+        sslWriteAll(pipe.ssl, last) catch return error.WriteFailed;
+        total += last.len;
+    }
+    return total;
+}
+
+fn sslWriteAll(ssl: *anyopaque, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = glacier_tls_write(ssl, bytes[off..].ptr, @intCast(bytes.len - off));
+        if (n <= 0) return error.WriteFailed;
+        off += @intCast(n);
+    }
+}
+
+fn serveH2(self: *Handle, reader: *std.Io.Reader, writer: *std.Io.Writer) void {
+    var conn = h2.Conn.init(self.gpa, reader, writer);
     defer conn.deinit();
     conn.expectPreface() catch return;
     conn.writeSettings() catch return;
 
-    var sess = Session.open(self.gpa, io, self.warehouse) catch return;
+    var sess = Session.open(self.gpa, self.io, self.warehouse) catch return;
     defer sess.close();
 
     var streams = std.AutoHashMap(u32, StreamBuf).init(self.gpa);
@@ -146,9 +288,11 @@ const StreamBuf = struct {
     path: []u8 = &.{},
     data: std.ArrayList(u8) = .empty,
     ended: bool = false,
+    cred: []u8 = &.{},
 
     fn deinit(self: *StreamBuf, gpa: std.mem.Allocator) void {
         if (self.path.len > 0) gpa.free(self.path);
+        if (self.cred.len > 0) gpa.free(self.cred);
         self.data.deinit(gpa);
     }
 };
@@ -165,7 +309,9 @@ fn handleStream(
     const a = arena.allocator();
 
     const gop = try streams.getOrPut(frame.stream);
-    if (!gop.found_existing) gop.value_ptr.* = .{};
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{};
+    }
 
     var payload = frame.payload;
     if (frame.flags & h2.Flag.padded != 0) {
@@ -185,6 +331,9 @@ fn handleStream(
         const path = h2.pathOf(headers.items);
         if (gop.value_ptr.path.len > 0) self.gpa.free(gop.value_ptr.path);
         gop.value_ptr.path = try self.gpa.dupe(u8, path);
+        const raw = bearerRaw(headers.items);
+        if (gop.value_ptr.cred.len > 0) self.gpa.free(gop.value_ptr.cred);
+        gop.value_ptr.cred = try self.gpa.dupe(u8, raw);
     } else {
         try gop.value_ptr.data.appendSlice(self.gpa, payload);
     }
@@ -193,6 +342,14 @@ fn handleStream(
 
     const path = gop.value_ptr.path;
     const body = gop.value_ptr.data.items;
+    if (needsAuth(self)) {
+        applyPrincipal(self, sess, gop.value_ptr.cred) catch {
+            try conn.writeGrpcError(frame.stream, "16", "missing or invalid bearer token");
+            gop.value_ptr.deinit(self.gpa);
+            _ = streams.remove(frame.stream);
+            return;
+        };
+    }
     const msgs = try grpcSplit(a, body);
     if (std.mem.eql(u8, path, svc ++ "Handshake")) {
         try conn.writeGrpcMessages(frame.stream, &.{try pbHandshake()}, true);
@@ -213,8 +370,29 @@ fn handleStream(
     }
 
     if (gop.value_ptr.path.len > 0) self.gpa.free(gop.value_ptr.path);
+    if (gop.value_ptr.cred.len > 0) self.gpa.free(gop.value_ptr.cred);
     gop.value_ptr.data.deinit(self.gpa);
     _ = streams.remove(frame.stream);
+}
+
+fn needsAuth(self: *const Handle) bool {
+    return self.token != null or self.keys != null;
+}
+
+fn applyPrincipal(self: *Handle, sess: *Session, raw: []const u8) !void {
+    const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+    const who = glacier.jwt.identify(self.gpa, self.token, self.keys, raw, now) catch return error.NotAuthorized;
+    defer self.gpa.free(who);
+    try sess.setPrincipal(who);
+    sess.as_bearer = true;
+}
+
+fn bearerRaw(headers: []const h2.Header) []const u8 {
+    const v = h2.headerValue(headers, "authorization");
+    const prefix = "Bearer ";
+    if (v.len <= prefix.len) return "";
+    if (!std.ascii.eqlIgnoreCase(v[0..prefix.len], prefix)) return "";
+    return v[prefix.len..];
 }
 
 fn doGet(gpa: std.mem.Allocator, conn: *h2.Conn, sess: *Session, stream: u32, sql: []const u8) !void {
@@ -458,7 +636,12 @@ pub fn runSql(gpa: std.mem.Allocator, io: std.Io, port: u16, sql: []const u8) !v
 }
 
 pub fn queryI64(gpa: std.mem.Allocator, io: std.Io, port: u16, sql: []const u8) ![]i64 {
+    return queryI64Token(gpa, io, port, sql, null);
+}
+
+pub fn queryI64Token(gpa: std.mem.Allocator, io: std.Io, port: u16, sql: []const u8, token: ?[]const u8) ![]i64 {
     const client = try Client.connect(gpa, io, port);
+    client.token = token;
     defer client.deinit();
     return client.queryI64(sql);
 }
@@ -478,6 +661,7 @@ const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     stream: net.Stream,
+    token: ?[]const u8 = null,
     reader_buf: [16 * 1024]u8 = undefined,
     writer_buf: [16 * 1024]u8 = undefined,
     reader: net.Stream.Reader = undefined,
@@ -616,14 +800,31 @@ const Client = struct {
     }
 
     fn unary(self: *Client, stream: u32, path: []const u8, proto: []const u8) !void {
-        try self.conn.writeHeaders(stream, &.{
-            .{ .name = ":method", .value = "POST" },
-            .{ .name = ":scheme", .value = "http" },
-            .{ .name = ":path", .value = path },
-            .{ .name = ":authority", .value = "localhost" },
-            .{ .name = "content-type", .value = "application/grpc" },
-            .{ .name = "te", .value = "trailers" },
-        }, false);
+        const auth = if (self.token) |tok|
+            try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{tok})
+        else
+            null;
+        defer if (auth) |v| self.gpa.free(v);
+        if (auth) |value| {
+            try self.conn.writeHeaders(stream, &.{
+                .{ .name = ":method", .value = "POST" },
+                .{ .name = ":scheme", .value = "http" },
+                .{ .name = ":path", .value = path },
+                .{ .name = ":authority", .value = "localhost" },
+                .{ .name = "content-type", .value = "application/grpc" },
+                .{ .name = "te", .value = "trailers" },
+                .{ .name = "authorization", .value = value },
+            }, false);
+        } else {
+            try self.conn.writeHeaders(stream, &.{
+                .{ .name = ":method", .value = "POST" },
+                .{ .name = ":scheme", .value = "http" },
+                .{ .name = ":path", .value = path },
+                .{ .name = ":authority", .value = "localhost" },
+                .{ .name = "content-type", .value = "application/grpc" },
+                .{ .name = "te", .value = "trailers" },
+            }, false);
+        }
         const framed = try h2.grpcFrame(self.gpa, proto);
         defer self.gpa.free(framed);
         try self.conn.writeData(stream, framed, true);
@@ -756,4 +957,200 @@ test "Flight SQL DoGet streams multiple record batches" {
     try std.testing.expectEqual(@as(i64, 3), got.values[2]);
     try std.testing.expectEqual(@as(i64, 4), got.values[3]);
     try std.testing.expectEqual(@as(i64, 5), got.values[4]);
+}
+
+test "public Flight needs TLS and a token" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "/tmp/glacier_flight_door";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    try std.testing.expectError(error.TlsRequired, bindDoor(gpa, io, root, "0.0.0.0:9", null, null, "tok", null));
+    try std.testing.expectError(error.TokenRequired, bindDoor(gpa, io, root, "0.0.0.0:9", "missing.crt", "missing.key", null, null));
+    var dummy = glacier.jwt.probeSet(gpa);
+    try std.testing.expectError(error.TlsRequired, bindDoor(gpa, io, root, "0.0.0.0:9", "missing.crt", "missing.key", null, &dummy));
+}
+
+test "Flight bearer uses the native GRANT" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "/tmp/glacier_flight_grant";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var owner = try Session.open(gpa, io, root);
+    defer owner.close();
+    var made = try owner.execute("CREATE NAMESPACE sales");
+    made.deinit();
+    made = try owner.execute("CREATE TABLE sales.orders (id BIGINT)");
+    made.deinit();
+    made = try owner.execute("CREATE TABLE sales.hidden (id BIGINT)");
+    made.deinit();
+    made = try owner.execute("INSERT INTO sales.orders VALUES (7)");
+    made.deinit();
+    made = try owner.execute("INSERT INTO sales.hidden VALUES (9)");
+    made.deinit();
+    made = try owner.execute("GRANT SELECT ON TABLE sales.orders TO bearer");
+    made.deinit();
+
+    var h = try bindDoor(gpa, io, root, "127.0.0.1:0", null, null, "sekret", null);
+    var fut = try io.concurrent(serveLoop, .{&h});
+    defer {
+        h.stop();
+        _ = fut.cancel(io) catch {};
+        h.deinit();
+    }
+    const port = h.port();
+    try std.testing.expectError(error.InvalidFlight, queryI64Token(gpa, io, port, "SELECT COUNT(*) FROM sales.orders", null));
+    try std.testing.expectError(error.InvalidFlight, queryI64Token(gpa, io, port, "SELECT COUNT(*) FROM sales.orders", "nope"));
+    try std.testing.expectError(error.InvalidFlight, queryI64Token(gpa, io, port, "SELECT COUNT(*) FROM sales.hidden", "sekret"));
+    const got = try queryI64Token(gpa, io, port, "SELECT COUNT(*) FROM sales.orders", "sekret");
+    defer gpa.free(got);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expectEqual(@as(i64, 1), got[0]);
+}
+
+test "Flight TLS accepts the HTTP/2 preface" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cert = "/tmp/glacier-flight-tls.crt";
+    const key = "/tmp/glacier-flight-tls.key";
+    var gen = std.process.spawn(io, .{
+        .argv = &.{
+            "openssl", "req",    "-x509", "-newkey",       "rsa:2048",
+            "-keyout", key,      "-out",  cert,            "-days",
+            "1",       "-nodes", "-subj", "/CN=localhost",
+        },
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    }) catch return error.SkipZigTest;
+    switch (gen.wait(io) catch return error.SkipZigTest) {
+        .exited => |code| if (code != 0) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+
+    const root = "/tmp/glacier_flight_tls";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var h = try bindDoor(gpa, io, root, "127.0.0.1:0", cert, key, null, null);
+    var fut = try io.concurrent(serveLoop, .{&h});
+    defer {
+        h.stop();
+        _ = fut.cancel(io) catch {};
+        h.deinit();
+    }
+    const port_text = try std.fmt.allocPrint(gpa, "{d}", .{h.port()});
+    defer gpa.free(port_text);
+    var py = try std.process.spawn(io, .{
+        .argv = &.{
+            "python3", "-c",
+            \\import socket, ssl, sys
+            \\ctx = ssl._create_unverified_context()
+            \\raw = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+            \\s = ctx.wrap_socket(raw, server_hostname="localhost")
+            \\s.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            \\data = s.recv(9)
+            \\print(len(data))
+            ,
+            port_text,
+        },
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    });
+    defer py.kill(io);
+    var line_buf: [64]u8 = undefined;
+    var stdout_reader = py.stdout.?.readerStreaming(io, &line_buf);
+    const line = try stdout_reader.interface.takeDelimiterExclusive('\n');
+    try std.testing.expectEqualStrings("9", line);
+}
+
+test "Flight JWT sub uses the native GRANT filter" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const gpa = da.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ran = std.process.run(gpa, io, .{
+        .argv = &.{ "python3", "-c",
+            \\import base64, json, pathlib, subprocess
+            \\key = "/tmp/glacier-flight-jwt.pem"
+            \\jwks_path = "/tmp/glacier-flight-jwt.jwks"
+            \\subprocess.check_call(["openssl", "genrsa", "-out", key, "2048"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            \\mod = subprocess.check_output(["openssl", "rsa", "-in", key, "-noout", "-modulus"], text=True)
+            \\n = bytes.fromhex(mod.strip().split("=", 1)[1])
+            \\def b64(b):
+            \\    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+            \\jwks = {"keys": [{"kty": "RSA", "alg": "RS256", "kid": "k1", "n": b64(n), "e": "AQAB"}]}
+            \\pathlib.Path(jwks_path).write_text(json.dumps(jwks))
+            \\header = b64(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "k1"}, separators=(",", ":")).encode())
+            \\payload = b64(json.dumps({"sub": "alice", "iss": "https://idp.example", "aud": "glacier", "exp": 2000000000}, separators=(",", ":")).encode())
+            \\signing = header + "." + payload
+            \\msg = "/tmp/glacier-flight-jwt.msg"
+            \\sigp = "/tmp/glacier-flight-jwt.sig"
+            \\pathlib.Path(msg).write_bytes(signing.encode())
+            \\subprocess.check_call(["openssl", "dgst", "-sha256", "-sign", key, "-out", sigp, msg])
+            \\print(signing + "." + b64(pathlib.Path(sigp).read_bytes()))
+        },
+    }) catch return error.SkipZigTest;
+    defer gpa.free(ran.stdout);
+    defer gpa.free(ran.stderr);
+    switch (ran.term) {
+        .exited => |code| if (code != 0) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+    const token = std.mem.trim(u8, ran.stdout, " \r\n");
+    var set = glacier.jwt.loadPath(gpa, io, "/tmp/glacier-flight-jwt.jwks", "https://idp.example", "glacier") catch return error.SkipZigTest;
+    defer set.deinit();
+
+    const root = "/tmp/glacier_flight_jwt";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var owner = try Session.open(gpa, io, root);
+    defer owner.close();
+    var made = try owner.execute("CREATE NAMESPACE sales");
+    made.deinit();
+    made = try owner.execute("CREATE TABLE sales.orders (id BIGINT)");
+    made.deinit();
+    made = try owner.execute("INSERT INTO sales.orders VALUES (7), (9)");
+    made.deinit();
+    made = try owner.execute("GRANT SELECT ON TABLE sales.orders TO alice FILTER (id = 7)");
+    made.deinit();
+
+    var h = try bindDoor(gpa, io, root, "127.0.0.1:0", null, null, null, &set);
+    var fut = try io.concurrent(serveLoop, .{&h});
+    defer {
+        h.stop();
+        _ = fut.cancel(io) catch {};
+        h.deinit();
+    }
+    const port = h.port();
+    try std.testing.expectError(error.InvalidFlight, queryI64Token(gpa, io, port, "SELECT COUNT(*) FROM sales.orders", "nope"));
+    const got = try queryI64Token(gpa, io, port, "SELECT id FROM sales.orders WHERE 1 = 1", token);
+    defer gpa.free(got);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expectEqual(@as(i64, 7), got[0]);
 }

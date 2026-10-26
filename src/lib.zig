@@ -21,6 +21,7 @@ pub const hadoop_catalog = @import("table/hadoop_catalog.zig");
 pub const glacier_catalog = @import("table/glacier_catalog.zig");
 pub const grants = @import("table/grants.zig");
 pub const rest_server = @import("table/rest_server.zig");
+pub const jwt = @import("table/jwt.zig");
 pub const err = @import("error.zig");
 pub const c_api = @import("c_api.zig");
 
@@ -30,7 +31,7 @@ pub const Batch = batch.Batch;
 pub const Column = batch.Column;
 pub const GlacierError = err.GlacierError;
 
-pub const version = "0.6.3";
+pub const version = "0.7.0";
 
 comptime {
     _ = &c_api.glacier_open;
